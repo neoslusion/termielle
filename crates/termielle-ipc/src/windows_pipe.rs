@@ -553,15 +553,28 @@ mod tests {
             ));
         }
 
-        let sid = crate::security::current_user_sid_string().expect("current user SID");
+        let (_sid_buffer, sid) = crate::security::current_user_sid().expect("current user SID");
 
         assert_eq!(ace_count, 1, "expected exactly one ACE, got {sddl}");
         assert!(
             sddl.contains("D:P"),
             "DACL is not protected, so inherited entries could widen it: {sddl}"
         );
+
+        let mut ace_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: `dacl` is the live ACL from `GetSecurityInfo` above, and
+        // `ace_ptr` is a live out-parameter receiving a pointer into it.
+        unsafe { windows::Win32::Security::GetAce(dacl, 0, &mut ace_ptr) }.expect("GetAce failed");
+
+        // SAFETY: `ace_ptr` names an `ACCESS_ALLOWED_ACE` inside `dacl`, which
+        // is still alive, and `sid` points into `sid_buffer`, also alive.
+        let ace = unsafe { &*(ace_ptr as *const windows::Win32::Security::ACCESS_ALLOWED_ACE) };
+        // `SidStart` is the ACE's inline SID; its `u32` field models the
+        // flexible-array member at that offset.
+        let ace_sid =
+            windows::Win32::Security::PSID((&ace.SidStart as *const u32) as *mut core::ffi::c_void);
         assert!(
-            sddl.contains(&sid),
+            unsafe { windows::Win32::Security::EqualSid(ace_sid, sid) }.is_ok(),
             "DACL does not name the current user: {sddl}"
         );
     }

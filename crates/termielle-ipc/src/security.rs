@@ -13,7 +13,7 @@ use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     TokenUser,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -159,8 +159,11 @@ impl OwnerOnlySecurity {
     }
 }
 
-/// Reads this process's user SID and renders it in string form.
-pub(crate) fn current_user_sid_string() -> Result<String, IpcError> {
+/// Reads this process's user SID, kept alive by the returned buffer.
+///
+/// The SID points into the `TOKEN_USER` buffer the query filled, so the pair
+/// must stay together: dropping the buffer invalidates the SID.
+pub(crate) fn current_user_sid() -> Result<(Vec<u8>, PSID), IpcError> {
     let mut token = HANDLE::default();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no
     // cleanup, and `token` is a live out-parameter.
@@ -206,9 +209,16 @@ pub(crate) fn current_user_sid_string() -> Result<String, IpcError> {
         .User
         .Sid;
 
+    Ok((buffer, sid))
+}
+
+/// Reads this process's user SID and renders it in string form.
+pub(crate) fn current_user_sid_string() -> Result<String, IpcError> {
+    let (_buffer, sid) = current_user_sid()?;
+
     let mut text = PWSTR::null();
-    // SAFETY: `sid` points into `buffer`, which is still alive, and `text` is a
-    // live out-parameter that receives a `LocalAlloc` string.
+    // SAFETY: `sid` points into `_buffer`, which is still alive, and `text` is
+    // a live out-parameter that receives a `LocalAlloc` string.
     unsafe { ConvertSidToStringSidW(sid, &mut text) }.map_err(from_win32)?;
     let owned = LocalBuffer(text.0.cast());
 
