@@ -243,6 +243,10 @@ impl SessionReducer {
                     next: VisualState::Working,
                 }),
             ),
+            // A real reasoning signal overrides the one-second heuristic: the
+            // overlay holds Thinking until the agent reports reasoning done.
+            EventKind::ThinkingStarted => (VisualState::Thinking, None),
+            EventKind::ThinkingEnded => (VisualState::Working, None),
             EventKind::NeedsInput => (VisualState::NeedsInput, None),
             EventKind::TurnCompleted => (
                 VisualState::Ready,

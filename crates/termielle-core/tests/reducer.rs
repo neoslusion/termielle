@@ -32,6 +32,52 @@ fn thinking_becomes_working_after_one_second() {
 }
 
 #[test]
+fn thinking_started_holds_the_thinking_face_past_the_heuristic() {
+    let mut reducer = SessionReducer::new(5_000, 60_000);
+    reducer.apply(message(
+        Source::Opencode,
+        "one",
+        EventKind::PromptSubmitted,
+        10_000,
+    ));
+    // A real reasoning signal arrives; the one-second heuristic deadline must
+    // no longer advance the overlay.
+    reducer.apply(message(
+        Source::Opencode,
+        "one",
+        EventKind::ThinkingStarted,
+        10_100,
+    ));
+    assert_eq!(reducer.visible_state(), VisualState::Thinking);
+    assert!(reducer.next_deadline_ms().unwrap() > 11_000);
+
+    assert!(!reducer.advance(30_000));
+    assert_eq!(reducer.visible_state(), VisualState::Thinking);
+
+    // Reasoning ends: working, with no timer.
+    reducer.apply(message(
+        Source::Opencode,
+        "one",
+        EventKind::ThinkingEnded,
+        30_100,
+    ));
+    assert_eq!(reducer.visible_state(), VisualState::Working);
+}
+
+#[test]
+fn thinking_end_without_a_start_just_works() {
+    let mut reducer = SessionReducer::new(5_000, 60_000);
+    reducer.apply(message(
+        Source::Opencode,
+        "one",
+        EventKind::ThinkingEnded,
+        10_000,
+    ));
+    assert_eq!(reducer.visible_state(), VisualState::Working);
+    assert!(reducer.next_deadline_ms().unwrap() > 60_000);
+}
+
+#[test]
 fn priority_is_needs_input_failed_ready_running_idle() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(

@@ -49,6 +49,8 @@ fn opencode_plugin_maps_the_lifecycle_events_with_the_opencode_source() {
 
     for wire in [
         "prompt_submitted",
+        "thinking_started",
+        "thinking_ended",
         "needs_input",
         "turn_completed",
         "turn_failed",

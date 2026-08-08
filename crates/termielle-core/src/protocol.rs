@@ -15,6 +15,10 @@ pub enum Source {
 pub enum EventKind {
     SessionStarted,
     PromptSubmitted,
+    /// The agent is actively reasoning; held until [`Self::ThinkingEnded`].
+    ThinkingStarted,
+    /// Reasoning finished; the agent is generating or running tools.
+    ThinkingEnded,
     NeedsInput,
     TurnCompleted,
     TurnFailed,

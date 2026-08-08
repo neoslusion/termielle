@@ -23,13 +23,15 @@ in the notification area. `scripts/doctor.ps1` validates an install end to end.
 
 ## Integrations
 
-Each agent translates its own lifecycle events into one of six protocol events
+Each agent translates its own lifecycle events into one of the protocol events
 and invokes `termielle-emit.exe` with the session identifier and nothing else:
 
 | Event | Overlay face |
 | --- | --- |
 | `session_started` | idle |
-| `prompt_submitted` | thinking -> working |
+| `prompt_submitted` | thinking -> working (after the local one-second transition) |
+| `thinking_started` | thinking, held while the agent reasons |
+| `thinking_ended` | working |
 | `needs_input` | waiting |
 | `turn_completed` | ready |
 | `turn_failed` | failed |
@@ -51,15 +53,17 @@ emitter.
 - **opencode** — copy `integrations/opencode/termielle.plugin.ts` into
   `~/.config/opencode/plugins/` (all projects) or `.opencode/plugins/` (one
   project) and restart; plugins load at startup, so no hooks config is needed.
-  The plugin maps prompts, permission prompts, step failures, and status to
-  emitter calls.
+  The plugin maps prompts, real reasoning (`thinking_started`/`thinking_ended`
+  from the assistant message stream), permission prompts, step failures, and
+  status to emitter calls.
 
-Neither Claude nor Codex emits a universal "resumed after approval" event, so
-the one-second `Thinking -> Working` transition happens locally and an approval
-prompt may stay `NeedsInput` until the next event. opencode publishes no
-session-end event, so a finished conversation leaves via the Ready hold, an
-explicit `session.deleted`, or the busy-stall idle decay (`busy_stall_ms`,
-default 5 minutes).
+Claude and Codex expose no reasoning boundary, so their `Thinking -> Working`
+transition is the local one-second heuristic; opencode's thinking face is
+driven by its actual reasoning step. Neither Claude nor Codex emits a universal
+"resumed after approval" event, so an approval prompt may stay `NeedsInput`
+until the next event. opencode publishes no session-end event, so a finished
+conversation leaves via the Ready hold, an explicit `session.deleted`, or the
+busy-stall idle decay (`busy_stall_ms`, default 5 minutes).
 
 ## Assets
 

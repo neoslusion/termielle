@@ -110,6 +110,8 @@ fn opencode_hooks() -> Vec<Hook> {
         let wire = captured.split('"').next().unwrap();
         let event = match wire {
             "prompt_submitted" => EventKind::PromptSubmitted,
+            "thinking_started" => EventKind::ThinkingStarted,
+            "thinking_ended" => EventKind::ThinkingEnded,
             "needs_input" => EventKind::NeedsInput,
             "turn_completed" => EventKind::TurnCompleted,
             "turn_failed" => EventKind::TurnFailed,
@@ -173,6 +175,8 @@ impl Hook {
         match self.event {
             EventKind::SessionStarted => 0,
             EventKind::PromptSubmitted => 1,
+            EventKind::ThinkingStarted => 6,
+            EventKind::ThinkingEnded => 7,
             EventKind::NeedsInput => 2,
             EventKind::TurnCompleted => 3,
             EventKind::TurnFailed => 4,
@@ -223,8 +227,8 @@ fn fixture_commands_deliver_the_right_events_over_a_real_pipe() {
     hooks.extend(opencode_hooks());
     assert_eq!(
         hooks.len(),
-        19,
-        "six codex plus six claude plus seven opencode hooks"
+        21,
+        "six codex plus six claude plus nine opencode hooks"
     );
 
     for (index, hook) in hooks.iter().enumerate() {

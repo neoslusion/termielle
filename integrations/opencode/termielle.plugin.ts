@@ -5,12 +5,16 @@
 // hooks configuration is needed.
 //
 // The overlay follows the opencode event stream:
-//   message.updated (role=user) -> prompt submitted
-//   permission.asked             -> waiting for input
-//   permission.replied           -> back to work
-//   session.idle                 -> answer ready
-//   session.status (type=error)  -> step failed
-//   session.deleted              -> conversation ended
+//   message.updated (role=user)             -> prompt submitted
+//   message.updated (role=assistant,
+//                    stepType=thinking)     -> thinking started
+//   message.updated (role=assistant,
+//                    stepType=plan/tool/...) -> thinking ended, working
+//   permission.asked                        -> waiting for input
+//   permission.replied                      -> back to work
+//   session.idle                            -> answer ready
+//   session.status (type=error)             -> step failed
+//   session.deleted                         -> conversation ended
 //
 // Every event is one neutral `termielle-emit` invocation with only the
 // session identifier in the argv document; failures are swallowed so a
@@ -51,12 +55,25 @@ export const TermiellePlugin = async ({ $ }) => {
     event: async ({ event }) => {
       const sessionID = sessionIDOf(event)
       switch (event.type) {
-        case "message.updated":
-          // A user-role message landing is the prompt being submitted.
-          if (event?.properties?.info?.role === "user") {
+        case "message.updated": {
+          const info = event?.properties?.info
+          if (info?.role === "user") {
+            // A user-role message landing is the prompt being submitted.
             await emit("prompt_submitted", sessionID)
+          } else if (info?.role === "assistant") {
+            // opencode streams the reasoning step as its own message type, so
+            // the overlay can hold the thinking face for as long as the model
+            // actually reasons instead of a fixed one-second guess. Anything
+            // that is not the reasoning step means the agent is writing or
+            // running tools.
+            if (info?.stepType === "thinking") {
+              await emit("thinking_started", sessionID)
+            } else {
+              await emit("thinking_ended", sessionID)
+            }
           }
           return
+        }
         case "permission.asked":
           await emit("needs_input", sessionID)
           return

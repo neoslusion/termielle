@@ -236,6 +236,8 @@ pub fn parse_args(args: Vec<OsString>) -> Result<EmitArgs, UsageError> {
                 event = Some(match value {
                     "session_started" => EventKind::SessionStarted,
                     "prompt_submitted" => EventKind::PromptSubmitted,
+                    "thinking_started" => EventKind::ThinkingStarted,
+                    "thinking_ended" => EventKind::ThinkingEnded,
                     "needs_input" => EventKind::NeedsInput,
                     "turn_completed" => EventKind::TurnCompleted,
                     "turn_failed" => EventKind::TurnFailed,
@@ -646,6 +648,8 @@ mod tests {
         let expected = [
             ("session_started", EventKind::SessionStarted),
             ("prompt_submitted", EventKind::PromptSubmitted),
+            ("thinking_started", EventKind::ThinkingStarted),
+            ("thinking_ended", EventKind::ThinkingEnded),
             ("needs_input", EventKind::NeedsInput),
             ("turn_completed", EventKind::TurnCompleted),
             ("turn_failed", EventKind::TurnFailed),
