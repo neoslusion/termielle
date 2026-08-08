@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        id: test
+        shell: pwsh
+        run: cargo test --workspace --all-targets 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\test.log"
+      - name: Annotate failures
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:RUNNER_TEMP\test.log") {
+            Get-Content "$env:RUNNER_TEMP\test.log" | Select-Object -Last 40 |
+              ForEach-Object { Write-Host "::error::CI-TAIL $_" }
+          }
+      - name: Doctor
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts\doctor.ps1 -BinDir target\debug
+      - name: Benchmark report
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts\benchmark.ps1 -Samples 5 -Warmups 2 -WorkingSetSeconds 2 -DurationSeconds 2 -BinDir target\debug -NoBuild -ReportOnly

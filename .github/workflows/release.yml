@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release
+        run: cargo build --release
+      - name: Stage and verify
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $stage = Join-Path $env:RUNNER_TEMP "termielle-$tag"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\release\termielle-app.exe $stage
+          Copy-Item target\release\termielle-emit.exe $stage
+          Copy-Item THIRD_PARTY_NOTICES.md $stage
+          Copy-Item README.md $stage
+          Copy-Item integrations $stage -Recurse
+          $tag | Out-File -Encoding ascii (Join-Path $stage 'VERSION')
+          $assets = Join-Path $stage 'assets'
+          New-Item -ItemType Directory -Force -Path $assets | Out-Null
+          Copy-Item assets\*.gif $assets
+          Copy-Item assets\LICENSE.Gemielle $assets
+          pwsh -NoProfile -File scripts\doctor.ps1 -BinDir $stage
+      - name: Checksums
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "termielle-$env:GITHUB_REF_NAME"
+          Push-Location $env:RUNNER_TEMP
+          try {
+            Compress-Archive -Path "$stage\*" -DestinationPath 'termielle-windows-x64.zip'
+            Get-FileHash -Algorithm SHA256 'termielle-windows-x64.zip' |
+              Select-Object -ExpandProperty Hash |
+              Out-File -Encoding ascii 'termielle-windows-x64.zip.sha256'
+          } finally {
+            Pop-Location
+          }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/termielle-windows-x64.zip
+            ${{ runner.temp }}/termielle-windows-x64.zip.sha256
+            install.ps1

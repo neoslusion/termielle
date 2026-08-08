@@ -1,0 +1,63 @@
+# Termielle x Codex CLI
+#
+# Merge the tables below into ~/.codex/config.toml and make sure
+# termielle-emit.exe is on PATH. Every hook is observational: it sends one
+# content-free lifecycle event over the overlay pipe and exits; its stdout is
+# the emitter's neutral `{}` response. A missing overlay never delays Codex.
+#
+# Codex passes the hook event JSON on stdin, so every lifecycle hook reads
+# --input stdin. The legacy notify fallback passes the agent-turn-complete
+# document as its first command-line argument, so it reads --input argv.
+#
+# A custom overlay pipe requires adding --pipe \\.\pipe\<name> to every
+# command below.
+#
+# Boundary: exact reasoning-vs-generation boundaries are not exposed. Termielle
+# performs only the approved local one-second Thinking -> Working transition,
+# and an approval prompt may remain NeedsInput until the next lifecycle event.
+#
+# Codex resolves hooks from ~/.codex/config.toml and <repo>/.codex/config.toml
+# (trusted repos only). Only the user-level config honors the notify key, so
+# keep it here, not in a project config.
+
+# TOML requires root-level keys before any [table] section, and Codex only
+# honors notify from the user-level config.
+notify = [
+  "termielle-emit.exe",
+  "--source", "codex",
+  "--event", "turn_completed",
+  "--input", "argv",
+]
+
+[features]
+codex_hooks = true
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source codex --event session_started --input stdin'
+timeout = 1
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source codex --event prompt_submitted --input stdin'
+timeout = 1
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source codex --event needs_input --input stdin'
+timeout = 1
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source codex --event turn_completed --input stdin'
+timeout = 1
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source codex --event session_ended --input stdin'
+timeout = 1
