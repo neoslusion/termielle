@@ -92,6 +92,10 @@ fn wait_for_ack_state(path: &Path, state: &str, seconds: u64) {
 
 /// Smoke mode on a unique pipe passes only when an external event reaches the
 /// `Thinking` state; the emitter delivers it over the real transport.
+///
+/// The app opens the pipe only after its startup work, and the emitter is
+/// fail-open, so a single early emit can be dropped with no trace on a loaded
+/// machine. Keep emitting until the app exits or the delivery window closes.
 #[test]
 fn smoke_test_passes_on_an_external_event_over_a_custom_pipe() {
     let pipe = unique_pipe("smoke-ext");
@@ -100,17 +104,30 @@ fn smoke_test_passes_on_an_external_event_over_a_custom_pipe() {
         .arg(&pipe)
         .spawn()
         .expect("app starts");
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        emit_prompt_submitted(&pipe, "cli-ext"),
-        "emitter must deliver the event"
-    );
-    let status = wait_exit(child, Instant::now() + Duration::from_secs(15));
-    assert_eq!(
-        Some(0),
-        status.code(),
-        "smoke must exit 0 on an external event"
-    );
+
+    let mut child = child;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                assert_eq!(
+                    Some(0),
+                    status.code(),
+                    "smoke must exit 0 on an external event"
+                );
+                return;
+            }
+            Ok(None) => {}
+            Err(error) => panic!("wait failed: {error}"),
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("smoke run did not exit after an external event");
+        }
+        emit_prompt_submitted(&pipe, "cli-ext");
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Smoke mode with no event at all times out with exit code 1.
@@ -171,11 +188,19 @@ fn ack_file_records_visible_state_transitions() {
         .expect("app starts");
 
     wait_for_ack_state(&ack, "idle", 15);
+    // The first ack line is written after the pipe server is up, but the
+    // emitter is fail-open: if this single delivery is dropped, the run
+    // fails. Retry until the state shows up or the budget runs out.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !ack_has_state(&ack, "thinking") {
+        emit_prompt_submitted(&pipe, "cli-ack");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     assert!(
-        emit_prompt_submitted(&pipe, "cli-ack"),
-        "emitter must deliver the event"
+        ack_has_state(&ack, "thinking"),
+        "ack file never recorded thinking; got: {:?}",
+        fs::read_to_string(&ack)
     );
-    wait_for_ack_state(&ack, "thinking", 15);
 
     let mut child = child;
     let _ = child.kill();

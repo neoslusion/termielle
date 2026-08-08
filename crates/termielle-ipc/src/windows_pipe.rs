@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use termielle_core::MAX_EVENT_BYTES;
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY,
+    ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
     ERROR_PIPE_CONNECTED, ERROR_SEM_TIMEOUT, GENERIC_WRITE, INVALID_HANDLE_VALUE,
 };
 use windows::Win32::Storage::FileSystem::{
@@ -225,7 +225,25 @@ impl PipeServer {
     /// returned to the caller.
     pub fn receive_one(&self) -> Result<Vec<u8>, IpcError> {
         let instance = self.next_instance()?;
-        let connected = self.accept(&instance);
+        let connected = loop {
+            match self.accept(&instance) {
+                Ok(()) => break Ok(()),
+                // A client connected and closed before `ConnectNamedPipe`
+                // completed; the kernel discards the connection and the bytes
+                // it carried, with no error on the client's side. Reset the
+                // instance and keep listening instead of surfacing a ghost
+                // connection as an event error.
+                Err(IpcError::Os(code)) if code == ERROR_NO_DATA.0 => {
+                    // SAFETY: `instance` is a live pipe handle owned by this
+                    // scope; a disconnect failure only means the ghost is
+                    // already gone.
+                    unsafe {
+                        let _ = DisconnectNamedPipe(instance.raw());
+                    }
+                }
+                Err(error) => break Err(error),
+            }
+        };
 
         let result = connected.and_then(|()| read_line(&instance));
 

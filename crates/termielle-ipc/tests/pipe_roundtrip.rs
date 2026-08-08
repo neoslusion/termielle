@@ -93,13 +93,13 @@ fn accepts_a_line_at_exactly_the_protocol_limit() {
 fn serves_two_sequential_clients_from_separate_instances() {
     let name = unique_pipe_name("sequential");
     let (ready_tx, ready_rx) = mpsc::channel();
+    let (line_tx, line_rx) = mpsc::channel();
     let server_name = name.clone();
     let server = thread::spawn(move || {
         let server = PipeServer::bind(&server_name).unwrap();
         ready_tx.send(()).unwrap();
-        let first = server.receive_one().unwrap();
-        let second = server.receive_one().unwrap();
-        (first, second)
+        line_tx.send(server.receive_one().unwrap()).unwrap();
+        line_tx.send(server.receive_one().unwrap()).unwrap();
     });
     ready_rx.recv().unwrap();
 
@@ -109,15 +109,27 @@ fn serves_two_sequential_clients_from_separate_instances() {
     PipeClient::new(&name, Duration::from_millis(20))
         .send(first_line)
         .unwrap();
-    // The second instance only exists once the server loops back around, so this
-    // client is given a budget long enough to cover that gap.
-    PipeClient::new(&name, Duration::from_secs(5))
-        .send(second_line)
-        .unwrap();
+    assert_eq!(line_rx.recv().unwrap(), first_line);
 
-    let (first, second) = server.join().unwrap();
-    assert_eq!(first, first_line);
-    assert_eq!(second, second_line);
+    // A client that closes before the server's `ConnectNamedPipe` completes
+    // has its whole connection discarded by the kernel: the write reports
+    // success but the bytes never arrive, and the server sees `ERROR_NO_DATA`
+    // and waits for the next client. Retry the delivery until the server
+    // confirms receipt, then verify both lines in the expected order.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        PipeClient::new(&name, Duration::from_millis(20))
+            .send(second_line)
+            .unwrap();
+        match line_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(line) if line == second_line => break,
+            Ok(line) => panic!("unexpected line: {line:?}"),
+            Err(_) if Instant::now() < deadline => {}
+            Err(error) => panic!("second line was never delivered: {error}"),
+        }
+    }
+
+    server.join().unwrap();
 }
 
 #[test]

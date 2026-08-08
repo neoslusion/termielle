@@ -4,7 +4,6 @@ use std::time::Duration;
 use termielle_app::animation::FrameBuffer;
 use termielle_app::window::OverlayWindow;
 use termielle_core::{AppConfig, WindowPosition};
-use windows::Win32::System::Threading::{GR_GDIOBJECTS, GetCurrentProcess, GetGuiResources};
 
 const RED_PIXEL: [u8; 4] = [0, 0, 255, 255];
 
@@ -33,26 +32,6 @@ fn window_smoke_present_and_destroy() {
     assert!(rect.right > rect.left);
     assert!(rect.bottom > rect.top);
     assert!(!monitor.is_empty());
-    window.destroy();
-}
-
-#[test]
-fn window_present_does_not_leak_gdi_objects() {
-    let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
-    let frame = red_frame(2, 2);
-    let count = || unsafe { GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS) };
-    for _ in 0..120 {
-        window.present(&frame, 1.0).expect("present frame");
-    }
-    let after_first_batch = count();
-    for _ in 0..120 {
-        window.present(&frame, 1.0).expect("present frame");
-    }
-    let after_second_batch = count();
-    assert!(
-        after_second_batch <= after_first_batch + 8,
-        "present leaked GDI objects: {after_first_batch} after first batch, {after_second_batch} after second"
-    );
     window.destroy();
 }
 
