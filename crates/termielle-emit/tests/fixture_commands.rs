@@ -71,30 +71,35 @@ fn codex_hooks() -> Vec<Hook> {
     hooks
 }
 
-/// Every `command` line from `integrations/claude/settings.fragment.json`.
+/// Every `command` line from `integrations/claude/settings.fragment.json`
+/// and the native plugin manifest, which carry the same hooks.
 fn claude_hooks() -> Vec<Hook> {
-    let text =
-        std::fs::read_to_string(fixture("integrations/claude/settings.fragment.json")).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-
     let mut hooks = Vec::new();
-    for (name, groups) in value["hooks"].as_object().unwrap() {
-        let event = match name.as_str() {
-            "SessionStart" => EventKind::SessionStarted,
-            "UserPromptSubmit" => EventKind::PromptSubmitted,
-            "PermissionRequest" => EventKind::NeedsInput,
-            "Stop" => EventKind::TurnCompleted,
-            "StopFailure" => EventKind::TurnFailed,
-            "SessionEnd" => EventKind::SessionEnded,
-            other => panic!("unexpected claude hook event {other}"),
-        };
-        for group in groups.as_array().unwrap() {
-            for handler in group["hooks"].as_array().unwrap() {
-                hooks.push(Hook {
-                    command: handler["command"].as_str().unwrap().to_string(),
-                    source: Source::Claude,
-                    event,
-                });
+    for relative in [
+        "integrations/claude/settings.fragment.json",
+        "integrations/claude/.claude-plugin/plugin.json",
+    ] {
+        let text = std::fs::read_to_string(fixture(relative)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        for (name, groups) in value["hooks"].as_object().unwrap() {
+            let event = match name.as_str() {
+                "SessionStart" => EventKind::SessionStarted,
+                "UserPromptSubmit" => EventKind::PromptSubmitted,
+                "PermissionRequest" => EventKind::NeedsInput,
+                "Stop" => EventKind::TurnCompleted,
+                "StopFailure" => EventKind::TurnFailed,
+                "SessionEnd" => EventKind::SessionEnded,
+                other => panic!("unexpected claude hook event {other}"),
+            };
+            for group in groups.as_array().unwrap() {
+                for handler in group["hooks"].as_array().unwrap() {
+                    hooks.push(Hook {
+                        command: handler["command"].as_str().unwrap().to_string(),
+                        source: Source::Claude,
+                        event,
+                    });
+                }
             }
         }
     }
@@ -225,8 +230,9 @@ fn fixture_commands_deliver_the_right_events_over_a_real_pipe() {
     hooks.extend(opencode_hooks());
     assert_eq!(
         hooks.len(),
-        21,
-        "six codex plus six claude plus nine opencode hooks"
+        27,
+        "twelve codex plus twelve claude (fragment and plugin manifest) \
+         plus nine opencode hooks"
     );
 
     for (index, hook) in hooks.iter().enumerate() {

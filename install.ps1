@@ -176,7 +176,7 @@ try {
     Write-Host ''
     Write-Host 'Termielle installed.' -ForegroundColor Green
     Write-Host "  - Binaries:    $bin"
-    Write-Host "  - Config:      $(Join-Path $dest 'config.json')"
+    Write-Host "  - Config:      $(Join-Path $env:USERPROFILE '.termielle\config.json')"
     Write-Host '  - Restart opencode once if you use it, so the plugin loads.'
     Write-Host '  - Uninstall:   Stop-Process termielle-app; Unregister-ScheduledTask Termielle;'
     Write-Host "                 Remove-Item -Recurse $dest; remove the bin entry from PATH."

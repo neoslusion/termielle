@@ -31,6 +31,10 @@ and invokes `termielle-emit.exe` with the session identifier and nothing else.
 The wire contract is versioned and documented in [docs/protocol.md](docs/protocol.md);
 new agents start from the scaffold in `integrations/_template/`.
 
+The integrations are packaged the way each agent expects. Installing one means
+placing a file in your agent's own configuration directory — the installer
+wires them automatically when it finds the agents, or you can do it by hand:
+
 | Event | Overlay face |
 | --- | --- |
 | `session_started` | idle |
@@ -48,19 +52,22 @@ so a hook never blocks an agent. It must be reachable on `PATH` (or via the
 overlay endpoint is supported with `--pipe <name>` on both the app and the
 emitter.
 
-- **Claude Code** — merge the `hooks` object from
-  `integrations/claude/settings.fragment.json` into `~/.claude/settings.json`.
-  Covers all six events, including `StopFailure` -> `turn_failed`.
+- **Claude Code** — the native plugin package is
+  `integrations/claude/.claude-plugin/plugin.json` (name `termielle`, with all
+  six hooks). Installing it the classic way means merging the `hooks` object
+  from `integrations/claude/settings.fragment.json` into
+  `~/.claude/settings.json`. Covers all six events, including
+  `StopFailure` -> `turn_failed`.
 - **Codex** — merge the `hooks` table from `integrations/codex/hooks.toml` into
   `~/.codex/config.toml`. The legacy `notify` fallback is only honored from the
   user-level config, so keep it there. Codex exposes no failure event, so
   `turn_failed` is not mapped.
-- **opencode** — copy `integrations/opencode/termielle.plugin.ts` into
-  `~/.config/opencode/plugins/` (all projects) or `.opencode/plugins/` (one
-  project) and restart; plugins load at startup, so no hooks config is needed.
-  The plugin maps prompts, real reasoning (`thinking_started`/`thinking_ended`
-  from the assistant message stream), permission prompts, step failures, and
-  status to emitter calls.
+- **opencode** — the native plugin is
+  `integrations/opencode/termielle.plugin.ts`; copy it into
+  `~/.config/opencode/plugins/` (all projects) and restart. The plugin maps
+  prompts, real reasoning (`thinking_started`/`thinking_ended` from the
+  assistant message stream), permission prompts, step failures, and status to
+  emitter calls.
 
 Claude and Codex expose no reasoning boundary, so their `Thinking -> Working`
 transition is the local one-second heuristic; opencode's thinking face is
