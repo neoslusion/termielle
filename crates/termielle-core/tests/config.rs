@@ -19,6 +19,7 @@ fn sample_config() -> AppConfig {
             y_logical: 40,
         }),
         render: RenderMode::ColorKey,
+        frame_rate: Some(60),
     }
 }
 

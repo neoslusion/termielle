@@ -16,13 +16,13 @@ use termielle_app::animation::fallback_frame;
 use termielle_app::app::{Controller, ControllerActions, FALLBACK_FRAME_SIZE};
 use termielle_app::log::{BoundedLog, LogComponent, LogEvent, LogLevel, LogRecord};
 use termielle_app::tray;
-use termielle_app::window::{OverlayWindow, WakeHandle, WindowError, WindowEvent};
+use termielle_app::window::{AnimationClock, OverlayWindow, WakeHandle, WindowError, WindowEvent};
 use termielle_core::{
-    AppConfig, AssetCatalog, EventKind, EventMessage, PROTOCOL_VERSION, ProtocolError,
-    ReducedMotion, RenderMode, Source, VisualState, decode_event_line, encode_event_line,
-    load_config,
+    AppConfig, AssetCatalog, DEFAULT_EVENT_LOG_MAX_BYTES, EventKind, EventLog, EventMessage,
+    PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode, Source, VisualState,
+    decode_event_line, encode_event_line, load_config,
 };
-use termielle_ipc::{DEFAULT_PIPE_NAME, IpcError, PipeClient, PipeServer};
+use termielle_ipc::{DEFAULT_PIPE_NAME, EventClient, EventServer, IpcError};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PATH_NOT_FOUND, GetLastError, HANDLE, SetLastError,
     WIN32_ERROR,
@@ -45,6 +45,33 @@ const ALL_STATES: [VisualState; 6] = [
     VisualState::Ready,
     VisualState::Failed,
 ];
+
+/// Raises the process-wide timer resolution to 1 ms for the process lifetime.
+/// The animation cadence is 20-40 ms per frame; the default 15.6 ms system
+/// timer makes such short deadlines fire irregularly (a 20 ms frame can land
+/// at 31 ms), which reads as shutter. `timeBeginPeriod(1)` removes that
+/// jitter for as long as the overlay lives.
+struct PreciseTimer;
+
+impl PreciseTimer {
+    fn enable() -> Self {
+        // SAFETY: the call has no pointers and cannot fail; the matching
+        // `timeEndPeriod` runs when the guard drops.
+        unsafe {
+            let _ = windows::Win32::Media::timeBeginPeriod(1);
+        }
+        Self
+    }
+}
+
+impl Drop for PreciseTimer {
+    fn drop(&mut self) {
+        // SAFETY: balances the matching `timeBeginPeriod` from `enable`.
+        unsafe {
+            let _ = windows::Win32::Media::timeEndPeriod(1);
+        }
+    }
+}
 
 /// How long the smoke test waits for its in-process pipe event.
 const SMOKE_TIMEOUT_MS: u32 = 5_000;
@@ -92,7 +119,14 @@ impl Cli {
 }
 
 fn main() {
+    // The frame timer needs millisecond precision; enable it before any
+    // timing path runs, including the smoke test.
+    let _precise_timer = PreciseTimer::enable();
+
     let cli = Cli::parse();
+
+    // One-time move of user state from the pre-0.2 location.
+    migrate_legacy_data();
 
     // One overlay per session: a second instance must neither appear nor
     // steal events. The claim is held for the whole process lifetime. A
@@ -135,9 +169,17 @@ fn main() {
     let wake = window.wake_handle();
     if !cli.smoke_test && cli.pipe == DEFAULT_PIPE_NAME {
         // Only the production overlay gets the tray icon: diagnostics runs on
-        // custom pipes stay out of the notification area.
-        if !window.install_tray() {
-            log_error(&log, LogComponent::Window, LogEvent::PresentFailed, 9);
+        // custom pipes stay out of the notification area. The icon is the
+        // character's idle face when the standby asset is present.
+        let catalog = AssetCatalog::new(asset_roots());
+        let idle_asset = catalog.resolve(VisualState::Idle);
+        if let Err(code) = window.install_tray(idle_asset.as_deref()) {
+            log_error(
+                &log,
+                LogComponent::Window,
+                LogEvent::PresentFailed,
+                code as i32,
+            );
         }
     }
     let mut controller = Controller::new(
@@ -145,11 +187,35 @@ fn main() {
         config.busy_stall_ms,
         AssetCatalog::new(asset_roots()),
         reduced_motion_enabled(config.reduced_motion),
+        // A fixed frame rate overrides each GIF's own delays: the overlay
+        // presents frames at exactly this cadence (clamped to a whole
+        // millisecond interval).
+        config
+            .frame_rate
+            .map(|rate| ((1000u64 + u64::from(rate) / 2) / u64::from(rate)).max(1)),
     );
+
+    // Only the production overlay journals and replays: diagnostics runs on
+    // custom pipes must neither inherit nor pollute the live state.
+    let journal = if !cli.smoke_test && cli.pipe == DEFAULT_PIPE_NAME {
+        Some(EventLog::new(events_path(), DEFAULT_EVENT_LOG_MAX_BYTES))
+    } else {
+        None
+    };
+
+    // Rebuild the pre-restart state from the journal before any live event can
+    // arrive. The fold is absolute-time driven, so a restart that happened
+    // after the ready-hold or busy-stall expired replays straight into Idle,
+    // and a restart mid-turn picks up exactly where the crash left off.
+    if let Some(journal) = &journal {
+        for event in journal.read_all() {
+            controller.handle_event(event, now_ms());
+        }
+    }
 
     // Claim the pipe on the main thread so a name squatter is rejected at
     // startup, then hand the server to the pipe thread.
-    let server = match PipeServer::bind(&cli.pipe) {
+    let server = match EventServer::bind(&cli.pipe) {
         Ok(server) => server,
         Err(IpcError::PipeNameOwned) => {
             log_error(&log, LogComponent::Ipc, LogEvent::InvalidEvent, 3);
@@ -196,7 +262,14 @@ fn main() {
         });
 
     present_current(&mut window, &mut controller, &log, ack.as_mut());
-    let restart = run_gui(&mut window, &mut controller, &receiver, &log, &mut ack);
+    let restart = run_gui(
+        &mut window,
+        &mut controller,
+        &receiver,
+        &log,
+        &mut ack,
+        journal.as_ref(),
+    );
     drop(instance);
     if restart {
         // The single-instance claim is already released, so the new process
@@ -207,10 +280,59 @@ fn main() {
     }
 }
 
-/// The overlay's data directory: `%LOCALAPPDATA%\Termielle`.
+/// The overlay's data directory: `%USERPROFILE%\.termielle`, the same
+/// dot-directory convention as `~/.claude`. All user-facing state lives
+/// here; the installed binaries stay under `%LOCALAPPDATA%\Termielle\bin`.
 fn data_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")?;
+    Some(PathBuf::from(home).join(".termielle"))
+}
+
+/// The legacy data directory, `%LOCALAPPDATA%\Termielle`, used before the
+/// move to `~/.termielle`.
+fn legacy_data_dir() -> Option<PathBuf> {
     let local = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(local).join("Termielle"))
+}
+
+/// Copies user-facing state from the legacy `%LOCALAPPDATA%\Termielle`
+/// location into `~/.termielle`, once. The installed binaries stay where the
+/// installer put them; config, the user asset folder, and the logs move.
+fn migrate_legacy_data() {
+    let (Some(legacy), Some(current)) = (legacy_data_dir(), data_dir()) else {
+        return;
+    };
+    if !legacy.join("config.json").is_file() {
+        return;
+    }
+    if current.join("config.json").is_file() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&current);
+    for name in ["config.json", "assets", "termielle.log", "events.log"] {
+        let from = legacy.join(name);
+        let to = current.join(name);
+        if from.is_dir() {
+            let _ = copy_tree(&from, &to);
+        } else if from.is_file() {
+            let _ = std::fs::copy(&from, &to);
+        }
+    }
+}
+
+/// Recursively copies a directory tree.
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Where the bounded JSON-lines log lives.
@@ -218,6 +340,13 @@ fn log_path() -> PathBuf {
     data_dir()
         .map(|dir| dir.join("termielle.log"))
         .unwrap_or_else(|| PathBuf::from("termielle.log"))
+}
+
+/// Where the replayed event journal lives.
+fn events_path() -> PathBuf {
+    data_dir()
+        .map(|dir| dir.join("events.log"))
+        .unwrap_or_else(|| PathBuf::from("events.log"))
 }
 
 /// Asset roots: the user's folder first, then the install directory.
@@ -453,7 +582,7 @@ impl AckWriter {
 /// One blocking server thread: decode accepted lines, queue valid events,
 /// and wake the GUI thread out of `GetMessageW`.
 fn spawn_pipe_thread(
-    server: PipeServer,
+    server: EventServer,
     wake: WakeHandle,
     sender: Sender<EventMessage>,
     log: Arc<Mutex<BoundedLog>>,
@@ -555,9 +684,21 @@ fn apply(
 }
 
 /// Drains every queued pipe event into the controller, merging the actions.
-fn drain_pipe(controller: &mut Controller, receiver: &Receiver<EventMessage>) -> ControllerActions {
+///
+/// Each event is journaled before it is folded: a crash between the two loses
+/// the event, and replaying from the journal is exactly what restores it.
+fn drain_pipe(
+    controller: &mut Controller,
+    receiver: &Receiver<EventMessage>,
+    journal: Option<&EventLog>,
+) -> ControllerActions {
     let mut actions = ControllerActions::default();
     while let Ok(event) = receiver.try_recv() {
+        if let Some(journal) = journal {
+            // A journal failure is logged nowhere and stalls nothing: the
+            // overlay keeps running, it simply forgets the event on restart.
+            let _ = journal.append(&event);
+        }
         actions = merge(actions, controller.handle_event(event, now_ms()));
     }
     actions
@@ -574,6 +715,25 @@ fn merge(left: ControllerActions, right: ControllerActions) -> ControllerActions
     }
 }
 
+/// Applies the controller's actions, measuring the present cost when a frame
+/// was actually presented so the animation clock can subtract it from the
+/// next frame interval (a slow present would otherwise stretch every gap).
+fn apply_timed(
+    window: &mut OverlayWindow,
+    controller: &mut Controller,
+    log: &Arc<Mutex<BoundedLog>>,
+    actions: ControllerActions,
+    ack: &mut Option<AckWriter>,
+) {
+    if actions.present_frame {
+        let started = std::time::Instant::now();
+        apply(window, controller, log, actions, ack);
+        controller.set_present_cost(started.elapsed().as_millis() as u64);
+    } else {
+        apply(window, controller, log, actions, ack);
+    }
+}
+
 /// The production loop: block on the window, react to timer and display
 /// changes, drain pipe events, present when required, and re-arm one timer.
 /// Returns whether the overlay should be relaunched after the graceful quit.
@@ -583,7 +743,11 @@ fn run_gui(
     receiver: &Receiver<EventMessage>,
     log: &Arc<Mutex<BoundedLog>>,
     ack: &mut Option<AckWriter>,
+    journal: Option<&EventLog>,
 ) -> bool {
+    // The animation clock thread paces frames; the smoke test's timeout timer
+    // is separate and unaffected.
+    let clock = AnimationClock::spawn(window.wake_handle());
     loop {
         // Catch up on deadlines that became due while we were blocked.
         loop {
@@ -595,21 +759,22 @@ fn run_gui(
                 break;
             }
             let actions = controller.on_timer(now);
-            apply(window, controller, log, actions, ack);
+            apply_timed(window, controller, log, actions, ack);
         }
 
-        // Arm the single timer for the nearest deadline; disarming when none.
-        let delay = controller
-            .next_deadline_ms()
-            .and_then(|at| u32::try_from(at.saturating_sub(now_ms())).ok());
-        let _ = window.set_timer(delay);
+        // Arm the clock for the nearest deadline; disarming when none. The
+        // clock thread wakes the loop out of `next_event`, which lands here
+        // via the `Ok(None)` path and re-runs the catch-up above.
+        clock.arm(controller.next_deadline_ms());
 
         let event = match window.next_event() {
             Ok(Some(event)) => event,
             Ok(None) => {
-                // A wake message or WM_QUIT: drain queued pipe events.
-                let actions = drain_pipe(controller, receiver);
-                apply(window, controller, log, actions, ack);
+                // A wake message (deadline due, or a pipe event) or WM_QUIT:
+                // drain queued pipe events; the catch-up loop above handles
+                // any deadline that is now due.
+                let actions = drain_pipe(controller, receiver, journal);
+                apply_timed(window, controller, log, actions, ack);
                 continue;
             }
             Err(error) => {
@@ -638,8 +803,8 @@ fn run_gui(
                 return true;
             }
         };
-        actions = merge(actions, drain_pipe(controller, receiver));
-        apply(window, controller, log, actions, ack);
+        actions = merge(actions, drain_pipe(controller, receiver, journal));
+        apply_timed(window, controller, log, actions, ack);
     }
 }
 
@@ -678,7 +843,7 @@ fn run_smoke(
         })
         .expect("smoke event encodes");
         std::thread::spawn(move || {
-            let client = PipeClient::new(DEFAULT_PIPE_NAME, Duration::from_secs(5));
+            let client = EventClient::new(DEFAULT_PIPE_NAME, Duration::from_secs(5));
             let _ = client.send(&line);
         });
     }
@@ -705,7 +870,7 @@ fn run_smoke(
                 return 1;
             }
         }
-        let actions = drain_pipe(controller, receiver);
+        let actions = drain_pipe(controller, receiver, None);
         if actions.visible_state == Some(VisualState::Thinking) {
             window.destroy();
             return 0;

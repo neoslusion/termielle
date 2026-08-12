@@ -2,15 +2,18 @@
 
 Termielle is a low-overhead animated desktop companion for the terminal. A
 transparent overlay character follows Claude Code, Codex CLI, and opencode
-lifecycle events, received over a local named pipe. Version 1 targets Windows,
-including hooks launched from WSL through a bridge executable. The events are
-small and content-free: no prompts or terminal output are ever captured.
+lifecycle events, received over a local named pipe (Windows) or Unix domain
+socket (macOS/Linux). Version 1 targets Windows, including hooks launched from
+WSL through a bridge executable; the event protocol, transport, and emitter
+are platform-neutral and covered by a Linux CI job. The events are small and
+content-free: no prompts or terminal output are ever captured.
 
 ## Install
 
 One-shot installer — downloads the latest release, verifies the checksum,
-installs to `%LOCALAPPDATA%\Termielle`, registers the crash-watchdog startup
-task, and wires up whichever agent integrations are present:
+installs the binaries to `%LOCALAPPDATA%\Termielle\bin`, registers the
+crash-watchdog startup task, and wires up whichever agent integrations are
+present:
 
 ```powershell
 irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
@@ -18,13 +21,15 @@ irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1
 
 Manual install: unpack the `termielle-windows-x64.zip` release asset into
 `%LOCALAPPDATA%\Termielle\bin`, add that directory to `PATH`, and run
-`termielle-app.exe`. It reads `%LOCALAPPDATA%\Termielle\config.json` and sits
-in the notification area. `scripts/doctor.ps1` validates an install end to end.
+`termielle-app.exe`. It reads `~\.termielle\config.json` (the same dot-directory
+convention as `~\.claude`) and sits in the notification area.
 
 ## Integrations
 
 Each agent translates its own lifecycle events into one of the protocol events
-and invokes `termielle-emit.exe` with the session identifier and nothing else:
+and invokes `termielle-emit.exe` with the session identifier and nothing else.
+The wire contract is versioned and documented in [docs/protocol.md](docs/protocol.md);
+new agents start from the scaffold in `integrations/_template/`.
 
 | Event | Overlay face |
 | --- | --- |
@@ -40,7 +45,7 @@ and invokes `termielle-emit.exe` with the session identifier and nothing else:
 The emitter is fail-open: with no overlay running it prints `{}` and exits 0,
 so a hook never blocks an agent. It must be reachable on `PATH` (or via the
 `TERMIELLE_EMIT` environment variable pointing at the absolute path). A custom
-overlay pipe is supported with `--pipe \\.\pipe\<name>` on both the app and the
+overlay endpoint is supported with `--pipe <name>` on both the app and the
 emitter.
 
 - **Claude Code** — merge the `hooks` object from
@@ -70,9 +75,18 @@ busy-stall idle decay (`busy_stall_ms`, default 5 minutes).
 The overlay artwork is the Gemielle asset set, redistributed under the Apache
 License 2.0 (copy at `assets/LICENSE.Gemielle`). Every file is listed with
 source, SHA256, and modifications in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-To install it, copy the GIFs into `%LOCALAPPDATA%\Termielle\assets\`; each
-visual state resolves to one file, and a procedural ring is drawn when an asset
-is missing or undecodable.
+The shipped GIFs are re-encodings produced by `crates/termielle-asset` from
+the unmodified originals in `assets/sources/`: composited with the GIF
+specification's disposal semantics, cropped to the shared character box
+(329x294, so the window never resizes between states), and re-encoded with
+one global palette and full-canvas Background-disposal frames so motion never
+traces. The `refine` subcommand regenerates them, and `verify` proves a
+regenerated set renders pixel-identical to the sources through WIC, the
+overlay's own decoder.
+
+To install a custom set, copy GIFs into `~\.termielle\assets\`;
+each visual state resolves to one file, and a procedural ring is drawn when an
+asset is missing or undecodable.
 
 ## Rendering and tray
 
@@ -82,6 +96,13 @@ The overlay composites its layered window with per-pixel alpha via
 for display drivers whose layered DIB redirection renders black. The tray icon
 shows the current face and offers `Restart` and `Exit`; `Exit` terminates with
 code 0 so the external watchdog does not relaunch it.
+
+Animation playback is paced by a dedicated clock thread (not `WM_TIMER`, whose
+message-queue latency cannot hold a 16 ms cadence), with the measured present
+cost subtracted from each frame interval. Set `{"frame_rate": 60}` in the
+config file to play every animation at that frame rate instead of the GIF's
+own delays — the loop then takes frame count / rate seconds (the shipped
+60-frame assets loop in one second).
 
 ## Diagnostics
 
@@ -100,18 +121,36 @@ Two PowerShell 7 scripts exercise an install without any agent running:
 Both scripts launch the overlay in an isolated instance (unique pipe, unique
 mutex), so they never disturb a live companion.
 
+## Persistence
+
+The overlay journals every accepted event to `events.log` next to its
+config and replays it at startup, so a tray `Restart` or a crash-watchdog
+relaunch picks up exactly where the session was instead of starting over at
+Idle. The journal is bounded (1 MiB, oldest lines dropped) and replay is
+absolute-time driven: a restart after the ready-hold or busy-stall expired
+comes back as Idle anyway. Diagnostics runs on custom pipes neither journal
+nor replay.
+
 ## Workspace
 
-The Rust workspace (edition 2024) is split into four crates:
+The Rust workspace (edition 2024) is split into five crates:
 
-- `crates/termielle-core` — event protocol, session reducer, configuration.
-- `crates/termielle-ipc` — user-scoped named-pipe transport.
+- `crates/termielle-core` — event protocol, session reducer, configuration,
+  and the replayed event journal.
+- `crates/termielle-ipc` — the platform-abstracted transport: an owner-only
+  named pipe on Windows, an owner-only Unix domain socket elsewhere. Both
+  share one one-connection-per-event contract and one test suite.
 - `crates/termielle-emit` — the fail-open hook emitter executable.
+- `crates/termielle-asset` — the artwork toolkit: analyze, refine, verify,
+  preview. Its LZW encoder is a faithful port of GifLib's, whose streams WIC,
+  .NET, and the gif crate all read identically.
 - `crates/termielle-app` — the GIF overlay, single-instance guard, tray, and
-  diagnostics (`--smoke-test`, `--ack-file`).
+  diagnostics (`--smoke-test`, `--ack-file`). Its assets test validates the
+  shipped artwork frame by frame through WIC, the overlay's own decoder.
 
 `scripts/` holds the PowerShell 7 harnesses, and `.github/workflows/` runs
-fmt/clippy/tests in CI and packages checksummed release builds.
+fmt/clippy/tests in CI on Windows, packages checksummed release builds, and
+keeps core/ipc/emit green on Linux.
 
 ## Inspiration
 

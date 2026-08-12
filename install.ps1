@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     Downloads the latest release, verifies its checksum, installs to
-    %LOCALAPPDATA%\Termielle, adds the emitter to PATH, registers the
+    %LOCALAPPDATA%\Termielle\bin, adds the emitter to PATH, registers the
     crash-watchdog scheduled task, and wires up the CLI integrations it
     finds (opencode, Claude Code, Codex). Safe to re-run: it upgrades the
     binaries in place and leaves the user configuration alone.

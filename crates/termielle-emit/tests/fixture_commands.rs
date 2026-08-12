@@ -2,6 +2,11 @@
 //! `integrations/` must be an executable emitter invocation that delivers the
 //! right (source, event, session) pair over a real named pipe, and the hook
 //! payload must never leak beyond the session identifier.
+//!
+//! The checked-in fixtures are Windows command lines (`command_windows`,
+//! `termielle-emit.exe`), so this suite runs on Windows only.
+
+#![cfg(windows)]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -9,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use termielle_core::{EventKind, Source, decode_event_line};
-use termielle_ipc::PipeServer;
+use termielle_ipc::EventServer;
 
 fn fixture(relative: &str) -> PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -191,16 +196,9 @@ impl Hook {
 /// never reached.
 #[test]
 fn fixture_commands_deliver_the_right_events_over_a_real_pipe() {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    let pipe = termielle_ipc::test_endpoint("fixture");
 
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let pipe = format!(
-        r"\\.\pipe\termielle-fixture-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-
-    let server = PipeServer::bind(&pipe).expect("bind test pipe");
+    let server = EventServer::bind(&pipe).expect("bind test pipe");
     let (sender, receiver) = mpsc::channel();
     let (ready_sender, ready) = mpsc::channel();
     std::thread::spawn(move || {

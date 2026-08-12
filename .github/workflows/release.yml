@@ -32,6 +32,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $assets | Out-Null
           Copy-Item assets\*.gif $assets
           Copy-Item assets\LICENSE.Gemielle $assets
+          Copy-Item assets\sources $assets -Recurse
           pwsh -NoProfile -File scripts\doctor.ps1 -BinDir $stage
       - name: Checksums
         shell: pwsh

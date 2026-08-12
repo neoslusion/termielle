@@ -5,17 +5,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 
 use termielle_core::{EventKind, decode_event_line};
-use termielle_ipc::PipeServer;
+use termielle_ipc::{EventServer, test_endpoint};
 
 fn unique_pipe_name(label: &str) -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!(
-        r"\\.\pipe\termielle-emit-test-{}-{}-{}",
-        std::process::id(),
-        label,
-        NEXT.fetch_add(1, Ordering::Relaxed),
-    )
+    test_endpoint(&format!("emit-{label}"))
 }
 
 /// A `termielle-emit.exe` command with piped stdio and no implicit arguments,
@@ -34,7 +27,7 @@ fn a_real_process_delivers_one_claude_event_to_the_server() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let server_name = name.clone();
     let server = std::thread::spawn(move || {
-        let server = PipeServer::bind(&server_name).expect("bind");
+        let server = EventServer::bind(&server_name).expect("bind");
         ready_tx.send(()).unwrap();
         server.receive_one().expect("receive")
     });
@@ -84,7 +77,7 @@ fn a_real_process_delivers_one_opencode_event_from_an_argv_document() {
     let (ready_tx, ready_rx) = mpsc::channel();
     let server_name = name.clone();
     let server = std::thread::spawn(move || {
-        let server = PipeServer::bind(&server_name).expect("bind");
+        let server = EventServer::bind(&server_name).expect("bind");
         ready_tx.send(()).unwrap();
         server.receive_one().expect("receive")
     });

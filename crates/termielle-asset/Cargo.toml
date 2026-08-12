@@ -1,0 +1,13 @@
+[package]
+name = "termielle-asset"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "termielle-asset"
+path = "src/main.rs"
+
+[dependencies]
+gif.workspace = true

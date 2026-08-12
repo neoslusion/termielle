@@ -95,7 +95,7 @@ fn write_gif(dir: &Path, name: &str, frames: &[(u16, u8)]) -> std::path::PathBuf
 
 #[test]
 fn swaps_thinking_to_working_without_a_fixed_poll_loop() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     let actions = controller.handle_event(prompt_event(S1, 10_000), 10_000);
     assert_eq!(actions.visible_state, Some(VisualState::Thinking));
     assert!(actions.present_frame);
@@ -110,7 +110,7 @@ fn swaps_thinking_to_working_without_a_fixed_poll_loop() {
 
 #[test]
 fn duplicate_completion_does_not_restart_the_ready_timer() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     controller.handle_event(completed_event(S1, 20_000), 20_000);
 
     let actions = controller.handle_event(completed_event(S1, 20_000), 21_000);
@@ -122,7 +122,7 @@ fn duplicate_completion_does_not_restart_the_ready_timer() {
 
 #[test]
 fn missing_assets_render_the_procedural_fallback() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
 
     let frame = controller.current_frame();
@@ -139,7 +139,7 @@ fn a_corrupt_asset_falls_back_without_panicking() {
     std::fs::write(dir.path().join(THINKING_GIF), b"this is not a gif image").unwrap();
     let catalog = AssetCatalog::new(vec![dir.path().to_path_buf()]);
 
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false, None);
     let actions = controller.handle_event(prompt_event(S1, 10_000), 10_000);
     assert_eq!(actions.visible_state, Some(VisualState::Thinking));
     assert!(actions.error_code.is_some());
@@ -152,7 +152,7 @@ fn a_corrupt_asset_falls_back_without_panicking() {
 #[test]
 fn animation_deadline_drives_the_timer_before_the_state_deadline() {
     let (_dir, catalog) = gif_catalog();
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
 
     // The first animation frame is due before the thinking -> working flip.
@@ -182,9 +182,23 @@ fn animation_deadline_drives_the_timer_before_the_state_deadline() {
 }
 
 #[test]
+fn a_fixed_frame_interval_overrides_the_gif_delays() {
+    let (_dir, catalog) = gif_catalog();
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false, Some(100));
+    controller.handle_event(prompt_event(S1, 10_000), 10_000);
+
+    // The GIF's first frame is due at +400 ms, but the fixed interval wins.
+    assert_eq!(controller.next_deadline_ms(), Some(10_100));
+    let actions = controller.on_timer(10_100);
+    assert!(actions.present_frame);
+    // The next frame is due another 100 ms later, not at the GIF's +800.
+    assert_eq!(controller.next_deadline_ms(), Some(10_200));
+}
+
+#[test]
 fn reduced_motion_shows_the_first_frame_without_a_frame_deadline() {
     let (_dir, catalog) = gif_catalog();
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, true);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, true, None);
 
     let actions = controller.handle_event(prompt_event(S1, 10_000), 10_000);
     assert_eq!(actions.visible_state, Some(VisualState::Thinking));
@@ -209,7 +223,7 @@ fn reduced_motion_shows_the_first_frame_without_a_frame_deadline() {
 
 #[test]
 fn needs_input_outranks_a_thinking_session() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
 
     let actions = controller.handle_event(needs_input_event(S2, 10_500), 10_500);
@@ -227,7 +241,7 @@ fn needs_input_outranks_a_thinking_session() {
 
 #[test]
 fn session_ended_returns_to_the_previous_state() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
     controller.handle_event(needs_input_event(S2, 10_500), 10_500);
 
@@ -238,7 +252,7 @@ fn session_ended_returns_to_the_previous_state() {
 
 #[test]
 fn a_late_event_advances_due_transitions_first() {
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
 
     // The same prompt re-delivered after its thinking hold elapsed: time passed,
@@ -250,7 +264,7 @@ fn a_late_event_advances_due_transitions_first() {
 
 #[test]
 fn idle_has_no_pending_deadline() {
-    let controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false);
+    let controller = Controller::new(5_000, BUSY_STALL_MS, catalog(), false, None);
     assert_eq!(controller.next_deadline_ms(), None);
     let frame = controller.current_frame();
     assert_eq!(frame.width, FALLBACK_FRAME_SIZE);
@@ -273,7 +287,7 @@ fn idle_has_no_pending_deadline() {
 #[test]
 fn a_duplicate_delivery_does_not_restart_the_animation() {
     let (_dir, catalog) = gif_catalog();
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
     assert_eq!(controller.next_deadline_ms(), Some(10_400));
 
@@ -286,7 +300,7 @@ fn a_duplicate_delivery_does_not_restart_the_animation() {
 #[test]
 fn fallback_to_still_replaces_the_active_animation() {
     let (_dir, catalog) = gif_catalog();
-    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false);
+    let mut controller = Controller::new(5_000, BUSY_STALL_MS, catalog, false, None);
     controller.handle_event(prompt_event(S1, 10_000), 10_000);
     assert_eq!(controller.next_deadline_ms(), Some(10_400));
 

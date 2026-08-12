@@ -15,6 +15,10 @@ const MIN_READY_HOLD_MS: u64 = 1_000;
 const MAX_READY_HOLD_MS: u64 = 30_000;
 const DEFAULT_READY_HOLD_MS: u64 = 5_000;
 
+/// Fixed animation playback rate bounds, in frames per second.
+const MIN_FRAME_RATE: u32 = 1;
+const MAX_FRAME_RATE: u32 = 240;
+
 /// Busy-state stall bounds: how long a Thinking or Working session may stay
 /// silent before the overlay returns to Idle, in milliseconds. The lower bound
 /// keeps a briefly paused agent from flickering out; the upper bound stays
@@ -70,6 +74,10 @@ pub struct AppConfig {
     pub busy_stall_ms: u64,
     pub position: Option<WindowPosition>,
     pub render: RenderMode,
+    /// Fixed animation playback rate in frames per second. When set, the
+    /// overlay presents animation frames at this rate instead of the GIF's
+    /// own delays; the loop duration becomes frame count / rate.
+    pub frame_rate: Option<u32>,
 }
 
 impl Default for AppConfig {
@@ -82,6 +90,7 @@ impl Default for AppConfig {
             busy_stall_ms: DEFAULT_BUSY_STALL_MS,
             position: None,
             render: RenderMode::PerPixel,
+            frame_rate: None,
         }
     }
 }
@@ -112,6 +121,9 @@ impl AppConfig {
         self.busy_stall_ms = self
             .busy_stall_ms
             .clamp(MIN_BUSY_STALL_MS, MAX_BUSY_STALL_MS);
+        self.frame_rate = self
+            .frame_rate
+            .map(|rate| rate.clamp(MIN_FRAME_RATE, MAX_FRAME_RATE));
     }
 }
 

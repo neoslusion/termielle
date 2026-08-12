@@ -1,0 +1,46 @@
+# Termielle x <Agent Label>
+#
+# Merge the tables below into the agent's user-level configuration and make
+# sure termielle-emit.exe is on PATH. Every hook is observational: it sends one
+# content-free lifecycle event over the overlay transport and exits; its stdout
+# is the emitter's neutral `{}` response. A missing overlay never delays the
+# agent.
+#
+# Boundary: <describe the approximations: reasoning boundary, waiting state,
+# failure detection — anything the agent's hooks cannot observe exactly>.
+#
+# A custom overlay transport requires adding --pipe <endpoint> to every
+# command below.
+
+[features]
+<agent>_hooks = true
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source <agent> --event session_started --input stdin'
+timeout = 1
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source <agent> --event prompt_submitted --input stdin'
+timeout = 1
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source <agent> --event needs_input --input stdin'
+timeout = 1
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source <agent> --event turn_completed --input stdin'
+timeout = 1
+
+[[hooks.SessionEnd]]
+[[hooks.SessionEnd.hooks]]
+type = "command"
+command_windows = 'termielle-emit.exe --source <agent> --event session_ended --input stdin'
+timeout = 1

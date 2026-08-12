@@ -47,6 +47,13 @@ pub const COLOR_KEY_REF: u32 = 0x00FF00FF;
 /// above it are painted straight, everything below becomes the key color.
 pub const COLOR_KEY_ALPHA_THRESHOLD: u8 = 128;
 
+/// The row stride of a 24-bit top-down DIB: every row is padded to a 4-byte
+/// boundary. `SetDIBitsToDevice` reads rows at this stride, so the paint
+/// buffer must match it exactly.
+pub fn dib_stride(width: u32) -> usize {
+    (width * 3).div_ceil(4) as usize * 4
+}
+
 /// The color-key renderer's per-pixel decision: pixels at or above
 /// [`COLOR_KEY_ALPHA_THRESHOLD`] become straight RGB (un-premultiplied from
 /// BGRA), everything below becomes the key color for the compositor to erase.
@@ -517,13 +524,17 @@ impl OverlayWindow {
         WakeHandle { hwnd: self.hwnd }
     }
 
-    /// Adds the notification-area icon for the production overlay.
-    pub fn install_tray(&mut self) -> bool {
-        if tray::add(self.hwnd) {
-            self.tray = true;
-            true
-        } else {
-            false
+    /// Adds the notification-area icon for the production overlay. The icon
+    /// is the character's idle face when `character_path` resolves, else the
+    /// plain application icon. Returns the Win32 error code when the shell
+    /// rejects the icon.
+    pub fn install_tray(&mut self, character_path: Option<&std::path::Path>) -> Result<(), u32> {
+        match tray::add(self.hwnd, character_path) {
+            Ok(()) => {
+                self.tray = true;
+                Ok(())
+            }
+            Err(code) => Err(code),
         }
     }
 
@@ -663,7 +674,13 @@ impl OverlayWindow {
             return Err(WindowError::FrameBuffer);
         }
 
-        let mut rgb = vec![0u8; scaled_w as usize * scaled_h as usize * 3];
+        // 24-bit DIB rows are padded to a 4-byte boundary. The width times
+        // three is not always divisible by four (329 px -> 987 bytes -> 988
+        // padded), and `SetDIBitsToDevice` reads rows at the padded stride:
+        // a buffer without the padding shifts every row by one byte and
+        // renders diagonal garbage.
+        let stride = dib_stride(scaled_w);
+        let mut rgb = vec![0u8; stride * scaled_h as usize];
         let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
         for y in 0..scaled_h {
             for x in 0..scaled_w {
@@ -671,7 +688,7 @@ impl OverlayWindow {
                 let source_y = (y * frame.height / scaled_h) as usize;
                 let source =
                     &frame.pixels_pbgra[(source_y * frame.width as usize + source_x) * 4..][..4];
-                let target = (y as usize * scaled_w as usize + x as usize) * 3;
+                let target = y as usize * stride + x as usize * 3;
                 rgb[target..target + 3]
                     .copy_from_slice(&straight_or_key(source[3], source[0], source[1], source[2]));
                 alpha_map.push(source[3]);
@@ -744,6 +761,66 @@ pub struct WakeHandle {
 /// GUI thread out of `GetMessageW`.
 unsafe impl Send for WakeHandle {}
 
+/// A precise animation clock: a background thread sleeps until the next
+/// deadline and wakes the GUI thread, which decodes and presents the frame.
+/// `WM_TIMER` cannot pace 16 ms frames — its messages are delivered only when
+/// the queue is idle, adding unpredictable latency — so the deadlines live on
+/// this thread instead.
+pub struct AnimationClock {
+    deadline: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Kept for the wake handle's lifetime; the spawned thread holds its own
+    /// copy, so this field keeps the handle alive for as long as the clock.
+    _wake: WakeHandle,
+}
+
+/// Sentinel: no deadline is armed.
+const NO_DEADLINE: u64 = u64::MAX;
+
+impl AnimationClock {
+    /// Starts the clock thread. The overlay arms deadlines with
+    /// [`AnimationClock::arm`] after every frame.
+    pub fn spawn(wake: WakeHandle) -> Self {
+        let deadline = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_DEADLINE));
+        let clock = Self {
+            deadline: deadline.clone(),
+            _wake: wake,
+        };
+        std::thread::spawn(move || {
+            loop {
+                let at = deadline.load(std::sync::atomic::Ordering::Relaxed);
+                if at == NO_DEADLINE {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                let now = now_ms();
+                if at > now {
+                    std::thread::sleep(std::time::Duration::from_millis(at - now));
+                }
+                let _ = wake.post();
+                // Give the GUI thread a moment to re-arm before checking again,
+                // so a due-but-not-yet-rearmed deadline does not spin.
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+        clock
+    }
+
+    /// Arms the next deadline; `None` disarms the clock.
+    pub fn arm(&self, deadline: Option<u64>) {
+        self.deadline.store(
+            deadline.unwrap_or(NO_DEADLINE),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |elapsed| elapsed.as_millis() as u64)
+}
+
 impl WakeHandle {
     /// Posts an empty message to the overlay's message queue.
     pub fn post(&self) -> Result<(), WindowError> {
@@ -783,4 +860,15 @@ mod tests {
         // color itself so it does not leak a tinted fringe.
         assert_eq!(straight_or_key(200, 200, 0, 200), COLOR_KEY_BGRA);
     }
+}
+
+#[test]
+fn dib_stride_pads_rows_to_four_bytes() {
+    // 360 px * 3 = 1080 bytes: already aligned, the case that masked the
+    // bug. 329 px * 3 = 987 bytes: padded to 988, the refined assets.
+    assert_eq!(dib_stride(360), 1080);
+    assert_eq!(dib_stride(329), 988);
+    assert_eq!(dib_stride(1), 4);
+    assert_eq!(dib_stride(2), 8);
+    assert_eq!(dib_stride(4), 12);
 }

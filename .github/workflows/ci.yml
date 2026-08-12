@@ -36,3 +36,19 @@ jobs:
       - name: Benchmark report
         shell: pwsh
         run: pwsh -NoProfile -File scripts\benchmark.ps1 -Samples 5 -Warmups 2 -WorkingSetSeconds 2 -DurationSeconds 2 -BinDir target\debug -NoBuild -ReportOnly
+
+  # The overlay itself is Windows-only, but the protocol, the transport, and
+  # the emitter are not: core, ipc, and emit must build and pass their suites
+  # on Linux, where the Unix-domain-socket backend is the code under test.
+  cross-platform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy -p termielle-core -p termielle-ipc -p termielle-emit --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p termielle-core -p termielle-ipc -p termielle-emit --all-targets

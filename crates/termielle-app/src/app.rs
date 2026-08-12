@@ -41,15 +41,26 @@ pub struct Controller {
     current: FrameBuffer,
     /// When the next GIF frame is due; `None` for stills and reduced motion.
     frame_deadline: Option<u64>,
+    /// Fixed interval between animation frames in milliseconds; when set, it
+    /// overrides each frame's GIF delay so the animation plays at a constant
+    /// frame rate (e.g. 60 fps) instead of the file's own timing.
+    frame_interval_ms: Option<u64>,
+    /// Smoothed cost of presenting one frame, in milliseconds. The frame
+    /// deadline is measured from the start of the previous frame's work, so
+    /// the present cost must be subtracted or the cadence runs slow by that
+    /// amount.
+    present_cost_ms: u64,
 }
 
 impl Controller {
     /// Builds a controller showing the Idle state, ready to present.
+    /// `frame_interval_ms` overrides the GIF's per-frame delays when set.
     pub fn new(
         ready_hold_ms: u64,
         busy_stall_ms: u64,
         assets: AssetCatalog,
         reduced_motion: bool,
+        frame_interval_ms: Option<u64>,
     ) -> Self {
         let mut controller = Self {
             reducer: SessionReducer::new(ready_hold_ms, busy_stall_ms),
@@ -62,9 +73,18 @@ impl Controller {
             )),
             current: fallback_frame(VisualState::Idle, FALLBACK_FRAME_SIZE),
             frame_deadline: None,
+            frame_interval_ms,
+            present_cost_ms: 0,
         };
         let _ = controller.load_animation(VisualState::Idle, 0);
         controller
+    }
+
+    /// Feeds the measured cost of the last present back into frame pacing.
+    /// The fixed-rate deadline is measured from the start of the previous
+    /// present, so a slow present would otherwise stretch every frame gap.
+    pub fn set_present_cost(&mut self, elapsed_ms: u64) {
+        self.present_cost_ms = (self.present_cost_ms + elapsed_ms) / 2;
     }
 
     /// Folds one pipe event in and returns what the window must do.
@@ -161,8 +181,10 @@ impl Controller {
                     // First frame only: a still with no frame deadline.
                     self.animation = AnimationSource::Still(frame.clone());
                 } else {
+                    let interval = self.frame_interval_ms;
+                    let present_cost = self.present_cost_ms;
                     self.frame_deadline =
-                        Some(now_ms.saturating_add(u64::from(frame.delay_ms.max(1))));
+                        Some(deadline_for(interval, present_cost, now_ms, frame.delay_ms));
                     self.animation = AnimationSource::Gif(gif);
                 }
                 None
@@ -178,6 +200,8 @@ impl Controller {
     /// the numeric error code when the frame fails to decode, in which case
     /// the procedural still replaces the animation.
     fn advance_animation(&mut self, now_ms: u64) -> Option<i32> {
+        let interval = self.frame_interval_ms;
+        let present_cost = self.present_cost_ms;
         let gif = match &mut self.animation {
             AnimationSource::Gif(gif) => gif,
             AnimationSource::Still(_) => {
@@ -189,7 +213,8 @@ impl Controller {
         match gif.next_frame() {
             Ok(frame) => {
                 self.current = frame.clone();
-                self.frame_deadline = Some(now_ms.saturating_add(u64::from(frame.delay_ms.max(1))));
+                self.frame_deadline =
+                    Some(deadline_for(interval, present_cost, now_ms, frame.delay_ms));
                 None
             }
             Err(error) => {
@@ -198,6 +223,23 @@ impl Controller {
                 Some(code)
             }
         }
+    }
+}
+
+/// The deadline for the next animation frame: the fixed interval when
+/// configured (minus the smoothed present cost), else the frame's own GIF
+/// delay.
+fn deadline_for(
+    interval: Option<u64>,
+    present_cost_ms: u64,
+    now_ms: u64,
+    gif_delay_ms: u32,
+) -> u64 {
+    match interval {
+        Some(interval) => now_ms
+            .saturating_add(interval)
+            .saturating_sub(present_cost_ms.min(interval.saturating_sub(1))),
+        None => now_ms.saturating_add(u64::from(gif_delay_ms.max(1))),
     }
 }
 

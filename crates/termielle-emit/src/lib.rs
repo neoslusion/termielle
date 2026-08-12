@@ -19,7 +19,7 @@ use termielle_core::{
     EventKind, EventMessage, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, PROTOCOL_VERSION, Source,
     encode_event_line,
 };
-use termielle_ipc::{DEFAULT_PIPE_NAME, PipeClient};
+use termielle_ipc::{EventClient, default_endpoint};
 
 /// Hook documents are bounded by the same ceiling as wire events: anything an
 /// agent could hand us that matters fits well inside 4 KiB, and a document
@@ -324,8 +324,9 @@ pub fn run(args: Vec<OsString>, stdin: &mut impl Read, stdout: &mut impl Write) 
         Err(_) => return 0,
     };
 
-    let pipe = parsed.pipe.as_deref().unwrap_or(DEFAULT_PIPE_NAME);
-    let client = PipeClient::new(pipe, PIPE_TIMEOUT);
+    let default = default_endpoint();
+    let pipe = parsed.pipe.as_deref().unwrap_or(&default);
+    let client = EventClient::new(pipe, PIPE_TIMEOUT);
     // A missing overlay, a timeout, and every other pipe failure are all
     // fail-open outcomes: the agent must never wait on or break over the pet.
     let _ = client.send(&line);
@@ -363,14 +364,7 @@ mod tests {
     /// A pipe name no overlay can be listening on, so the `run` tests exercise
     /// the fail-open path instead of reaching a developer's live overlay.
     fn dead_pipe_name(label: &str) -> String {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        format!(
-            r"\\.\pipe\termielle-emit-unit-{}-{}-{}",
-            std::process::id(),
-            label,
-            NEXT.fetch_add(1, Ordering::Relaxed),
-        )
+        termielle_ipc::test_endpoint(&format!("emit-{label}"))
     }
 
     // -- neutral output ----------------------------------------------------

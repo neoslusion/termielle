@@ -1,8 +1,8 @@
 //! Byte-mode named-pipe client and server.
 //!
 //! Each connection carries exactly one newline-terminated event line and is then
-//! torn down. [`PipeServer::bind`] claims the name by creating the first pipe
-//! instance, and every later [`PipeServer::receive_one`] creates a fresh one, so
+//! torn down. [`EventServer::bind`] claims the name by creating the first pipe
+//! instance, and every later [`EventServer::receive_one`] creates a fresh one, so
 //! a stalled or hostile writer occupies one instance and nothing else.
 
 use std::os::windows::ffi::OsStrExt;
@@ -56,12 +56,12 @@ fn wide(value: &str) -> Vec<u16> {
 ///
 /// The client never blocks longer than its timeout and never waits for the
 /// reader to consume the bytes, so a wedged overlay cannot stall an agent.
-pub struct PipeClient {
+pub struct EventClient {
     name: Vec<u16>,
     timeout: Duration,
 }
 
-impl PipeClient {
+impl EventClient {
     pub fn new(name: &str, timeout: Duration) -> Self {
         Self {
             name: wide(name),
@@ -137,7 +137,7 @@ impl PipeClient {
     }
 
     /// One open attempt against the current instance, classified for the retry
-    /// loop in [`PipeClient::open`].
+    /// loop in [`EventClient::open`].
     fn try_open(&self) -> Result<OwnedHandle, IpcError> {
         // SAFETY: `self.name` is NUL-terminated and outlives the call; the
         // returned handle is immediately wrapped for RAII cleanup.
@@ -176,9 +176,9 @@ impl PipeClient {
 
 /// Listens for single-event connections on an owner-only pipe.
 ///
-/// [`PipeServer::bind`] claims the name, and each `receive_one` serves and
+/// [`EventServer::bind`] claims the name, and each `receive_one` serves and
 /// destroys one instance, so an abandoned connection is never reused.
-pub struct PipeServer {
+pub struct EventServer {
     name: Vec<u16>,
     security: OwnerOnlySecurity,
     /// The instance created by `bind` to claim the name, held until the first
@@ -186,7 +186,7 @@ pub struct PipeServer {
     claimed: std::cell::Cell<Option<OwnedHandle>>,
 }
 
-impl PipeServer {
+impl EventServer {
     /// Claims `name` and prepares to listen on it.
     ///
     /// Two things must fail here rather than later. The owner-only descriptor is
@@ -197,7 +197,7 @@ impl PipeServer {
     /// while our own create failed later with an opaque Win32 code.
     ///
     /// Returns [`IpcError::PipeNameOwned`] when the name is already taken. The
-    /// instance created here serves the first [`PipeServer::receive_one`].
+    /// instance created here serves the first [`EventServer::receive_one`].
     pub fn bind(name: &str) -> Result<Self, IpcError> {
         let name = wide(name);
         let security = OwnerOnlySecurity::current_user()?;
@@ -373,16 +373,16 @@ mod tests {
 
     /// The app binds on the main thread, so a SID or name-ownership failure is
     /// reported at startup, then moves the server onto the pipe thread. That
-    /// move is only possible if `PipeServer` is `Send`; the raw pointers inside
+    /// move is only possible if `EventServer` is `Send`; the raw pointers inside
     /// the descriptor and the pipe handle make it a hand-written guarantee
     /// rather than an inferred one, so it is pinned here.
     #[test]
     fn the_server_can_be_moved_to_a_pipe_thread() {
         fn assert_send<T: Send>() {}
-        assert_send::<PipeServer>();
+        assert_send::<EventServer>();
 
         let name = format!(r"\\.\pipe\termielle-send-{}", std::process::id());
-        let server = PipeServer::bind(&name).expect("bind");
+        let server = EventServer::bind(&name).expect("bind");
         // A compile-time bound alone would be satisfied by a type nobody ever
         // moves; actually moving one across a thread boundary is the behavior
         // the app depends on.
@@ -398,7 +398,7 @@ mod tests {
     /// whoever connected. With no explicit QoS the default is
     /// SecurityImpersonation, which would let a process that squatted the name
     /// act as the agent. This test plays the hostile server: it impersonates a
-    /// real `PipeClient` and reads back the level it was granted, so a
+    /// real `EventClient` and reads back the level it was granted, so a
     /// regression that drops the flags fails here rather than in the field.
     #[test]
     fn a_server_can_only_identify_the_client_never_act_as_it() {
@@ -411,11 +411,11 @@ mod tests {
         use windows::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
         let name = format!(r"\\.\pipe\termielle-impersonate-{}", std::process::id());
-        let server = PipeServer::bind(&name).expect("bind");
+        let server = EventServer::bind(&name).expect("bind");
 
         let client_name = name.clone();
         let client = std::thread::spawn(move || {
-            PipeClient::new(&client_name, Duration::from_secs(5)).send(b"{}\n")
+            EventClient::new(&client_name, Duration::from_secs(5)).send(b"{}\n")
         });
 
         let instance = server.next_instance().expect("instance");
@@ -495,7 +495,7 @@ mod tests {
         use windows::core::PWSTR;
 
         let name = format!(r"\\.\pipe\termielle-dacl-{}", std::process::id());
-        let server = PipeServer::bind(&name).expect("bind");
+        let server = EventServer::bind(&name).expect("bind");
         // The instance `bind` claimed the name with: the very handle a client
         // would connect to, so its DACL is the one that matters.
         let instance = server.next_instance().expect("claimed instance");
