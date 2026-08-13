@@ -44,9 +44,27 @@ $targets = @{
 function Emit {
     param([string]$Pipe, [string]$Session, [string]$Event)
     $payload = '{"type":"' + $Event + '","session_id":"' + $Session + '","prompt":"x"}'
-    $null = $payload | & $EmitExe --source codex --event $Event --input stdin --pipe $Pipe
-    if ($LASTEXITCODE -ne 0) {
-        throw "emitter failed with exit $LASTEXITCODE"
+    # The emitter is a GUI-subsystem executable (so hooks never flash a
+    # console), which PowerShell's `&` runs asynchronously. Drive it through
+    # the .NET Process API instead: CreateProcess-based, like a real agent
+    # hook, and it waits for the exit code.
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $EmitExe
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($arg in @('--source', 'codex', '--event', $Event, '--input', 'stdin', '--pipe', $Pipe)) {
+        $null = $psi.ArgumentList.Add($arg)
+    }
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc.StandardInput.Write($payload)
+    $proc.StandardInput.Close()
+    $null = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) {
+        throw "emitter failed with exit $($proc.ExitCode)"
     }
 }
 

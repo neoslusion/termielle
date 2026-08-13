@@ -57,8 +57,25 @@ if ($failures.Count -eq 0) {
     $smoke2 = Start-Process -FilePath $app -ArgumentList '--smoke-test', '--pipe', $fullPipe -PassThru -WindowStyle Hidden
     Start-Sleep -Milliseconds 400
     $payload = '{"type":"prompt_submitted","session_id":"doctor","prompt":"x"}'
-    $null = $payload | & $emit --source codex --event prompt_submitted --input stdin --pipe $fullPipe
-    $emitExit = $LASTEXITCODE
+    # The emitter is a GUI-subsystem executable (so hooks never flash a
+    # console), which PowerShell's `&` runs asynchronously. Drive it through
+    # the .NET Process API instead, and read its exit code.
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = $emit
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    foreach ($arg in @('--source', 'codex', '--event', 'prompt_submitted', '--input', 'stdin', '--pipe', $fullPipe)) {
+        $null = $psi.ArgumentList.Add($arg)
+    }
+    $emitProc = [System.Diagnostics.Process]::Start($psi)
+    $emitProc.StandardInput.Write($payload)
+    $emitProc.StandardInput.Close()
+    $null = $emitProc.StandardOutput.ReadToEnd()
+    $emitProc.WaitForExit()
+    $emitExit = $emitProc.ExitCode
     $settled = $smoke2.WaitForExit(15000)
     Assert-Check ($emitExit -eq 0) 'Emitter delivers over the unique pipe'
     Assert-Check ($settled -and $smoke2.ExitCode -eq 0) 'Smoke passes on the external event'
