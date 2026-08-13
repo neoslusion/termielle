@@ -6,14 +6,23 @@
     Downloads the latest release, verifies its checksum, installs to
     %LOCALAPPDATA%\Termielle\bin, adds the emitter to PATH, registers the
     crash-watchdog scheduled task, and wires up the CLI integrations it
-    finds (opencode, Claude Code, Codex). Safe to re-run: it upgrades the
-    binaries in place and leaves the user configuration alone.
+    finds (opencode, Claude Code, Codex).
+
+    Safe to re-run: it upgrades the binaries in place, refreshes the
+    Termielle-owned configuration on every run, and never touches anything
+    it does not own. Before the first modification of a user config, the
+    original is saved once to %LOCALAPPDATA%\Termielle\backups, and every
+    write is atomic (temp file + rename) and validated before it lands.
+    What was installed is recorded in
+    %LOCALAPPDATA%\Termielle\installed.json, which scripts\uninstall.ps1
+    uses to reverse everything exactly.
 
     Usage:
         irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
 
     Options (via $args or -Repo): pass -Repo owner/name to override the
-    source repository and -NoStart to skip launching the overlay.
+    source repository, -NoStart to skip launching the overlay, -NoTask to
+    skip the crash-watchdog scheduled task, -NoPath to skip the PATH entry.
 
 .EXAMPLE
     irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
@@ -22,7 +31,9 @@
 param(
     [string]$Repo = 'neoslusion/termielle',
     [string]$BaseUrl = '',
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$NoTask,
+    [switch]$NoPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,11 +48,110 @@ $shaUrl = "$BaseUrl/$asset.sha256"
 
 $dest = Join-Path $env:LOCALAPPDATA 'Termielle'
 $bin = Join-Path $dest 'bin'
+$backupDir = Join-Path $dest 'backups'
+$recordPath = Join-Path $dest 'installed.json'
 $temp = Join-Path $env:TEMP 'termielle-install'
 $zip = Join-Path $temp $asset
 
 function Write-Step($message) { Write-Host "==> $message" -ForegroundColor Cyan }
 function Write-Good($message) { Write-Host "    $message" -ForegroundColor Green }
+
+# Reads a JSON file as a hashtable. A missing file is an empty hashtable; a
+# malformed file is an error, never a silent reset.
+function Read-Json {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return @{} }
+    $raw = Get-Content -Raw -LiteralPath $Path
+    if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+    try {
+        return $raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        throw "$Path is not valid JSON: $($_.Exception.Message)"
+    }
+}
+
+# Writes atomically: the content lands in a same-directory temp file, is
+# flushed, then renamed over the target. A crash can never leave a torn file.
+function Write-Atomic {
+    param([string]$Path, [string]$Content)
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path $directory)) {
+        New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    }
+    $tempFile = Join-Path $directory ('.' + (Split-Path -Leaf $Path) + '.tmp-' + [guid]::NewGuid().ToString('N'))
+    try {
+        [System.IO.File]::WriteAllText($tempFile, $Content)
+        Move-Item -LiteralPath $tempFile -Destination $Path -Force
+    } finally {
+        Remove-Item -LiteralPath $tempFile -ErrorAction SilentlyContinue
+    }
+}
+
+# Saves the pre-Termielle state of a config once. Re-runs never overwrite
+# it, so uninstall always has the true original to restore.
+function Backup-Once {
+    param([string]$Path, [string]$Name)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+    $backup = Join-Path $backupDir $Name
+    if (-not (Test-Path -LiteralPath $backup)) {
+        Copy-Item -LiteralPath $Path -Destination $backup -Force
+    }
+    return $backup
+}
+
+# Merges the Termielle hooks fragment into ~/.claude/settings.json.
+# Termielle-owned keys are refreshed on every run; user-owned keys are
+# preserved. The result is validated before it replaces the file.
+function Merge-ClaudeSettings {
+    param([string]$SettingsPath, [string]$FragmentPath)
+    $fragment = Read-Json $FragmentPath
+    if (-not $fragment.ContainsKey('hooks') -or $fragment['hooks'] -isnot [System.Collections.IDictionary]) {
+        throw 'the claude fragment has no hooks object'
+    }
+    $settings = Read-Json $SettingsPath
+    if (-not $settings.ContainsKey('hooks')) { $settings['hooks'] = @{} }
+    if ($settings['hooks'] -isnot [System.Collections.IDictionary]) {
+        throw 'the hooks key in settings.json is not an object; refusing to modify'
+    }
+    foreach ($key in $fragment['hooks'].Keys) {
+        $settings['hooks'][$key] = $fragment['hooks'][$key]
+    }
+    $json = $settings | ConvertTo-Json -Depth 20
+    # The serialized result must parse before it may replace the file.
+    $null = $json | ConvertFrom-Json -AsHashtable
+    Write-Atomic $SettingsPath $json
+}
+
+# Merges the Termielle hooks block into ~/.codex/config.toml, guarded by
+# start/end markers so re-runs replace only the Termielle block and
+# uninstall can remove exactly it.
+function Merge-CodexConfig {
+    param([string]$ConfigPath, [string]$HooksPath)
+    $hooksText = Get-Content -Raw -LiteralPath $HooksPath
+    $block = "# --- Termielle hooks (managed by Termielle) ---`r`n$hooksText" +
+        "`r`n# --- Termielle hooks end ---`r`n"
+    $existing = ''
+    if (Test-Path -LiteralPath $ConfigPath) {
+        $existing = Get-Content -Raw -LiteralPath $ConfigPath
+    }
+    $startMarker = '# --- Termielle hooks (managed by Termielle) ---'
+    $endMarker = '# --- Termielle hooks end ---'
+    $start = $existing.IndexOf($startMarker)
+    if ($start -ge 0) {
+        # Cut from the start marker to just past the end marker (or to the
+        # end of the file when the block predates the end marker), then
+        # consume the trailing newline so no blank line is left behind.
+        $endAt = $existing.IndexOf($endMarker, $start)
+        $end = if ($endAt -ge 0) { $endAt + $endMarker.Length } else { $existing.Length }
+        if ($end -lt $existing.Length -and $existing[$end] -eq "`r") { $end++ }
+        if ($end -lt $existing.Length -and $existing[$end] -eq "`n") { $end++ }
+        $existing = $existing.Substring(0, $start).TrimEnd() + "`r`n`r`n$block"
+    } else {
+        $existing = $existing.TrimEnd() + "`r`n`r`n$block"
+    }
+    Write-Atomic $ConfigPath $existing
+}
 
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
@@ -80,87 +190,97 @@ try {
     if (-not (Test-Path (Join-Path $bin 'termielle-app.exe'))) {
         throw 'Release archive does not contain termielle-app.exe'
     }
+    if (-not (Test-Path (Join-Path $bin 'termielle-emit.exe'))) {
+        throw 'Release archive does not contain termielle-emit.exe'
+    }
     $version = if (Test-Path (Join-Path $bin 'VERSION')) {
         (Get-Content (Join-Path $bin 'VERSION') -Raw).Trim()
     } else { 'unknown' }
     Write-Good "Termielle $version installed"
 
-    Write-Step 'Adding emitter to PATH'
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($userPath -notlike "*$bin*") {
-        [Environment]::SetEnvironmentVariable(
-            'Path',
-            (($userPath.TrimEnd(';') + ';' + $bin).TrimStart(';')),
-            'User'
-        )
-        Write-Good "Added $bin to user PATH"
-    } else {
-        Write-Good 'PATH already contains the emitter directory'
+    $record = @{
+        version = 1
+        bin     = $bin
+        task    = $false
+        path    = $false
+        claude  = $null
+        codex   = $null
+        opencode = $null
     }
 
-    Write-Step 'Registering the crash-watchdog task'
-    $task = Get-ScheduledTask -TaskName 'Termielle' -ErrorAction SilentlyContinue
-    if (-not $task) {
-        $action = New-ScheduledTaskAction -Execute (Join-Path $bin 'termielle-app.exe')
-        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-        $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
-            -RestartInterval (New-TimeSpan -Minutes 1) `
-            -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
-            -MultipleInstances IgnoreNew -StartWhenAvailable
-        Register-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
-            -Settings $settings -Description 'Termielle overlay companion' -Force | Out-Null
-        Write-Good 'Task registered'
-    } else {
-        Write-Good 'Task already registered'
+    if (-not $NoPath) {
+        Write-Step 'Adding emitter to PATH'
+        $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+        if ($userPath -notlike "*$bin*") {
+            [Environment]::SetEnvironmentVariable(
+                'Path',
+                (($userPath.TrimEnd(';') + ';' + $bin).TrimStart(';')),
+                'User'
+            )
+            Write-Good "Added $bin to user PATH"
+            $record.path = $true
+        } else {
+            Write-Good 'PATH already contains the emitter directory'
+        }
     }
 
-    $integrations = Join-Path $dest 'integrations'
+    if (-not $NoTask) {
+        Write-Step 'Registering the crash-watchdog task'
+        $task = Get-ScheduledTask -TaskName 'Termielle' -ErrorAction SilentlyContinue
+        if (-not $task) {
+            $action = New-ScheduledTaskAction -Execute (Join-Path $bin 'termielle-app.exe')
+            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
+                -RestartInterval (New-TimeSpan -Minutes 1) `
+                -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
+                -MultipleInstances IgnoreNew -StartWhenAvailable
+            Register-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
+                -Settings $settings -Description 'Termielle overlay companion' -Force | Out-Null
+            Write-Good 'Task registered'
+            $record.task = $true
+        } else {
+            Write-Good 'Task already registered'
+        }
+    }
+
+    # The release archive extracts its payload (including integrations/) into
+    # the bin directory.
+    $integrations = Join-Path $bin 'integrations'
     if (Test-Path $integrations) {
         Write-Step 'Wiring CLI integrations'
 
-        $opencode = Join-Path $env:USERPROFILE '.config\opencode\plugins'
-        if ((Test-Path $opencode) -or (Get-Command opencode -ErrorAction SilentlyContinue)) {
-            New-Item -ItemType Directory -Force -Path $opencode | Out-Null
-            Copy-Item (Join-Path $integrations 'opencode\termielle.plugin.ts') $opencode -Force
+        $opencodeDir = Join-Path $env:USERPROFILE '.config\opencode\plugins'
+        if ((Test-Path $opencodeDir) -or (Get-Command opencode -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Force -Path $opencodeDir | Out-Null
+            $pluginTarget = Join-Path $opencodeDir 'termielle.plugin.ts'
+            Copy-Item (Join-Path $integrations 'opencode\termielle.plugin.ts') $pluginTarget -Force
             Write-Good 'opencode plugin installed (restart opencode to load it)'
+            $record.opencode = @{ plugin = $pluginTarget }
         }
 
         $claudeSettings = Join-Path $env:USERPROFILE '.claude\settings.json'
         $claudeDir = Join-Path $env:USERPROFILE '.claude'
         if ((Test-Path $claudeDir) -or (Get-Command claude -ErrorAction SilentlyContinue)) {
             New-Item -ItemType Directory -Force -Path $claudeDir | Out-Null
-            $fragment = Get-Content (Join-Path $integrations 'claude\settings.fragment.json') -Raw |
-                ConvertFrom-Json
-            $settings = @{}
-            if (Test-Path $claudeSettings) {
-                $settings = Get-Content $claudeSettings -Raw | ConvertFrom-Json
-            }
-            if (-not $settings.hooks) {
-                $settings | Add-Member -NotePropertyName hooks -NotePropertyValue $fragment.hooks
-                $settings | ConvertTo-Json -Depth 10 | Set-Content $claudeSettings
-                Write-Good 'Claude Code hooks installed'
-            } else {
-                Write-Good 'Claude Code hooks already present'
-            }
+            $claudeBackup = Backup-Once -Path $claudeSettings -Name 'claude.settings.json.pre'
+            Merge-ClaudeSettings -SettingsPath $claudeSettings `
+                -FragmentPath (Join-Path $integrations 'claude\settings.fragment.json')
+            Write-Good 'Claude Code hooks installed'
+            $record.claude = @{ settings = $claudeSettings; backup = $claudeBackup }
         }
 
         $codexConfig = Join-Path $env:USERPROFILE '.codex\config.toml'
         $codexDir = Join-Path $env:USERPROFILE '.codex'
         if ((Test-Path $codexDir) -or (Get-Command codex -ErrorAction SilentlyContinue)) {
             New-Item -ItemType Directory -Force -Path $codexDir | Out-Null
-            $hooksText = Get-Content (Join-Path $integrations 'codex\hooks.toml') -Raw
-            if (Test-Path $codexConfig) {
-                if ((Get-Content $codexConfig -Raw) -notmatch '\[hooks\.') {
-                    Add-Content -Path $codexConfig -Value "`n$hooksText"
-                    Write-Good 'Codex hooks appended'
-                } else {
-                    Write-Good 'Codex hooks already present'
-                }
-            } else {
-                Set-Content -Path $codexConfig -Value $hooksText
-                Write-Good 'Codex hooks installed'
-            }
+            $codexBackup = Backup-Once -Path $codexConfig -Name 'codex.config.toml.pre'
+            Merge-CodexConfig -ConfigPath $codexConfig `
+                -HooksPath (Join-Path $integrations 'codex\hooks.toml')
+            Write-Good 'Codex hooks installed'
+            $record.codex = @{ config = $codexConfig; backup = $codexBackup }
         }
+
+        Write-Atomic $recordPath ($record | ConvertTo-Json -Depth 10)
     }
 
     if (-not $NoStart -and -not (Get-Process 'termielle-app' -ErrorAction SilentlyContinue)) {
@@ -178,8 +298,7 @@ try {
     Write-Host "  - Binaries:    $bin"
     Write-Host "  - Config:      $(Join-Path $env:USERPROFILE '.termielle\config.json')"
     Write-Host '  - Restart opencode once if you use it, so the plugin loads.'
-    Write-Host '  - Uninstall:   Stop-Process termielle-app; Unregister-ScheduledTask Termielle;'
-    Write-Host "                 Remove-Item -Recurse $dest; remove the bin entry from PATH."
+    Write-Host "  - Uninstall:   pwsh -File $(Join-Path $PSScriptRoot 'uninstall.ps1')"
 } finally {
     Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue
 }

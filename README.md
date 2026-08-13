@@ -19,6 +19,22 @@ present:
 irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
 ```
 
+The installer is safe to re-run: it upgrades the binaries in place and
+refreshes only the Termielle-owned configuration. Before it first modifies a
+user config it saves the original once to
+`%LOCALAPPDATA%\Termielle\backups`, every write is atomic and validated, and
+what it installed is recorded in `installed.json`.
+
+```powershell
+pwsh -File scripts\uninstall.ps1          # reverse the install
+pwsh -File scripts\uninstall.ps1 -RemoveData   # also delete ~/.termielle
+```
+
+Uninstall restores the pre-install configs from the backups (or removes only
+the Termielle-owned entries when no backup exists), stops the overlay,
+unregisters the task, and removes the PATH entry — whatever the install
+record says was done, and nothing else.
+
 Manual install: unpack the `termielle-windows-x64.zip` release asset into
 `%LOCALAPPDATA%\Termielle\bin`, add that directory to `PATH`, and run
 `termielle-app.exe`. It reads `~\.termielle\config.json` (the same dot-directory
