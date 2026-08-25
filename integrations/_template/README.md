@@ -11,8 +11,9 @@ approximations it documents are the parts most likely to be wrong.
 ## Checklist
 
 1. **Find the session identifier.** What stable per-conversation ID does the
-   agent hand its hooks? The emitter currently extracts these document keys,
-   in order: `session_id`, `thread-id`, `thread_id`. If your agent uses
+   agent hand its hooks? The emitter extracts these document keys, in order:
+   `session_id`, `sessionID`, `sessionId`, `thread-id`, `thread_id`,
+   `threadId`, `conversation_id`, `conversationId`. If your agent uses
    another key, extend `session_id_from_document` in
    `crates/termielle-emit/src/lib.rs` and add a test.
 2. **Map lifecycle moments to events.** Go through the eight event kinds in
@@ -25,7 +26,9 @@ approximations it documents are the parts most likely to be wrong.
      a signal for "unblocked"? If unblocking is silent, say so: the overlay
      may sit on `needs_input` until the next event.
 3. **Emit.** Each hook runs `termielle-emit` with `--source <agent>`,
-   `--event <wire name>`, `--input stdin|argv`, and nothing else. The wire
+   `--event <wire name>`, `--input stdin|argv`, and nothing else. The source
+   word may be any short lowercase identifier (`[a-z0-9_-]+`, at most 32
+   bytes) — a new agent needs no emitter change, just a new word. The wire
    names must match `docs/protocol.md` exactly.
 4. **Wire the fixtures.** `crates/termielle-emit/tests/fixture_commands.rs`
    parses every checked-in `command_windows` line and runs it against the real

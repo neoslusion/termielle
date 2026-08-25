@@ -1,0 +1,25 @@
+{
+  "termielle": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "{{TERMIELLE_EMIT}} --source agy --event thinking_started --input stdin",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "{{TERMIELLE_EMIT}} --source agy --event thinking_ended --input stdin",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "{{TERMIELLE_EMIT}} --source agy --event turn_completed --input stdin",
+        "timeout": 5
+      }
+    ]
+  }
+}

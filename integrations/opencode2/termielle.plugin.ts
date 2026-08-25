@@ -1,10 +1,12 @@
-// Termielle companion for opencode 1.x.
+// Termielle companion for opencode 2.
 //
-// Install: copy this file into `~/.config/opencode/plugins/` (global) or
-// `.opencode/plugins/` (one project). Plugins load at opencode startup; no
-// hooks configuration is needed. OpenCode 2 (`opencode2`) reads the same
-// directories and is covered by `integrations/opencode2/termielle.plugin.ts`,
-// which emits under the `opencode2` source word.
+// OpenCode 2 (the `opencode2` binary) reads the same plugin directories as
+// V1: copy this file into `~/.config/opencode/plugins/` (global) or
+// `.opencode/plugins/` (one project) and restart. When V1 and V2 are both
+// installed they load plugins from the same directory, so this file and the
+// V1 `termielle.plugin.ts` can live side by side; each conversation is then
+// tracked under its own source word, which keeps the two runtimes' sessions
+// apart in the overlay's reducer.
 //
 // The overlay follows the opencode event stream:
 //   message.updated (role=user)             -> prompt submitted
@@ -49,7 +51,7 @@ export const TermiellePlugin = async ({ $ }) => {
   }
 
   const emit = (kind, sessionID) =>
-    $`${emitter()} --source opencode --event ${kind} --input argv ${JSON.stringify({ session_id: sessionID })}`
+    $`${emitter()} --source opencode2 --event ${kind} --input argv ${JSON.stringify({ session_id: sessionID })}`
       .quiet()
       .catch(() => {})
 
