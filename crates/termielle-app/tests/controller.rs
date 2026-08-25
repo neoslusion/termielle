@@ -13,6 +13,11 @@ use termielle_core::{AssetCatalog, EventKind, EventMessage, Source, VisualState}
 const S1: &str = "session-a";
 const S2: &str = "session-b";
 
+/// Parses a test source word, panicking when it is invalid.
+fn source(word: &str) -> Source {
+    Source::parse(word).unwrap()
+}
+
 /// Busy-stall used by every test; must stay far above the thinking hold so
 /// the per-state deadlines below stay observable.
 const BUSY_STALL_MS: u64 = 60_000;
@@ -39,7 +44,7 @@ fn gif_catalog() -> (tempfile::TempDir, AssetCatalog) {
 fn event(session: &str, kind: EventKind, at: u64) -> EventMessage {
     EventMessage {
         version: termielle_core::PROTOCOL_VERSION,
-        source: Source::Claude,
+        source: source("claude"),
         session_id: session.to_string(),
         event: kind,
         timestamp_ms: at,

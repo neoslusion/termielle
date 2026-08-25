@@ -58,7 +58,7 @@ enforces this by extracting only a session identifier from the hook document.
 | Field | Type | Rules |
 | --- | --- | --- |
 | `version` | integer | Must be `1`. A different version is rejected; the overlay reports it as an unsupported-version error rather than guessing. |
-| `source` | string | `claude`, `codex`, or `opencode`. The overlay uses it only to distinguish sessions from different agents; unknown sources are rejected. |
+| `source` | string | Any short lowercase agent identifier: `[a-z0-9_-]+`, at most 32 bytes — `claude`, `codex`, `opencode`, and `agy` are conventions, not an exhaustive list. The overlay uses it only to distinguish sessions from different agents; a well-formed but unknown source is accepted, and a malformed one is rejected (`invalid source`). |
 | `session_id` | string | See the rules above. Duplicate delivery detection and the visual reducer both key on `(source, session_id)`. |
 | `event` | string | One of the eight kinds below. |
 | `timestamp_ms` | integer | Unix epoch milliseconds, nonzero. The reducer never reads a clock; time enters only through these stamps and the overlay's own clock at fire time. |
@@ -94,7 +94,10 @@ cannot silently smuggle meaning past an older overlay.
   on its own.
 - **Missing reasoning boundary.** Agents that expose no reasoning step (Claude
   Code, Codex) can only offer `prompt_submitted`, and the one-second hold is
-  their best approximation. Agents that expose one should send
+  their best approximation. Agents whose only boundary is a model invocation
+  (`agy`: `PreInvocation`/`PostInvocation`) may bracket each invocation with
+  `thinking_started`/`thinking_ended`, which shows tool work as Working and
+  model time as Thinking. Agents that expose one should send
   `thinking_started`/`thinking_ended` and skip nothing else.
 
 ## Versioning
@@ -108,18 +111,24 @@ overlay only keys sessions on) do not bump the version.
 
 ## Integration checklist
 
-To add an agent, follow the scaffold in `integrations/_template/`:
+To add an agent, follow the scaffold in `integrations/_template/`. Adding one
+is a configuration exercise only: pick a source word, map lifecycle moments,
+and ship hooks — no overlay or emitter change is needed.
 
-1. **Identify sessions.** Find the stable per-conversation identifier your
+1. **Pick the source word.** Any short lowercase identifier (`[a-z0-9_-]+`,
+   at most 32 bytes). Use the agent's own command name where possible
+   (`claude`, `codex`, `opencode`, `agy`).
+2. **Identify sessions.** Find the stable per-conversation identifier your
    agent exposes to hooks (Claude Code: `session_id`; Codex: `thread-id`;
-   opencode: `sessionID`).
-2. **Map lifecycle moments.** Decide which of the eight events each agent
+   opencode: `sessionID`; agy: `session_id`, falling back to
+   `conversationId`). The emitter recognizes all of those spellings.
+3. **Map lifecycle moments.** Decide which of the eight events each agent
    signal maps to, and — critically — what your agent offers for the reasoning
    boundary and the "waiting" state.
-3. **Emit.** Have each hook invoke `termielle-emit` with `--source`,
+4. **Emit.** Have each hook invoke `termielle-emit` with `--source`,
    `--event`, `--input`, and the session document. Emitter flags and wire
    names must stay the same word.
-4. **Document the boundary.** Write down the approximations in your
+5. **Document the boundary.** Write down the approximations in your
    integration's comment block, exactly as the existing integrations do, so
    users know what to expect.
 

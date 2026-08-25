@@ -22,6 +22,11 @@ fn fixture(relative: &str) -> PathBuf {
         .join(relative)
 }
 
+/// Parses a test source word, panicking when it is invalid.
+fn source(word: &str) -> Source {
+    Source::parse(word).unwrap()
+}
+
 /// One fixture hook: its command line and the event it must deliver.
 struct Hook {
     command: String,
@@ -49,7 +54,7 @@ fn codex_hooks() -> Vec<Hook> {
             for handler in group["hooks"].as_array().unwrap() {
                 hooks.push(Hook {
                     command: handler["command_windows"].as_str().unwrap().to_string(),
-                    source: Source::Codex,
+                    source: source("codex"),
                     event,
                 });
             }
@@ -65,7 +70,7 @@ fn codex_hooks() -> Vec<Hook> {
         .collect();
     hooks.push(Hook {
         command: notify.join(" "),
-        source: Source::Codex,
+        source: source("codex"),
         event: EventKind::TurnCompleted,
     });
     hooks
@@ -96,7 +101,7 @@ fn claude_hooks() -> Vec<Hook> {
                 for handler in group["hooks"].as_array().unwrap() {
                     hooks.push(Hook {
                         command: handler["command"].as_str().unwrap().to_string(),
-                        source: Source::Claude,
+                        source: source("claude"),
                         event,
                     });
                 }
@@ -106,15 +111,16 @@ fn claude_hooks() -> Vec<Hook> {
     hooks
 }
 
-/// Every `emit("<event>", ...)` mapping from the opencode plugin file.
+/// Every `emit("<event>", ...)` mapping from an opencode plugin file. Both
+/// the V1 and the OpenCode-2 plugin are checked; they differ only in their
+/// `--source` word.
 ///
 /// The plugin builds each invocation as
-/// `termielle-emit.exe --source opencode --event <event> --input argv
+/// `termielle-emit.exe --source <word> --event <event> --input argv
 /// {"session_id":"..."}`, so the fixture reconstructs the same command line
 /// and verifies it delivers over a real pipe.
-fn opencode_hooks() -> Vec<Hook> {
-    let text =
-        std::fs::read_to_string(fixture("integrations/opencode/termielle.plugin.ts")).unwrap();
+fn opencode_hooks(relative: &str, word: &str) -> Vec<Hook> {
+    let text = std::fs::read_to_string(fixture(relative)).unwrap();
     let mut hooks = Vec::new();
     for captured in text.split("emit(\"").skip(1) {
         let wire = captured.split('"').next().unwrap();
@@ -129,10 +135,42 @@ fn opencode_hooks() -> Vec<Hook> {
             other => panic!("unexpected opencode plugin event {other}"),
         };
         hooks.push(Hook {
-            command: format!("termielle-emit.exe --source opencode --event {wire} --input argv"),
-            source: Source::Opencode,
+            command: format!("termielle-emit.exe --source {word} --event {wire} --input argv"),
+            source: source(word),
             event,
         });
+    }
+    hooks
+}
+
+/// Every command from `integrations/agy/hooks.fragment.json`, with the same
+/// `{{TERMIELLE_EMIT}}` substitution to the PATH exe that the installer
+/// performs against the real absolute path.
+fn agy_hooks() -> Vec<Hook> {
+    let text = std::fs::read_to_string(fixture("integrations/agy/hooks.fragment.json")).unwrap();
+    let substituted = text.replace("{{TERMIELLE_EMIT}}", "termielle-emit.exe");
+    let value: serde_json::Value = serde_json::from_str(&substituted).unwrap();
+
+    let handlers = &value["termielle"];
+    assert!(
+        handlers.is_object(),
+        "the agy fragment must keep its `termielle` handler"
+    );
+    let mut hooks = Vec::new();
+    for (name, entries) in handlers.as_object().unwrap() {
+        let event = match name.as_str() {
+            "PreInvocation" => EventKind::ThinkingStarted,
+            "PostInvocation" => EventKind::ThinkingEnded,
+            "Stop" => EventKind::TurnCompleted,
+            other => panic!("unexpected agy hook event {other}"),
+        };
+        for entry in entries.as_array().unwrap() {
+            hooks.push(Hook {
+                command: entry["command"].as_str().unwrap().to_string(),
+                source: source("agy"),
+                event,
+            });
+        }
     }
     hooks
 }
@@ -140,31 +178,27 @@ fn opencode_hooks() -> Vec<Hook> {
 /// The payload shape each source hands the hook, with a secret that must
 /// never reach the wire. Returns (bytes, input_source, session_id).
 fn payload(hook: &Hook) -> (Vec<u8>, &'static str, String) {
-    let session = match hook.source {
-        Source::Claude => format!("fixture-claude-{:x}", hook.event_key()),
-        Source::Codex => format!("fixture-codex-{:x}", hook.event_key()),
-        Source::Opencode => format!("fixture-opencode-{:x}", hook.event_key()),
-    };
+    let session = format!("fixture-{}-{:x}", hook.source, hook.event_key());
     // The wire name as plain text: `to_string` would serialize the enum as a
     // JSON string, quotes included, and break the document.
     let name = serde_json::to_string(&hook.event).unwrap();
     let name = name.trim_matches('"');
-    match (hook.source, hook.event) {
+    match (hook.source.as_str(), hook.event) {
         // The notify fallback is the one argv hook: Codex passes the
         // agent-turn-complete JSON as the first command-line argument.
-        (Source::Codex, EventKind::TurnCompleted) if hook.command.contains("--input argv") => (
+        ("codex", EventKind::TurnCompleted) if hook.command.contains("--input argv") => (
             format!(r#"{{"type":"agent-turn-complete","thread-id":"{session}","last-assistant-message":"secret"}}"#)
                 .into_bytes(),
             "argv",
             session,
         ),
-        (Source::Codex, _) => (
+        ("codex", _) => (
             format!(r#"{{"type":"{name}","session_id":"{session}","prompt":"secret"}}"#)
                 .into_bytes(),
             "stdin",
             session,
         ),
-        (Source::Claude, _) => (
+        ("claude", _) => (
             format!(
                 r#"{{"session_id":"{session}","hook_event_name":"{name}","transcript_path":"C:\\secret"}}"#
             )
@@ -172,7 +206,25 @@ fn payload(hook: &Hook) -> (Vec<u8>, &'static str, String) {
             "stdin",
             session,
         ),
-        (Source::Opencode, _) => (
+        // Antigravity's Stop document carries only `conversationId`; the
+        // emitter must find that identifier without any session key.
+        ("agy", EventKind::TurnCompleted) => (
+            format!(
+                r#"{{"conversationId":"{session}","terminationReason":"NO_TOOL_CALL","transcriptPath":"C:\\secret"}}"#
+            )
+            .into_bytes(),
+            "stdin",
+            session,
+        ),
+        ("agy", _) => (
+            format!(
+                r#"{{"session_id":"{session}","hookEventName":"{name}","toolCall":{{"args":{{"CommandLine":"secret"}}}}}}"#
+            )
+            .into_bytes(),
+            "stdin",
+            session,
+        ),
+        (_, _) => (
             format!(r#"{{"session_id":"{session}","prompt":"secret"}}"#).into_bytes(),
             "argv",
             session,
@@ -227,12 +279,20 @@ fn fixture_commands_deliver_the_right_events_over_a_real_pipe() {
     let emitter = std::env::var_os("CARGO_BIN_EXE_termielle-emit").expect("emitter binary");
     let mut hooks = codex_hooks();
     hooks.extend(claude_hooks());
-    hooks.extend(opencode_hooks());
+    hooks.extend(opencode_hooks(
+        "integrations/opencode/termielle.plugin.ts",
+        "opencode",
+    ));
+    hooks.extend(opencode_hooks(
+        "integrations/opencode2/termielle.plugin.ts",
+        "opencode2",
+    ));
+    hooks.extend(agy_hooks());
     assert_eq!(
         hooks.len(),
-        27,
-        "twelve codex plus twelve claude (fragment and plugin manifest) \
-         plus nine opencode hooks"
+        39,
+        "six codex, twelve claude (fragment and plugin manifest), nine \
+         opencode V1 plus nine OpenCode-2 plugin hooks, and three agy"
     );
 
     for (index, hook) in hooks.iter().enumerate() {

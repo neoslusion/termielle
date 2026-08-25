@@ -5,6 +5,11 @@ use termielle_core::{
 const FOUR_HOURS_MS: u64 = 14_400_000;
 const BUSY_STALL_MS: u64 = 60_000;
 
+/// Parses a test source word, panicking when it is invalid.
+fn source(word: &str) -> Source {
+    Source::parse(word).unwrap()
+}
+
 fn message(source: Source, session: &str, event: EventKind, at: u64) -> EventMessage {
     EventMessage {
         version: PROTOCOL_VERSION,
@@ -19,7 +24,7 @@ fn message(source: Source, session: &str, event: EventKind, at: u64) -> EventMes
 fn thinking_becomes_working_after_one_second() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::PromptSubmitted,
         10_000,
@@ -35,7 +40,7 @@ fn thinking_becomes_working_after_one_second() {
 fn thinking_started_holds_the_thinking_face_past_the_heuristic() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Opencode,
+        source("opencode"),
         "one",
         EventKind::PromptSubmitted,
         10_000,
@@ -43,7 +48,7 @@ fn thinking_started_holds_the_thinking_face_past_the_heuristic() {
     // A real reasoning signal arrives; the one-second heuristic deadline must
     // no longer advance the overlay.
     reducer.apply(message(
-        Source::Opencode,
+        source("opencode"),
         "one",
         EventKind::ThinkingStarted,
         10_100,
@@ -56,7 +61,7 @@ fn thinking_started_holds_the_thinking_face_past_the_heuristic() {
 
     // Reasoning ends: working, with no timer.
     reducer.apply(message(
-        Source::Opencode,
+        source("opencode"),
         "one",
         EventKind::ThinkingEnded,
         30_100,
@@ -68,7 +73,7 @@ fn thinking_started_holds_the_thinking_face_past_the_heuristic() {
 fn thinking_end_without_a_start_just_works() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Opencode,
+        source("opencode"),
         "one",
         EventKind::ThinkingEnded,
         10_000,
@@ -81,38 +86,43 @@ fn thinking_end_without_a_start_just_works() {
 fn priority_is_needs_input_failed_ready_running_idle() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "run",
         EventKind::PromptSubmitted,
         1_000,
     ));
     reducer.apply(message(
-        Source::Claude,
+        source("claude"),
         "ready",
         EventKind::TurnCompleted,
         2_000,
     ));
     assert_eq!(reducer.visible_state(), VisualState::Ready);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "failed",
         EventKind::TurnFailed,
         3_000,
     ));
     assert_eq!(reducer.visible_state(), VisualState::Failed);
-    reducer.apply(message(Source::Claude, "ask", EventKind::NeedsInput, 4_000));
+    reducer.apply(message(
+        source("claude"),
+        "ask",
+        EventKind::NeedsInput,
+        4_000,
+    ));
     assert_eq!(reducer.visible_state(), VisualState::NeedsInput);
 }
 
 #[test]
 fn duplicate_completion_is_idempotent_and_old_events_are_ignored() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
-    let done = message(Source::Codex, "one", EventKind::TurnCompleted, 20_000);
+    let done = message(source("codex"), "one", EventKind::TurnCompleted, 20_000);
     assert_eq!(reducer.apply(done.clone()), ApplyOutcome::Changed);
     assert_eq!(reducer.apply(done), ApplyOutcome::Duplicate);
     assert_eq!(
         reducer.apply(message(
-            Source::Codex,
+            source("codex"),
             "one",
             EventKind::PromptSubmitted,
             19_999
@@ -126,7 +136,7 @@ fn duplicate_completion_is_idempotent_and_old_events_are_ignored() {
 fn ready_expires_and_session_end_removes_state() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::TurnCompleted,
         30_000,
@@ -134,7 +144,7 @@ fn ready_expires_and_session_end_removes_state() {
     assert!(reducer.advance(35_000));
     assert_eq!(reducer.visible_state(), VisualState::Idle);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::SessionEnded,
         36_000,
@@ -146,13 +156,13 @@ fn ready_expires_and_session_end_removes_state() {
 fn equal_priority_states_resolve_by_most_recent_activity() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     reducer.apply(message(
-        Source::Claude,
+        source("claude"),
         "first",
         EventKind::PromptSubmitted,
         1_000,
     ));
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "second",
         EventKind::PromptSubmitted,
         4_000,
@@ -173,7 +183,7 @@ fn session_started_registers_an_idle_session() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
     assert_eq!(
         reducer.apply(message(
-            Source::Claude,
+            source("claude"),
             "one",
             EventKind::SessionStarted,
             1_000
@@ -188,11 +198,16 @@ fn session_started_registers_an_idle_session() {
 #[test]
 fn a_new_prompt_leaves_needs_input() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
-    reducer.apply(message(Source::Codex, "one", EventKind::NeedsInput, 1_000));
+    reducer.apply(message(
+        source("codex"),
+        "one",
+        EventKind::NeedsInput,
+        1_000,
+    ));
     assert_eq!(reducer.visible_state(), VisualState::NeedsInput);
     assert_eq!(
         reducer.apply(message(
-            Source::Codex,
+            source("codex"),
             "one",
             EventKind::PromptSubmitted,
             2_000
@@ -206,7 +221,12 @@ fn a_new_prompt_leaves_needs_input() {
 #[test]
 fn an_accepted_event_hidden_behind_a_busier_session_is_unchanged() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
-    reducer.apply(message(Source::Claude, "ask", EventKind::NeedsInput, 1_000));
+    reducer.apply(message(
+        source("claude"),
+        "ask",
+        EventKind::NeedsInput,
+        1_000,
+    ));
     assert_eq!(reducer.visible_state(), VisualState::NeedsInput);
     assert_eq!(reducer.next_deadline_ms(), Some(1_000 + FOUR_HOURS_MS));
 
@@ -214,7 +234,7 @@ fn an_accepted_event_hidden_behind_a_busier_session_is_unchanged() {
     // neither the visible state nor the next deadline.
     assert_eq!(
         reducer.apply(message(
-            Source::Codex,
+            source("codex"),
             "new",
             EventKind::SessionStarted,
             2_000
@@ -227,9 +247,47 @@ fn an_accepted_event_hidden_behind_a_busier_session_is_unchanged() {
 }
 
 #[test]
+fn equal_priority_ties_break_deterministically_across_any_sources() {
+    // Sources are open, so the tie-break cannot depend on a fixed agent list:
+    // equal-priority sessions resolve by activity, then by source word, no
+    // matter which agents produced them.
+    let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
+    reducer.apply(message(
+        source("agy"),
+        "one",
+        EventKind::PromptSubmitted,
+        1_000,
+    ));
+    reducer.apply(message(
+        source("opencode2"),
+        "one",
+        EventKind::PromptSubmitted,
+        2_000,
+    ));
+    // Same state and priority: the most recently active session wins.
+    assert_eq!(reducer.visible_state(), VisualState::Thinking);
+
+    reducer.advance(3_000);
+    assert_eq!(reducer.visible_state(), VisualState::Working);
+
+    // Sessions decay at their own stall deadlines: the earlier one first,
+    // while the later one is still busy and keeps the overlay Working.
+    reducer.advance(1_000 + BUSY_STALL_MS);
+    assert_eq!(reducer.visible_state(), VisualState::Working);
+
+    reducer.advance(2_000 + BUSY_STALL_MS);
+    assert_eq!(reducer.visible_state(), VisualState::Idle);
+}
+
+#[test]
 fn sessions_expire_after_four_idle_hours() {
     let mut reducer = SessionReducer::new(5_000, 60_000);
-    reducer.apply(message(Source::Claude, "one", EventKind::NeedsInput, 1_000));
+    reducer.apply(message(
+        source("claude"),
+        "one",
+        EventKind::NeedsInput,
+        1_000,
+    ));
     assert_eq!(reducer.next_deadline_ms(), Some(1_000 + FOUR_HOURS_MS));
 
     assert!(!reducer.advance(FOUR_HOURS_MS + 999));
@@ -246,7 +304,7 @@ fn sessions_expire_after_four_idle_hours() {
 fn a_busy_session_decays_to_idle_after_the_stall_without_events() {
     let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::PromptSubmitted,
         10_000,
@@ -270,7 +328,7 @@ fn a_busy_session_decays_to_idle_after_the_stall_without_events() {
 fn an_event_refreshes_the_busy_stall() {
     let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::PromptSubmitted,
         10_000,
@@ -280,7 +338,7 @@ fn an_event_refreshes_the_busy_stall() {
 
     // A second prompt re-arms both the thinking hold and the stall.
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::PromptSubmitted,
         30_000,
@@ -302,7 +360,7 @@ fn an_event_refreshes_the_busy_stall() {
 fn needs_input_is_not_busy_stalled() {
     let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
     reducer.apply(message(
-        Source::Claude,
+        source("claude"),
         "ask",
         EventKind::NeedsInput,
         10_000,
@@ -317,7 +375,7 @@ fn needs_input_is_not_busy_stalled() {
 fn completing_a_turn_clears_the_busy_stall() {
     let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
     reducer.apply(message(
-        Source::Codex,
+        source("codex"),
         "one",
         EventKind::PromptSubmitted,
         10_000,
@@ -325,7 +383,7 @@ fn completing_a_turn_clears_the_busy_stall() {
     assert_eq!(reducer.next_deadline_ms(), Some(11_000));
     assert_eq!(
         reducer.apply(message(
-            Source::Codex,
+            source("codex"),
             "one",
             EventKind::TurnCompleted,
             10_500

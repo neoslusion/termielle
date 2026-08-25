@@ -836,7 +836,7 @@ fn run_smoke(
     if builtin_event {
         let line = encode_event_line(&EventMessage {
             version: PROTOCOL_VERSION,
-            source: Source::Codex,
+            source: Source::parse("codex").expect("smoke source word is valid"),
             session_id: "smoke-test".into(),
             event: EventKind::PromptSubmitted,
             timestamp_ms: now_ms(),
@@ -912,6 +912,7 @@ fn protocol_error_code(error: &ProtocolError) -> i32 {
         ProtocolError::UnsupportedVersion(version) => 100 + i32::from(*version),
         ProtocolError::InvalidSessionId => 3,
         ProtocolError::InvalidTimestamp => 4,
+        ProtocolError::InvalidSource => 5,
     }
 }
 

@@ -9,7 +9,7 @@ pub use config::{
 };
 pub use event_log::{DEFAULT_EVENT_LOG_MAX_BYTES, EventLog, EventLogError};
 pub use protocol::{
-    EventKind, EventMessage, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, PROTOCOL_VERSION,
-    ProtocolError, Source, decode_event_line, encode_event_line,
+    EventKind, EventMessage, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, MAX_SOURCE_BYTES,
+    PROTOCOL_VERSION, ProtocolError, Source, decode_event_line, encode_event_line,
 };
 pub use reducer::{ApplyOutcome, SessionReducer, VisualState};

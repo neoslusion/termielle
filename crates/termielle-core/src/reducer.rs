@@ -278,17 +278,12 @@ fn busy_stall_at(state: VisualState, timestamp_ms: u64, busy_stall_ms: u64) -> O
     }
 }
 
-/// Orders session keys deterministically so results never depend on hash order.
+/// Orders session keys deterministically so results never depend on hash
+/// order. Sources compare as plain words, which keeps the historical
+/// `claude < codex < opencode` order and extends it to any future agent.
 fn stable_cmp(left: &SessionKey, right: &SessionKey) -> Ordering {
-    source_rank(left.0)
-        .cmp(&source_rank(right.0))
+    left.0
+        .as_str()
+        .cmp(right.0.as_str())
         .then_with(|| left.1.cmp(&right.1))
-}
-
-fn source_rank(source: Source) -> u8 {
-    match source {
-        Source::Claude => 0,
-        Source::Codex => 1,
-        Source::Opencode => 2,
-    }
 }

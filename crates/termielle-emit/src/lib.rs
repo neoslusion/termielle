@@ -1,12 +1,16 @@
-//! Fail-open hook emitter for Claude Code and Codex CLI.
+//! Fail-open hook emitter for any agent CLI.
 //!
-//! Agent hooks invoke this process with a fixed source and event name, a hook
+//! Agent hooks invoke this process with a source word, an event name, a hook
 //! document on stdin or the command line, and nothing else. The document is
 //! reduced to a session identifier, one event line is sent over the overlay
 //! pipe, and the neutral hook response is always written before exit. A missing
 //! overlay, a malformed document, or a pipe failure never delays or breaks the
 //! agent: those paths exit `0` after writing [`neutral_hook_output`]. Only a
 //! broken installation (an invalid command line) exits `2`.
+//!
+//! The source word is any short lowercase identifier (`claude`, `codex`,
+//! `opencode`, `agy`, ...), so a new agent CLI needs no emitter change: pick a
+//! word and wire the eight event kinds up from `integrations/_template/`.
 //!
 //! Nothing from the hook document ever reaches the pipe or the log except the
 //! session identifier: no prompts, assistant text, tool payloads, or paths.
@@ -139,12 +143,24 @@ pub fn normalize_hook_event(
     })
 }
 
-/// Extracts the session identifier, preferring `session_id` (Claude Code),
-/// then `thread-id` (Codex), then `thread_id` (older Codex). A present
+/// Extracts the session identifier from whatever key the agent uses. The
+/// preference order is: `session_id` (Claude Code, agy base input), then its
+/// camelCase spellings (`sessionID` opencode, `sessionId`), then Codex's
+/// thread identifiers (`thread-id`, then older spellings), then Antigravity's
+/// conversation identifier (`conversation_id`, `conversationId`). A present
 /// identifier must be a string and pass the wire validation; anything else is
 /// unusable.
 fn session_id_from_document(value: &serde_json::Value) -> Result<String, EmitError> {
-    for key in ["session_id", "thread-id", "thread_id"] {
+    for key in [
+        "session_id",
+        "sessionID",
+        "sessionId",
+        "thread-id",
+        "thread_id",
+        "threadId",
+        "conversation_id",
+        "conversationId",
+    ] {
         let Some(found) = value.get(key) else {
             continue;
         };
@@ -222,12 +238,10 @@ pub fn parse_args(args: Vec<OsString>) -> Result<EmitArgs, UsageError> {
                 if source.is_some() {
                     return Err(UsageError::RepeatedFlag);
                 }
-                source = Some(match value {
-                    "claude" => Source::Claude,
-                    "codex" => Source::Codex,
-                    "opencode" => Source::Opencode,
-                    _ => return Err(UsageError::UnknownValue),
-                });
+                // Any valid source word is accepted, so wiring up a new agent
+                // CLI never requires an emitter change. A malformed word is an
+                // unknown value: the installation, not the agent, is wrong.
+                source = Some(Source::parse(value).map_err(|_| UsageError::UnknownValue)?);
             }
             "event" => {
                 if event.is_some() {
@@ -348,9 +362,14 @@ mod tests {
     use std::ffi::OsString;
 
     use termielle_core::{
-        EventKind, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, PROTOCOL_VERSION, Source,
-        encode_event_line,
+        EventKind, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, MAX_SOURCE_BYTES, PROTOCOL_VERSION,
+        Source, encode_event_line,
     };
+
+    /// Parses a test source word, failing the test when it is invalid.
+    fn source(word: &str) -> Source {
+        Source::parse(word).unwrap()
+    }
 
     use crate::{
         EmitArgs, EmitError, InputSource, MAX_HOOK_INPUT_BYTES, UsageError, neutral_hook_output,
@@ -380,7 +399,7 @@ mod tests {
     fn reads_claude_session_id_from_stdin_json() {
         let input = br#"{"session_id":"claude-1","hook_event_name":"UserPromptSubmit","prompt":"must-not-leak"}"#;
         let event =
-            normalize_hook_event(Source::Claude, EventKind::PromptSubmitted, input, 42).unwrap();
+            normalize_hook_event(source("claude"), EventKind::PromptSubmitted, input, 42).unwrap();
         assert_eq!(event.session_id, "claude-1");
         let encoded = serde_json::to_string(&event).unwrap();
         assert!(!encoded.contains("must-not-leak"));
@@ -390,7 +409,7 @@ mod tests {
     fn reads_codex_notify_thread_id_without_copying_messages() {
         let input = br#"{"type":"agent-turn-complete","thread-id":"thr-9","last-assistant-message":"private"}"#;
         let event =
-            normalize_hook_event(Source::Codex, EventKind::TurnCompleted, input, 43).unwrap();
+            normalize_hook_event(source("codex"), EventKind::TurnCompleted, input, 43).unwrap();
         assert_eq!(event.session_id, "thr-9");
         assert!(!serde_json::to_string(&event).unwrap().contains("private"));
     }
@@ -403,10 +422,10 @@ mod tests {
         // steer the overlay into a state the installed hook did not ask for.
         let input = br#"{"session_id":"s","hook_event_name":"SessionEnd","cwd":"C:\\secret"}"#;
         let event =
-            normalize_hook_event(Source::Claude, EventKind::PromptSubmitted, input, 7).unwrap();
+            normalize_hook_event(source("claude"), EventKind::PromptSubmitted, input, 7).unwrap();
 
         assert_eq!(event.version, PROTOCOL_VERSION);
-        assert_eq!(event.source, Source::Claude);
+        assert_eq!(event.source, source("claude"));
         assert_eq!(event.session_id, "s");
         assert_eq!(event.event, EventKind::PromptSubmitted);
         assert_eq!(event.timestamp_ms, 7);
@@ -417,7 +436,7 @@ mod tests {
     fn prefers_session_id_over_both_thread_id_spellings() {
         let input = br#"{"thread_id":"third","thread-id":"second","session_id":"first"}"#;
         let event =
-            normalize_hook_event(Source::Codex, EventKind::SessionStarted, input, 1).unwrap();
+            normalize_hook_event(source("codex"), EventKind::SessionStarted, input, 1).unwrap();
         assert_eq!(event.session_id, "first");
     }
 
@@ -425,7 +444,7 @@ mod tests {
     fn prefers_the_hyphenated_thread_id_over_the_underscored_one() {
         let input = br#"{"thread_id":"third","thread-id":"second"}"#;
         let event =
-            normalize_hook_event(Source::Codex, EventKind::SessionStarted, input, 1).unwrap();
+            normalize_hook_event(source("codex"), EventKind::SessionStarted, input, 1).unwrap();
         assert_eq!(event.session_id, "second");
     }
 
@@ -433,15 +452,45 @@ mod tests {
     fn accepts_the_underscored_thread_id_as_the_last_resort() {
         let input = br#"{"thread_id":"third"}"#;
         let event =
-            normalize_hook_event(Source::Codex, EventKind::SessionStarted, input, 1).unwrap();
+            normalize_hook_event(source("codex"), EventKind::SessionStarted, input, 1).unwrap();
         assert_eq!(event.session_id, "third");
+    }
+
+    #[test]
+    fn reads_the_opencode_camel_case_session_id() {
+        let input = br#"{"sessionID":"ses-1","prompt":"secret"}"#;
+        let event =
+            normalize_hook_event(source("opencode"), EventKind::PromptSubmitted, input, 1).unwrap();
+        assert_eq!(event.session_id, "ses-1");
+    }
+
+    #[test]
+    fn reads_the_agy_conversation_id_from_a_stop_document() {
+        // Antigravity's Stop payload carries `conversationId` and no session
+        // key at all; the emitter must still find the one identifier it has.
+        let input = br#"{"conversationId":"8591815f","terminationReason":"NO_TOOL_CALL","transcriptPath":"C:\\secret"}"#;
+        let event =
+            normalize_hook_event(source("agy"), EventKind::TurnCompleted, input, 1).unwrap();
+        assert_eq!(event.session_id, "8591815f");
+        assert!(!serde_json::to_string(&event).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn prefers_session_keys_over_thread_and_conversation_keys() {
+        // One preference order across every agent family: snake_case session
+        // identifiers win, then camelCase ones, then threads, then
+        // conversations.
+        let input = br#"{"conversationId":"fourth","threadId":"third","sessionID":"second"}"#;
+        let event =
+            normalize_hook_event(source("agy"), EventKind::SessionStarted, input, 1).unwrap();
+        assert_eq!(event.session_id, "second");
     }
 
     #[test]
     fn rejects_a_document_carrying_no_session_identifier() {
         let input = br#"{"hook_event_name":"Stop","prompt":"must-not-leak"}"#;
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, input, 1).unwrap_err();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, input, 1).unwrap_err();
         assert_eq!(error, EmitError::MissingSessionId);
         assert!(!error.to_string().contains("must-not-leak"));
     }
@@ -450,7 +499,7 @@ mod tests {
     fn rejects_an_empty_session_identifier() {
         let input = br#"{"session_id":""}"#;
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, input, 1).unwrap_err();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, input, 1).unwrap_err();
         assert_eq!(error, EmitError::InvalidSessionId);
     }
 
@@ -459,7 +508,7 @@ mod tests {
         let oversized = "x".repeat(MAX_SESSION_ID_BYTES + 1);
         let input = format!(r#"{{"session_id":"{oversized}"}}"#);
         let error = normalize_hook_event(
-            Source::Claude,
+            source("claude"),
             EventKind::TurnCompleted,
             input.as_bytes(),
             1,
@@ -473,7 +522,7 @@ mod tests {
         let at_limit = "x".repeat(MAX_SESSION_ID_BYTES);
         let input = format!(r#"{{"session_id":"{at_limit}"}}"#);
         let event = normalize_hook_event(
-            Source::Claude,
+            source("claude"),
             EventKind::TurnCompleted,
             input.as_bytes(),
             1,
@@ -488,7 +537,7 @@ mod tests {
         // never reach the encoder.
         let input = br#"{"session_id":"a\nb"}"#;
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, input, 1).unwrap_err();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, input, 1).unwrap_err();
         assert_eq!(error, EmitError::InvalidSessionId);
     }
 
@@ -498,8 +547,8 @@ mod tests {
         input.resize(MAX_HOOK_INPUT_BYTES + 1, b'x');
         input.extend_from_slice(br#""}"#);
 
-        let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, &input, 1).unwrap_err();
+        let error = normalize_hook_event(source("claude"), EventKind::TurnCompleted, &input, 1)
+            .unwrap_err();
 
         assert_eq!(error, EmitError::InputTooLarge);
         assert_eq!(MAX_HOOK_INPUT_BYTES, MAX_EVENT_BYTES);
@@ -515,15 +564,16 @@ mod tests {
         assert_eq!(input.len(), MAX_HOOK_INPUT_BYTES);
 
         let event =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, &input, 1).unwrap();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, &input, 1).unwrap();
 
         assert_eq!(event.session_id, "s");
     }
 
     #[test]
     fn rejects_input_that_is_not_json() {
-        let error = normalize_hook_event(Source::Claude, EventKind::TurnCompleted, b"not json", 1)
-            .unwrap_err();
+        let error =
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, b"not json", 1)
+                .unwrap_err();
         assert_eq!(error, EmitError::MalformedInput);
     }
 
@@ -532,7 +582,7 @@ mod tests {
         // A hook invoked with no stdin at all must fail open rather than invent
         // a session identifier.
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, b"", 1).unwrap_err();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, b"", 1).unwrap_err();
         assert_eq!(error, EmitError::MalformedInput);
     }
 
@@ -540,7 +590,7 @@ mod tests {
     fn rejects_a_session_identifier_that_is_not_a_string() {
         let input = br#"{"session_id":17}"#;
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, input, 1).unwrap_err();
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, input, 1).unwrap_err();
         assert_eq!(error, EmitError::MalformedInput);
     }
 
@@ -549,7 +599,7 @@ mod tests {
         // The protocol rejects a zero timestamp at encode time, so catching it
         // here keeps the invariant that a normalized event always encodes.
         let error =
-            normalize_hook_event(Source::Claude, EventKind::TurnCompleted, br#"{"a":1}"#, 0)
+            normalize_hook_event(source("claude"), EventKind::TurnCompleted, br#"{"a":1}"#, 0)
                 .unwrap_err();
         assert_eq!(error, EmitError::InvalidTimestamp);
     }
@@ -559,7 +609,7 @@ mod tests {
         let at_limit = "x".repeat(MAX_SESSION_ID_BYTES);
         let input = format!(r#"{{"session_id":"{at_limit}"}}"#);
         let event = normalize_hook_event(
-            Source::Codex,
+            source("codex"),
             EventKind::SessionEnded,
             input.as_bytes(),
             u64::MAX,
@@ -610,7 +660,7 @@ mod tests {
         assert_eq!(
             parsed,
             EmitArgs {
-                source: Source::Codex,
+                source: source("codex"),
                 event: EventKind::TurnCompleted,
                 input: InputSource::Argv,
                 pipe: Some(r"\\.\pipe\custom".to_owned()),
@@ -633,7 +683,7 @@ mod tests {
 
         assert_eq!(parsed.pipe, None);
         assert_eq!(parsed.document, None);
-        assert_eq!(parsed.source, Source::Claude);
+        assert_eq!(parsed.source, source("claude"));
         assert_eq!(parsed.input, InputSource::Stdin);
     }
 
@@ -698,12 +748,21 @@ mod tests {
         for bad in [
             vec![
                 "--source",
-                "gemini",
+                "Gemini",
                 "--event",
                 "needs_input",
                 "--input",
                 "stdin",
             ],
+            vec![
+                "--source",
+                "claude code",
+                "--event",
+                "needs_input",
+                "--input",
+                "stdin",
+            ],
+            vec!["--source", "", "--event", "needs_input", "--input", "stdin"],
             vec![
                 "--source",
                 "claude",
@@ -724,6 +783,67 @@ mod tests {
             let error = parse_args(args(&bad)).unwrap_err();
             assert_eq!(error, UsageError::UnknownValue, "for {bad:?}");
         }
+    }
+
+    #[test]
+    fn accepts_any_well_formed_source_word() {
+        // The point of the open source: a new agent CLI wires up with a new
+        // word and no emitter change.
+        for word in ["claude", "codex", "opencode", "agy", "opencode2", "gemini"] {
+            let parsed = parse_args(args(&[
+                "--source",
+                word,
+                "--event",
+                "session_started",
+                "--input",
+                "stdin",
+            ]))
+            .unwrap_or_else(|error| panic!("{word} must parse, got {error}"));
+            assert_eq!(parsed.source, source(word));
+            assert_eq!(parsed.source.as_str(), word);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_source_words() {
+        // Uppercase, whitespace, control characters, leading punctuation, and
+        // overlong words are all installation mistakes (UnknownValue), not
+        // agent failures.
+        let oversized = "x".repeat(MAX_SOURCE_BYTES + 1);
+        for word in [
+            "Claude",
+            "claude code",
+            "claude\n",
+            "-claude",
+            "_claude",
+            oversized.as_str(),
+        ] {
+            let error = parse_args(args(&[
+                "--source",
+                word,
+                "--event",
+                "needs_input",
+                "--input",
+                "stdin",
+            ]))
+            .unwrap_err();
+            assert_eq!(error, UsageError::UnknownValue, "for {word:?}");
+        }
+    }
+
+    #[test]
+    fn accepts_a_source_word_at_exactly_the_protocol_limit() {
+        let at_limit = "x".repeat(MAX_SOURCE_BYTES);
+        let parsed = parse_args(args(&[
+            "--source",
+            &at_limit,
+            "--event",
+            "needs_input",
+            "--input",
+            "stdin",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.source.as_str(), at_limit);
     }
 
     #[test]
