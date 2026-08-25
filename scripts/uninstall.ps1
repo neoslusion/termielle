@@ -7,10 +7,11 @@
     (%LOCALAPPDATA%\Termielle\installed.json):
 
       - Stops the overlay and unregisters the crash-watchdog task.
-      - Restores ~/.claude/settings.json and ~/.codex/config.toml from the
-        pre-Termielle backups the installer saved (falling back to a
-        surgical removal of only the Termielle-owned keys).
-      - Removes the opencode plugin file.
+      - Restores ~/.claude/settings.json, ~/.codex/config.toml, and
+        ~/.gemini/config/hooks.json from the pre-Termielle backups the
+        installer saved (falling back to a surgical removal of only the
+        Termielle-owned entries).
+      - Removes the opencode and OpenCode 2 plugin files.
       - Removes the Termielle directory and its PATH entry.
 
     The overlay's data (~/.termielle: config, assets, logs) is kept by
@@ -116,6 +117,22 @@ function Remove-CodexBlock {
     Write-Atomic $ConfigPath ($kept + "`r`n")
 }
 
+# Removes the Termielle handler from ~/.gemini/config/hooks.json when no
+# pre-Termielle backup exists. A file left holding nothing else is removed:
+# it can only have been created for Termielle's sake.
+function Remove-AgyHook {
+    param([string]$HooksPath)
+    if (-not (Test-Path -LiteralPath $HooksPath)) { return }
+    $hooks = Read-Json $HooksPath
+    if ($null -eq $hooks -or $hooks -isnot [System.Collections.IDictionary]) { return }
+    $null = $hooks.Remove('termielle')
+    if ($hooks.Count -eq 0) {
+        Remove-Item -LiteralPath $HooksPath -Force
+    } else {
+        Write-Atomic $HooksPath ($hooks | ConvertTo-Json -Depth 20)
+    }
+}
+
 # Reverses one configuration using its pre-Termielle backup, or the
 # surgical removal when no backup exists.
 function Restore-Config {
@@ -182,10 +199,22 @@ try {
             Remove-Item -LiteralPath $record.opencode.plugin -Force -ErrorAction SilentlyContinue
             Write-Good 'opencode plugin removed'
         }
+        if ($record.opencode2 -and $record.opencode2.plugin) {
+            Write-Step 'Removing the OpenCode 2 plugin'
+            Remove-Item -LiteralPath $record.opencode2.plugin -Force -ErrorAction SilentlyContinue
+            Write-Good 'OpenCode 2 plugin removed'
+        }
+        if ($record.agy) {
+            Write-Step 'Restoring Antigravity CLI hooks'
+            Restore-Config -ConfigPath $record.agy.hooks -Backup $record.agy.backup `
+                -Label 'Antigravity CLI hooks' `
+                -Surgical { Remove-AgyHook $record.agy.hooks }
+        }
     } else {
         Write-Host '==> No install record found; cleaning configs surgically'
         $claudeSettings = Join-Path $env:USERPROFILE '.claude\settings.json'
         $codexConfig = Join-Path $env:USERPROFILE '.codex\config.toml'
+        $agyHooks = Join-Path $env:USERPROFILE '.gemini\config\hooks.json'
         if (Test-Path $claudeSettings) {
             Write-Step 'Cleaning Claude Code settings'
             Remove-ClaudeHooks $claudeSettings $fragment
@@ -196,10 +225,20 @@ try {
             Remove-CodexBlock $codexConfig
             Write-Good 'Codex hooks removed'
         }
+        if (Test-Path $agyHooks) {
+            Write-Step 'Cleaning Antigravity CLI hooks'
+            Remove-AgyHook $agyHooks
+            Write-Good 'agy hooks removed'
+        }
         $opencodePlugin = Join-Path $env:USERPROFILE '.config\opencode\plugins\termielle.plugin.ts'
         if (Test-Path $opencodePlugin) {
             Remove-Item -LiteralPath $opencodePlugin -Force -ErrorAction SilentlyContinue
             Write-Good 'opencode plugin removed'
+        }
+        $opencode2Plugin = Join-Path $env:USERPROFILE '.config\opencode\plugins\termielle.opencode2.plugin.ts'
+        if (Test-Path $opencode2Plugin) {
+            Remove-Item -LiteralPath $opencode2Plugin -Force -ErrorAction SilentlyContinue
+            Write-Good 'OpenCode 2 plugin removed'
         }
     }
 

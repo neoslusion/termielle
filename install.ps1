@@ -6,7 +6,7 @@
     Downloads the latest release, verifies its checksum, installs to
     %LOCALAPPDATA%\Termielle\bin, adds the emitter to PATH, registers the
     crash-watchdog scheduled task, and wires up the CLI integrations it
-    finds (opencode, Claude Code, Codex).
+    finds (opencode, opencode2, Claude Code, Codex, agy).
 
     Safe to re-run: it upgrades the binaries in place, refreshes the
     Termielle-owned configuration on every run, and never touches anything
@@ -153,6 +153,36 @@ function Merge-CodexConfig {
     Write-Atomic $ConfigPath $existing
 }
 
+# Merges the Termielle handler into ~/.gemini/config/hooks.json (the global
+# Antigravity CLI hook configuration). Termielle-owned keys are refreshed on
+# every run; user-owned handlers are preserved. The result is validated
+# before it replaces the file.
+function Merge-AgyHooks {
+    param([string]$HooksPath, [string]$FragmentPath, [string]$EmitterPath)
+    $template = Get-Content -Raw -LiteralPath $FragmentPath
+    # agy resolves hook commands as absolute paths only, so the fragment's
+    # placeholder becomes the installed emitter's absolute path here; a bare
+    # PATH name would fail with exit 127. Backslashes double first because
+    # the path lands inside a JSON string.
+    $escaped = $EmitterPath.Replace('\', '\\')
+    $text = $template.Replace('{{TERMIELLE_EMIT}}', $escaped)
+    $ours = $text | ConvertFrom-Json -AsHashtable
+    if (-not $ours.ContainsKey('termielle')) {
+        throw 'the agy fragment has no termielle handler'
+    }
+    $hooks = Read-Json $HooksPath
+    if ($hooks -isnot [System.Collections.IDictionary]) {
+        throw "$HooksPath is not a JSON object; refusing to modify"
+    }
+    foreach ($key in $ours.Keys) {
+        $hooks[$key] = $ours[$key]
+    }
+    $json = $hooks | ConvertTo-Json -Depth 20
+    # The serialized result must parse before it may replace the file.
+    $null = $json | ConvertFrom-Json -AsHashtable
+    Write-Atomic $HooksPath $json
+}
+
 try {
     New-Item -ItemType Directory -Force -Path $temp | Out-Null
 
@@ -206,6 +236,8 @@ try {
         claude  = $null
         codex   = $null
         opencode = $null
+        opencode2 = $null
+        agy     = $null
     }
 
     if (-not $NoPath) {
@@ -250,12 +282,23 @@ try {
         Write-Step 'Wiring CLI integrations'
 
         $opencodeDir = Join-Path $env:USERPROFILE '.config\opencode\plugins'
-        if ((Test-Path $opencodeDir) -or (Get-Command opencode -ErrorAction SilentlyContinue)) {
+        if ((Test-Path $opencodeDir) -or (Get-Command opencode -ErrorAction SilentlyContinue) -or (Get-Command opencode2 -ErrorAction SilentlyContinue)) {
             New-Item -ItemType Directory -Force -Path $opencodeDir | Out-Null
             $pluginTarget = Join-Path $opencodeDir 'termielle.plugin.ts'
             Copy-Item (Join-Path $integrations 'opencode\termielle.plugin.ts') $pluginTarget -Force
             Write-Good 'opencode plugin installed (restart opencode to load it)'
             $record.opencode = @{ plugin = $pluginTarget }
+        }
+
+        # OpenCode 2 reads the same plugin directories; its variant emits
+        # under the distinct `opencode2` source word so sessions from both
+        # runtimes stay apart when they run side by side.
+        if ((Get-Command opencode2 -ErrorAction SilentlyContinue) -or (Test-Path (Join-Path $env:USERPROFILE '.config\opencode2'))) {
+            New-Item -ItemType Directory -Force -Path $opencodeDir | Out-Null
+            $v2PluginTarget = Join-Path $opencodeDir 'termielle.opencode2.plugin.ts'
+            Copy-Item (Join-Path $integrations 'opencode2\termielle.plugin.ts') $v2PluginTarget -Force
+            Write-Good 'OpenCode 2 plugin installed (restart opencode2 to load it)'
+            $record.opencode2 = @{ plugin = $v2PluginTarget }
         }
 
         $claudeSettings = Join-Path $env:USERPROFILE '.claude\settings.json'
@@ -280,6 +323,17 @@ try {
             $record.codex = @{ config = $codexConfig; backup = $codexBackup }
         }
 
+        $agyHooks = Join-Path $env:USERPROFILE '.gemini\config\hooks.json'
+        if ((Test-Path (Join-Path $env:USERPROFILE '.gemini')) -or (Get-Command agy -ErrorAction SilentlyContinue)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $agyHooks) | Out-Null
+            $agyBackup = Backup-Once -Path $agyHooks -Name 'agy.hooks.json.pre'
+            Merge-AgyHooks -HooksPath $agyHooks `
+                -FragmentPath (Join-Path $integrations 'agy\hooks.fragment.json') `
+                -EmitterPath (Join-Path $bin 'termielle-emit.exe')
+            Write-Good 'Antigravity CLI (agy) hooks installed'
+            $record.agy = @{ hooks = $agyHooks; backup = $agyBackup }
+        }
+
         Write-Atomic $recordPath ($record | ConvertTo-Json -Depth 10)
     }
 
@@ -297,7 +351,8 @@ try {
     Write-Host 'Termielle installed.' -ForegroundColor Green
     Write-Host "  - Binaries:    $bin"
     Write-Host "  - Config:      $(Join-Path $env:USERPROFILE '.termielle\config.json')"
-    Write-Host '  - Restart opencode once if you use it, so the plugin loads.'
+    Write-Host '  - Restart opencode / opencode2 once if you use them, so the plugins load.'
+    Write-Host '  - Restart any running agy session so its hooks reload.'
     Write-Host "  - Uninstall:   pwsh -File $(Join-Path $PSScriptRoot 'uninstall.ps1')"
 } finally {
     Remove-Item -Recurse -Force $temp -ErrorAction SilentlyContinue

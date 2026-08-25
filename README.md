@@ -1,12 +1,18 @@
 # Termielle
 
 Termielle is a low-overhead animated desktop companion for the terminal. A
-transparent overlay character follows Claude Code, Codex CLI, and opencode
-lifecycle events, received over a local named pipe (Windows) or Unix domain
-socket (macOS/Linux). Version 1 targets Windows, including hooks launched from
-WSL through a bridge executable; the event protocol, transport, and emitter
-are platform-neutral and covered by a Linux CI job. The events are small and
-content-free: no prompts or terminal output are ever captured.
+transparent overlay character follows Claude Code, Codex CLI, opencode (1.x
+and 2.x), and Antigravity CLI (`agy`) lifecycle events, received over a local
+named pipe (Windows) or Unix domain socket (macOS/Linux). Version 1 targets
+Windows, including hooks launched from WSL through a bridge executable; the
+event protocol, transport, and emitter are platform-neutral and covered by a
+Linux CI job. The events are small and content-free: no prompts or terminal
+output are ever captured.
+
+Any other agent CLI works too: the emitter's `--source` accepts any short
+lowercase identifier and its session extraction recognizes every common
+identifier key, so wiring up a new agent is pure configuration, following the
+scaffold in `integrations/_template/`.
 
 ## Install
 
@@ -84,10 +90,22 @@ emitter.
   prompts, real reasoning (`thinking_started`/`thinking_ended` from the
   assistant message stream), permission prompts, step failures, and status to
   emitter calls.
+- **opencode2 (OpenCode 2)** — OpenCode 2 reads the same plugin directories,
+  and its plugin is `integrations/opencode2/termielle.plugin.ts`; copy it next
+  to the V1 file and restart. It emits under the distinct `opencode2` source
+  word, so sessions from both runtimes stay apart when they run side by side.
+- **Antigravity CLI (`agy`)** — merge the handler from
+  `integrations/agy/hooks.fragment.json` into `~/.gemini/config/hooks.json`
+  (the installer substitutes the absolute emitter path that agy requires).
+  Each model invocation shows as Thinking and tool work as Working;
+  `Stop` completes the turn. agy exposes no failure or approval-prompt event,
+  so `needs_input` and `turn_failed` are not mapped. See
+  `integrations/agy/README.md`.
 
 Claude and Codex expose no reasoning boundary, so their `Thinking -> Working`
 transition is the local one-second heuristic; opencode's thinking face is
-driven by its actual reasoning step. Neither Claude nor Codex emits a universal
+driven by its actual reasoning step, and agy's by its model invocations.
+Neither Claude nor Codex emits a universal
 "resumed after approval" event, so an approval prompt may stay `NeedsInput`
 until the next event. opencode publishes no session-end event, so a finished
 conversation leaves via the Ready hold, an explicit `session.deleted`, or the
