@@ -165,8 +165,7 @@ pub fn glass_layer(
                 );
                 let cov_sh = ((0.5 - sd_sh).clamp(0.0, 1.0) * 255.0) as u32;
                 // Only where the body does not already cover.
-                let sa =
-                    u32::from(glass.shadow_alpha) * cov_sh / 255 * (255 - cov_u) / 255;
+                let sa = u32::from(glass.shadow_alpha) * cov_sh / 255 * (255 - cov_u) / 255;
                 if sa > 0 {
                     // Opaque black shadow.
                     acc[3] = sa as u8;
@@ -263,6 +262,7 @@ pub fn blit_icon(
     x: i32,
     y: i32,
     hovered: bool,
+    accent: [u8; 4],
 ) {
     if icon.width == 0 || icon.height == 0 {
         return;
@@ -273,23 +273,23 @@ pub fn blit_icon(
         let r = clip_radius + 1;
         for ty in -1..=icon.height as i32 {
             for tx in -1..=icon.width as i32 {
-                let cov = rounded_rect_coverage_aa(
-                    tx,
-                    ty,
-                    icon.width + 2,
-                    icon.height + 2,
-                    r,
-                    false,
-                );
+                let cov =
+                    rounded_rect_coverage_aa(tx, ty, icon.width + 2, icon.height + 2, r, false);
                 if cov == 0 {
                     continue;
                 }
-                let inner = rounded_rect_coverage_aa(tx, ty, icon.width, icon.height, clip_radius, false);
+                let inner =
+                    rounded_rect_coverage_aa(tx, ty, icon.width, icon.height, clip_radius, false);
                 let a = cov.saturating_sub(inner);
                 if a == 0 {
                     continue;
                 }
-                blend_pixel(frame, (x + tx) as u32, (y + ty) as u32, [215, 120, 0, a]);
+                blend_pixel(
+                    frame,
+                    (x + tx) as u32,
+                    (y + ty) as u32,
+                    [accent[0], accent[1], accent[2], a],
+                );
             }
         }
     }
@@ -344,7 +344,6 @@ pub fn draw_accent_strip(frame: &mut FrameBuffer, attached: bool, radius: u32, c
         }
     }
 }
-
 
 fn draw_island_glyph(
     frame: &mut FrameBuffer,
@@ -509,7 +508,6 @@ fn signed_distance_rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32, attached
 
 // ---- pixel helpers --------------------------------------------------------
 
-
 fn blend_pixel(frame: &mut FrameBuffer, x: u32, y: u32, src: [u8; 4]) {
     if x >= frame.width || y >= frame.height {
         return;
@@ -633,7 +631,7 @@ mod tests {
             pixels_pbgra: vec![200u8; 24 * 24 * 4],
         };
         blit_scaled(&mut f, &face, 14, 6, 44, 44);
-        blit_icon(&mut f, &icon, 70, 16, false);
+        blit_icon(&mut f, &icon, 70, 16, false, [215, 120, 0, 255]);
         draw_disc(&mut f, 110, 28, 3, [107, 201, 242, 255]);
         draw_accent_strip(&mut f, true, 20, [61, 163, 232, 220]);
         // Face fill, icon block, dots and the accent strip must leave

@@ -129,11 +129,18 @@ fn main() {
     let panic_path = data_dir().map(|d| d.join("panic.log"));
     std::panic::set_hook(Box::new(move |info| {
         if let Some(path) = panic_path.as_ref() {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
             {
                 use std::io::Write;
                 let _ = writeln!(f, "{} panic: {info}", now_ms());
-                let _ = writeln!(f, "location: {}", info.location().map(|l| l.to_string()).unwrap_or_default());
+                let _ = writeln!(
+                    f,
+                    "location: {}",
+                    info.location().map(|l| l.to_string()).unwrap_or_default()
+                );
             }
         }
     }));
@@ -899,7 +906,14 @@ fn run_gui(
             let actions = controller.on_timer(now);
             let mut actions = actions;
             poll_hover(window, controller, &mut actions);
-            apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
+            apply_timed(
+                window,
+                controller,
+                log,
+                actions,
+                ack,
+                Some(backdrop_request),
+            );
         }
 
         // Arm the clock for the nearest deadline; disarming when none. The
@@ -920,15 +934,27 @@ fn run_gui(
                     actions.present_frame = actions.present_frame || thumb_present;
                     poll_hover(window, controller, &mut actions);
                     actions.next_deadline_ms = controller.next_deadline_ms();
-                    apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
+                    apply_timed(
+                        window,
+                        controller,
+                        log,
+                        actions,
+                        ack,
+                        Some(backdrop_request),
+                    );
                 };
                 // A panic here must never kill the overlay: log (via the
                 // hook), rebuild a known-good still, and keep running.
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(iteration)).is_err()
-                {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(iteration)).is_err() {
                     log_error(log, LogComponent::Window, LogEvent::PresentFailed, 66);
                     controller.fallback_to_still();
-                    present_current(window, controller, log, ack.as_mut(), Some(backdrop_request));
+                    present_current(
+                        window,
+                        controller,
+                        log,
+                        ack.as_mut(),
+                        Some(backdrop_request),
+                    );
                 }
                 continue;
             }
@@ -1029,7 +1055,7 @@ fn run_gui(
                     ..Default::default()
                 },
                 termielle_app::app::ClickOutcome::None => ControllerActions::default(),
-            }
+            },
             WindowEvent::HoverChanged(inside) => {
                 let changed = controller.set_hover(inside, now_ms());
                 ControllerActions {
@@ -1107,13 +1133,26 @@ fn run_gui(
         }
         poll_hover(window, controller, &mut actions);
         let iteration = || {
-            apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
+            apply_timed(
+                window,
+                controller,
+                log,
+                actions,
+                ack,
+                Some(backdrop_request),
+            );
         };
         // Same fault tolerance as the wake path.
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(iteration)).is_err() {
             log_error(log, LogComponent::Window, LogEvent::PresentFailed, 66);
             controller.fallback_to_still();
-            present_current(window, controller, log, ack.as_mut(), Some(backdrop_request));
+            present_current(
+                window,
+                controller,
+                log,
+                ack.as_mut(),
+                Some(backdrop_request),
+            );
         }
     }
 }
@@ -1203,11 +1242,9 @@ fn run_smoke(
 /// sets foreground. The ALT tap satisfies the foreground-lock so the call
 /// from our (not foreground) process is honored.
 fn activate_window(hwnd: isize) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        keybd_event, KEYEVENTF_KEYUP,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, keybd_event};
     use windows::Win32::UI::WindowsAndMessaging::{
-        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
     };
     let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
     unsafe {

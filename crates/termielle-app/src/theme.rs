@@ -40,67 +40,6 @@ impl Default for ThemeFile {
     }
 }
 
-/// Built-in presets that ship with the binary, so the overlay works with no
-/// theme files on disk.
-pub fn builtin_themes() -> Vec<ThemeFile> {
-    // `auto` resolves to the system light/dark setting before lookup.
-    let names: Vec<&str> = vec!["liquid-dark", "midnight", "light", "transparent"];
-    let mut out = Vec::new();
-    for name in names {
-        out.push(builtin(name));
-    }
-    out
-}
-
-fn builtin(name: &str) -> ThemeFile {
-    match name {
-        "light" => ThemeFile {
-            name: "light".into(),
-            display_name: "Light Glass".into(),
-            tint: Some([245, 245, 245, 160]),
-            blur_radius: Some(12),
-            border_alpha: Some(40),
-            highlight_alpha: Some(90),
-            shadow_alpha: Some(40),
-            corner_radius: Some(18),
-            description: "Light frosted glass for dark wallpapers".into(),
-        },
-        "midnight" => ThemeFile {
-            name: "midnight".into(),
-            display_name: "Midnight".into(),
-            tint: Some([12, 18, 32, 200]),
-            blur_radius: Some(12),
-            border_alpha: Some(28),
-            highlight_alpha: Some(50),
-            shadow_alpha: Some(80),
-            corner_radius: Some(18),
-            description: "Deep navy, stronger shadow".into(),
-        },
-        "transparent" => ThemeFile {
-            name: "transparent".into(),
-            display_name: "Transparent".into(),
-            tint: Some([30, 30, 30, 90]),
-            blur_radius: Some(12),
-            border_alpha: Some(20),
-            highlight_alpha: Some(30),
-            shadow_alpha: Some(30),
-            corner_radius: Some(18),
-            description: "Barely-there glass".into(),
-        },
-        _ => ThemeFile {
-            name: "liquid-dark".into(),
-            display_name: "Liquid Dark".into(),
-            tint: Some([26, 26, 26, 180]),
-            blur_radius: Some(12),
-            border_alpha: Some(38),
-            highlight_alpha: Some(70),
-            shadow_alpha: Some(60),
-            corner_radius: Some(18),
-            description: "Near-black liquid glass, frosted border + top highlight".into(),
-        },
-    }
-}
-
 /// Apply a theme to `config` in place. Unknown names keep current config.
 /// The name `auto` maps to the system light/dark setting.
 ///
@@ -114,31 +53,33 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
         name.to_string()
     };
     let transparency = crate::system::transparency_enabled();
-    let (tint, border_alpha, highlight_alpha, shadow_alpha): ([u8; 4], u8, u8, u8) =
+    let (tint, blur, border_alpha, highlight_alpha, shadow_alpha): ([u8; 4], u32, u8, u8, u8) =
         match resolved.as_str() {
             "light" => (
                 [243, 243, 243, if transparency { 230 } else { 255 }],
+                24,
                 40,
                 90,
                 if transparency { 40 } else { 0 },
             ),
-            "transparent" => ([30, 30, 30, 90], 20, 30, 30),
-            "midnight" => ([12, 18, 32, 205], 28, 50, 80),
+            "transparent" => ([30, 30, 30, 90], 16, 20, 30, 30),
+            "midnight" => ([12, 18, 32, 205], 28, 28, 50, 80),
             _ => (
                 [32, 32, 32, if transparency { 205 } else { 255 }],
+                24,
                 38,
                 70,
                 if transparency { 60 } else { 0 },
             ),
         };
     config.glass.tint = tint;
+    config.glass.blur_radius = blur;
     config.glass.border_alpha = border_alpha;
     config.glass.highlight_alpha = highlight_alpha;
     config.glass.shadow_alpha = shadow_alpha;
     config.glass.clamp();
     config.clamp();
 }
-
 
 /// Try to load a theme file from `roots` (user first, install second).
 pub fn load_theme_file(name: &str, roots: &[PathBuf]) -> Option<ThemeFile> {
@@ -238,7 +179,6 @@ pub fn resolve_theme(config: &mut IslandConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::system::apps_use_light_theme;
 
     #[test]
     fn builtin_apply_changes_tint() {

@@ -363,9 +363,7 @@ impl Controller {
         if island.has_widget("face") {
             elements.push(Elem::Face);
         }
-        if island.show_tasks
-            && island.has_widget("tasks")
-            && presentation != Presentation::Minimal
+        if island.show_tasks && island.has_widget("tasks") && presentation != Presentation::Minimal
         {
             let max = island.max_thumbnails as usize;
             for (index, icon) in self.icons.iter().enumerate().take(max) {
@@ -375,9 +373,7 @@ impl Controller {
                 });
             }
         }
-        let dots = if island.has_widget("agents")
-            && presentation != Presentation::Minimal
-        {
+        let dots = if island.has_widget("agents") && presentation != Presentation::Minimal {
             self.reducer.session_count().min(6)
         } else {
             0
@@ -391,9 +387,7 @@ impl Controller {
             match e {
                 Elem::Face => (island.height.saturating_sub(12)).min(48) as i32,
                 Elem::Icon { .. } => crate::animation::notch::ICON_PX as i32,
-                Elem::Dots { count } => {
-                    (*count as i32 * 6) + (*count as i32 - 1) * 4
-                }
+                Elem::Dots { count } => (*count as i32 * 6) + (*count as i32 - 1) * 4,
             }
         };
         let content: i32 = elements.iter().map(&elem_w).sum();
@@ -433,8 +427,10 @@ impl Controller {
                         x,
                         cy - size / 2,
                         hovered,
+                        crate::system::accent_color_bgra(),
                     );
-                    self.icon_hits.push((*hwnd, x, cy - size / 2, size as u32, size as u32));
+                    self.icon_hits
+                        .push((*hwnd, x, cy - size / 2, size as u32, size as u32));
                 }
                 Elem::Dots { count } => {
                     let (dot, _) = crate::animation::notch::accent_colors(state);
@@ -507,27 +503,6 @@ impl Controller {
         Presentation::Minimal
     }
 
-    /// Progress-ring fraction from the configured metric (`ring_metric`):
-    /// battery, CPU, or memory load. `None` hides the ring (widget off or,
-    /// for battery, no battery present e.g. desktops).
-    ///
-    /// Note the honesty boundary: true per-agent API quota is not visible to
-    /// the overlay — the event protocol is content-free by design — so the
-    /// ring always shows a system metric. Agent *activity* (live sessions per
-    /// agent) is what the `agents` widget reports.
-    fn ring_frac(&self) -> Option<f32> {
-        if !self.island.has_widget("ring") {
-            return None;
-        }
-        let stats = crate::system::collect();
-        let pct = match self.island.ring_metric.as_str() {
-            "cpu" => Some(stats.cpu_percent),
-            "mem" => Some(stats.mem_percent),
-            _ => stats.battery,
-        }?;
-        Some(pct as f32 / 100.0)
-    }
-
     /// Whether the pill currently shows the wide dashboard layout (icons,
     /// agent usage, media) rather than the compact face+text layout.
     fn dashboard_expanded(&self) -> bool {
@@ -559,11 +534,11 @@ impl Controller {
         if !self.dashboard_expanded() {
             // Collapsed pills still refresh for a visible ring or the media
             // strip, which change without any event or tick.
-            if self.ring_frac().is_none() && !self.media_playing() {
+            if !self.media_playing() {
                 return false;
             }
         }
-        if !self.island.has_widget("tasks") && !self.media_playing() && self.ring_frac().is_none() {
+        if !self.island.has_widget("tasks") && !self.media_playing() {
             return false;
         }
         let w = self.current.width;
@@ -647,9 +622,9 @@ impl Controller {
         // Repaint only when the point moved across an icon hit-rect boundary.
         let on_icon = |pt: &Option<(i32, i32)>| {
             pt.is_some_and(|(px, py)| {
-                self.icon_hits
-                    .iter()
-                    .any(|(_, hx, hy, hw, hh)| px >= *hx && px < hx + *hw as i32 && py >= *hy && py < hy + *hh as i32)
+                self.icon_hits.iter().any(|(_, hx, hy, hw, hh)| {
+                    px >= *hx && px < hx + *hw as i32 && py >= *hy && py < hy + *hh as i32
+                })
             })
         };
         on_icon(&self.hover_point) != on_icon(&point)

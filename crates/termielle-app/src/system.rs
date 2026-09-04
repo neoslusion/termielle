@@ -160,7 +160,7 @@ pub fn apps_use_light_theme() -> Option<bool> {
 /// The user's accent color as BGRA, from the Windows personalization
 /// registry (AccentColorMenu). Falls back to the default Windows blue.
 pub fn accent_color_bgra() -> [u8; 4] {
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegGetValueW, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     use windows::core::w;
     let mut value: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
@@ -178,14 +178,19 @@ pub fn accent_color_bgra() -> [u8; 4] {
     if status.is_err() {
         [215, 120, 0, 255] // default Windows accent #0078D7 in BGRA
     } else {
-        [(value & 0xff) as u8, ((value >> 8) & 0xff) as u8, ((value >> 16) & 0xff) as u8, 255]
+        [
+            (value & 0xff) as u8,
+            ((value >> 8) & 0xff) as u8,
+            ((value >> 16) & 0xff) as u8,
+            255,
+        ]
     }
 }
 
 /// Whether Windows "transparency effects" are enabled. When off, the
 /// taskbar/goal glass is opaque — we match that with a fully opaque tint.
 pub fn transparency_enabled() -> bool {
-    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegGetValueW, RRF_RT_REG_DWORD};
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     use windows::core::w;
     let mut value: u32 = 1;
     let mut size = std::mem::size_of::<u32>() as u32;
@@ -200,11 +205,7 @@ pub fn transparency_enabled() -> bool {
             Some(&mut size),
         )
     };
-    if status.is_err() {
-        true
-    } else {
-        value == 1
-    }
+    if status.is_err() { true } else { value == 1 }
 }
 
 /// Resolves the `auto` theme name from the system light/dark setting.

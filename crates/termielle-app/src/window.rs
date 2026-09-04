@@ -406,8 +406,7 @@ unsafe extern "system" fn window_proc(
                     let _ = unsafe { TrackMouseEvent(&mut track) };
                 } else {
                     *inside = false;
-                    let _ =
-                        unsafe { (*state).events.send(WindowEvent::HoverChanged(false)) };
+                    let _ = unsafe { (*state).events.send(WindowEvent::HoverChanged(false)) };
                 }
             }
             return LRESULT(0);
@@ -1016,30 +1015,22 @@ impl OverlayWindow {
                             // during morphs the stored backdrop was captured
                             // for the previous pill size, and blur hides the
                             // stretch. Never panics on size mismatch.
-                            let bx = ((u64::from(xx) * u64::from(bg.width))
-                                / u64::from(scaled_w))
+                            let bx = ((u64::from(xx) * u64::from(bg.width)) / u64::from(scaled_w))
                                 .min(u64::from(bg.width.saturating_sub(1)))
                                 as usize;
-                            let by = ((u64::from(yy) * u64::from(bg.height))
-                                / u64::from(scaled_h))
+                            let by = ((u64::from(yy) * u64::from(bg.height)) / u64::from(scaled_h))
                                 .min(u64::from(bg.height.saturating_sub(1)))
                                 as usize;
                             let bi = (by * bg.width as usize + bx) * 4;
                             let ia = 255 - u32::from(source[3]);
                             dst[target] = (u32::from(source[0])
-                                + u32::from(bg.pixels.get(bi).copied().unwrap_or(0))
-                                    * ia
-                                    / 255)
+                                + u32::from(bg.pixels.get(bi).copied().unwrap_or(0)) * ia / 255)
                                 as u8;
                             dst[target + 1] = (u32::from(source[1])
-                                + u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0))
-                                    * ia
-                                    / 255)
+                                + u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0)) * ia / 255)
                                 as u8;
                             dst[target + 2] = (u32::from(source[2])
-                                + u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0))
-                                    * ia
-                                    / 255)
+                                + u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0)) * ia / 255)
                                 as u8;
                             dst[target + 3] = 255;
                         }

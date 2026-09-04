@@ -12,6 +12,6 @@ pub mod notch;
 pub use fallback::fallback_frame;
 pub use gif::{AnimationError, AnimationSource, FrameBuffer, GifAnimation};
 pub use notch::{
-    NotchContent, Presentation, blit_icon, blit_scaled, draw_accent_strip, draw_disc,
-    glass_layer, island_frame,
+    NotchContent, Presentation, blit_icon, blit_scaled, draw_accent_strip, draw_disc, glass_layer,
+    island_frame,
 };

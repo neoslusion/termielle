@@ -129,48 +129,82 @@ pub fn box_blur(backdrop: &mut Backdrop, radius: u32) {
     if radius == 0 || backdrop.width == 0 || backdrop.height == 0 {
         return;
     }
+    // Sliding-window box blur: O(w*h) per pass regardless of radius. The
+    // window sum is maintained by adding the entering column/row and
+    // subtracting the leaving one, instead of re-summing r pixels per pixel.
     let w = backdrop.width as usize;
     let h = backdrop.height as usize;
-    let r = radius as usize;
-    let mut tmp = backdrop.pixels.clone();
-    // Horizontal pass.
+    let r = (radius as usize).min(w.max(h));
+    let mut tmp = vec![0u8; backdrop.pixels.len()];
+
+    // Horizontal pass into tmp.
     for y in 0..h {
+        let row = y * w;
+        let mut sum = [0u32; 3];
+        // Seed the window [0, r].
+        for sx in 0..=r.min(w - 1) {
+            let i = (row + sx) * 4;
+            sum[0] += backdrop.pixels[i] as u32;
+            sum[1] += backdrop.pixels[i + 1] as u32;
+            sum[2] += backdrop.pixels[i + 2] as u32;
+        }
+        let mut count = (r.min(w - 1) + 1) as u32;
         for x in 0..w {
-            let mut acc = [0u32; 3];
-            let mut count = 0u32;
-            let x0 = x.saturating_sub(r);
-            let x1 = (x + r + 1).min(w);
-            for sx in x0..x1 {
-                let i = (y * w + sx) * 4;
-                acc[0] += backdrop.pixels[i] as u32;
-                acc[1] += backdrop.pixels[i + 1] as u32;
-                acc[2] += backdrop.pixels[i + 2] as u32;
+            let o = (row + x) * 4;
+            tmp[o] = (sum[0] / count) as u8;
+            tmp[o + 1] = (sum[1] / count) as u8;
+            tmp[o + 2] = (sum[2] / count) as u8;
+            // Slide: add x+r+1, drop x-r.
+            let add = x + r + 1;
+            if add < w {
+                let i = (row + add) * 4;
+                sum[0] += backdrop.pixels[i] as u32;
+                sum[1] += backdrop.pixels[i + 1] as u32;
+                sum[2] += backdrop.pixels[i + 2] as u32;
                 count += 1;
             }
-            let o = (y * w + x) * 4;
-            tmp[o] = (acc[0] / count) as u8;
-            tmp[o + 1] = (acc[1] / count) as u8;
-            tmp[o + 2] = (acc[2] / count) as u8;
+            let drop = x as isize - r as isize;
+            if drop >= 0 {
+                let i = (row + drop as usize) * 4;
+                sum[0] -= backdrop.pixels[i] as u32;
+                sum[1] -= backdrop.pixels[i + 1] as u32;
+                sum[2] -= backdrop.pixels[i + 2] as u32;
+                count -= 1;
+            }
         }
     }
-    // Vertical pass, writing back.
-    for y in 0..h {
-        for x in 0..w {
-            let mut acc = [0u32; 3];
-            let mut count = 0u32;
-            let y0 = y.saturating_sub(r);
-            let y1 = (y + r + 1).min(h);
-            for sy in y0..y1 {
-                let i = (sy * w + x) * 4;
-                acc[0] += tmp[i] as u32;
-                acc[1] += tmp[i + 1] as u32;
-                acc[2] += tmp[i + 2] as u32;
+
+    // Vertical pass from tmp back into pixels.
+    for x in 0..w {
+        let mut sum = [0u32; 3];
+        for sy in 0..=r.min(h - 1) {
+            let i = (sy * w + x) * 4;
+            sum[0] += tmp[i] as u32;
+            sum[1] += tmp[i + 1] as u32;
+            sum[2] += tmp[i + 2] as u32;
+        }
+        let mut count = (r.min(h - 1) + 1) as u32;
+        for y in 0..h {
+            let o = (y * w + x) * 4;
+            backdrop.pixels[o] = (sum[0] / count) as u8;
+            backdrop.pixels[o + 1] = (sum[1] / count) as u8;
+            backdrop.pixels[o + 2] = (sum[2] / count) as u8;
+            let add = y + r + 1;
+            if add < h {
+                let i = (add * w + x) * 4;
+                sum[0] += tmp[i] as u32;
+                sum[1] += tmp[i + 1] as u32;
+                sum[2] += tmp[i + 2] as u32;
                 count += 1;
             }
-            let o = (y * w + x) * 4;
-            backdrop.pixels[o] = (acc[0] / count) as u8;
-            backdrop.pixels[o + 1] = (acc[1] / count) as u8;
-            backdrop.pixels[o + 2] = (acc[2] / count) as u8;
+            let drop = y as isize - r as isize;
+            if drop >= 0 {
+                let i = (drop as usize * w + x) * 4;
+                sum[0] -= tmp[i] as u32;
+                sum[1] -= tmp[i + 1] as u32;
+                sum[2] -= tmp[i + 2] as u32;
+                count -= 1;
+            }
         }
     }
 }
