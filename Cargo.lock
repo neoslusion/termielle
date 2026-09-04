@@ -245,6 +245,7 @@ dependencies = [
  "termielle-ipc",
  "thiserror",
  "windows",
+ "windows-future",
 ]
 
 [[package]]

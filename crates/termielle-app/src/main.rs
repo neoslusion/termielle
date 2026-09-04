@@ -15,12 +15,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use termielle_app::animation::fallback_frame;
 use termielle_app::app::{Controller, ControllerActions, FALLBACK_FRAME_SIZE};
 use termielle_app::log::{BoundedLog, LogComponent, LogEvent, LogLevel, LogRecord};
+use termielle_app::theme;
 use termielle_app::tray;
 use termielle_app::window::{AnimationClock, OverlayWindow, WakeHandle, WindowError, WindowEvent};
 use termielle_core::{
     AppConfig, AssetCatalog, DEFAULT_EVENT_LOG_MAX_BYTES, EventKind, EventLog, EventMessage,
     PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode, Source, VisualState,
-    decode_event_line, encode_event_line, load_config,
+    decode_event_line, encode_event_line, load_config, save_config_atomic,
 };
 use termielle_ipc::{DEFAULT_PIPE_NAME, EventClient, EventServer, IpcError};
 use windows::Win32::Foundation::{
@@ -123,6 +124,20 @@ fn main() {
     // timing path runs, including the smoke test.
     let _precise_timer = PreciseTimer::enable();
 
+    // GUI-subsystem panics vanish silently; route them to a file so a hover
+    // crash is diagnosable instead of looking like "it disappeared".
+    let panic_path = data_dir().map(|d| d.join("panic.log"));
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(path) = panic_path.as_ref() {
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "{} panic: {info}", now_ms());
+                let _ = writeln!(f, "location: {}", info.location().map(|l| l.to_string()).unwrap_or_default());
+            }
+        }
+    }));
+
     let cli = Cli::parse();
 
     // One-time move of user state from the pre-0.2 location.
@@ -144,11 +159,12 @@ fn main() {
 
     let log = Arc::new(Mutex::new(BoundedLog::new(log_path(), 1_048_576, 3)));
 
-    let config = load_config_with_log(&log);
+    let mut config = load_config_with_log(&log);
+    // Resolve island theme (builtin + file overlay)
+    theme::resolve_theme(&mut config.island);
 
     // The command line wins over the persisted file: a doctor run can force a
     // renderer without touching the user's config.
-    let mut config = config;
     if let Some(render) = cli.render {
         config.render = render;
     }
@@ -182,7 +198,7 @@ fn main() {
             );
         }
     }
-    let mut controller = Controller::new(
+    let mut controller = Controller::new_with_island(
         config.ready_hold_ms,
         config.busy_stall_ms,
         AssetCatalog::new(asset_roots()),
@@ -193,6 +209,7 @@ fn main() {
         config
             .frame_rate
             .map(|rate| ((1000u64 + u64::from(rate) / 2) / u64::from(rate)).max(1)),
+        config.island.clone(),
     );
 
     // Only the production overlay journals and replays: diagnostics runs on
@@ -242,6 +259,23 @@ fn main() {
         std::process::exit(code);
     }
 
+    // Background dashboard worker: icon reads and media queries never run
+    // on the GUI thread, so hovering and morphing never stall. The worker
+    // exits when its receiver is dropped at shutdown.
+    let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
+        config.island.is_enabled() && config.island.show_tasks,
+        config.island.max_thumbnails,
+    ));
+    let (thumb_sender, thumb_receiver) = channel();
+    let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let _thumb_worker = termielle_app::tasks::spawn_worker(
+        wake,
+        thumb_sender,
+        thumb_cfg.clone(),
+        backdrop_request.clone(),
+    );
+
     // The acknowledgement file is a diagnostics contract: open failure is
     // logged and the overlay still runs, so a locked temp file never hides
     // the pet itself.
@@ -261,14 +295,24 @@ fn main() {
             }
         });
 
-    present_current(&mut window, &mut controller, &log, ack.as_mut());
+    present_current(
+        &mut window,
+        &mut controller,
+        &log,
+        ack.as_mut(),
+        Some(&backdrop_request),
+    );
     let restart = run_gui(
         &mut window,
         &mut controller,
         &receiver,
+        &thumb_receiver,
+        &thumb_cfg,
+        &backdrop_request,
         &log,
         &mut ack,
         journal.as_ref(),
+        &mut config,
     );
     drop(instance);
     if restart {
@@ -627,8 +671,36 @@ fn present_current(
     controller: &mut Controller,
     log: &Arc<Mutex<BoundedLog>>,
     ack: Option<&mut AckWriter>,
+    backdrop_request: Option<&Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>>,
 ) {
-    match window.present(controller.current_frame(), 1.0) {
+    let anchor = if controller.is_island() {
+        let cfg = controller.island_config();
+        Some((cfg.is_attached(), cfg.y_offset))
+    } else {
+        None
+    };
+    let attempt = if let Some((attached, y_off)) = anchor {
+        window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
+    } else {
+        window.present(controller.current_frame(), 1.0)
+    };
+    // Publish the glass capture request: the rect the pill was just drawn
+    // at. The worker owns the (potentially slow) capture and blur.
+    if let Some(request) = backdrop_request {
+        let (x, y, w, h) = window.last_dest();
+        if w > 1 {
+            let cfg = controller.island_config();
+            *request.lock().unwrap() = Some(termielle_app::tasks::BackdropRequest {
+                x,
+                y,
+                w,
+                h,
+                radius: cfg.glass.blur_radius,
+                tint: cfg.glass.tint,
+            });
+        }
+    }
+    match attempt {
         Ok(()) => {
             if let Some(ack) = ack {
                 ack.record(controller.visible_state());
@@ -641,7 +713,18 @@ fn present_current(
                 LogEvent::PresentFailed,
                 window_error_code(&error),
             );
-            match window.present(controller.current_frame(), 1.0) {
+            let retry_anchor = if controller.is_island() {
+                let cfg = controller.island_config();
+                Some((cfg.is_attached(), cfg.y_offset))
+            } else {
+                None
+            };
+            let retry = if let Some((attached, y_off)) = retry_anchor {
+                window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
+            } else {
+                window.present(controller.current_frame(), 1.0)
+            };
+            match retry {
                 Ok(()) => {
                     if let Some(ack) = ack {
                         ack.record(controller.visible_state());
@@ -655,10 +738,38 @@ fn present_current(
                         window_error_code(&second),
                     );
                     controller.fallback_to_still();
-                    let _ = window.present(controller.current_frame(), 1.0);
+                    let fallback_anchor = if controller.is_island() {
+                        let cfg = controller.island_config();
+                        Some((cfg.is_attached(), cfg.y_offset))
+                    } else {
+                        None
+                    };
+                    let _ = if let Some((attached, y_off)) = fallback_anchor {
+                        window.present_with_anchor(
+                            controller.current_frame(),
+                            1.0,
+                            Some((attached, y_off)),
+                        )
+                    } else {
+                        window.present(controller.current_frame(), 1.0)
+                    };
                 }
             }
         }
+    }
+}
+
+/// Polls hover from the real cursor position and folds any transition into
+/// `actions`. Backstop for spurious `WM_MOUSELEAVE`s across ULW resizes.
+fn poll_hover(
+    window: &OverlayWindow,
+    controller: &mut Controller,
+    actions: &mut ControllerActions,
+) {
+    controller.set_hover_point(window.cursor_client_pos());
+    if controller.set_hover(window.cursor_over_pill(), now_ms()) {
+        actions.present_frame = true;
+        actions.next_deadline_ms = controller.next_deadline_ms();
     }
 }
 
@@ -669,6 +780,7 @@ fn apply(
     log: &Arc<Mutex<BoundedLog>>,
     actions: ControllerActions,
     ack: &mut Option<AckWriter>,
+    backdrop_request: Option<&Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>>,
 ) {
     if let Some(code) = actions.error_code {
         log_error(log, LogComponent::Animation, LogEvent::DecodeFailed, code);
@@ -679,8 +791,27 @@ fn apply(
         }
     }
     if actions.present_frame {
-        present_current(window, controller, log, ack.as_mut());
+        present_current(window, controller, log, ack.as_mut(), backdrop_request);
     }
+}
+
+/// Drains background worker rounds (task icons + media state) into the
+/// controller. Returns whether any round wants a repaint.
+fn drain_thumbs(
+    window: &mut OverlayWindow,
+    controller: &mut Controller,
+    receiver: &Receiver<termielle_app::tasks::WorkerUpdate>,
+) -> bool {
+    let mut present = false;
+    while let Ok(mut batch) = receiver.try_recv() {
+        if let Some(backdrop) = batch.backdrop.take() {
+            window.set_backdrop(backdrop);
+        }
+        if controller.set_task_update(batch) {
+            present = true;
+        }
+    }
+    present
 }
 
 /// Drains every queued pipe event into the controller, merging the actions.
@@ -724,26 +855,33 @@ fn apply_timed(
     log: &Arc<Mutex<BoundedLog>>,
     actions: ControllerActions,
     ack: &mut Option<AckWriter>,
+    backdrop_request: Option<&Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>>,
 ) {
     if actions.present_frame {
         let started = std::time::Instant::now();
-        apply(window, controller, log, actions, ack);
+        apply(window, controller, log, actions, ack, backdrop_request);
         controller.set_present_cost(started.elapsed().as_millis() as u64);
     } else {
-        apply(window, controller, log, actions, ack);
+        apply(window, controller, log, actions, ack, backdrop_request);
     }
 }
 
 /// The production loop: block on the window, react to timer and display
-/// changes, drain pipe events, present when required, and re-arm one timer.
-/// Returns whether the overlay should be relaunched after the graceful quit.
+/// changes, drain pipe events and thumbnail batches, present when required,
+/// and re-arm one timer. Returns whether the overlay should be relaunched
+/// after the graceful quit.
+#[allow(clippy::too_many_arguments)] // wiring hub: each channel/config has exactly one consumer here.
 fn run_gui(
     window: &mut OverlayWindow,
     controller: &mut Controller,
     receiver: &Receiver<EventMessage>,
+    thumb_receiver: &Receiver<termielle_app::tasks::WorkerUpdate>,
+    thumb_cfg: &std::sync::Arc<termielle_app::tasks::WorkerConfig>,
+    backdrop_request: &Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>,
     log: &Arc<Mutex<BoundedLog>>,
     ack: &mut Option<AckWriter>,
     journal: Option<&EventLog>,
+    config: &mut AppConfig,
 ) -> bool {
     // The animation clock thread paces frames; the smoke test's timeout timer
     // is separate and unaffected.
@@ -759,7 +897,9 @@ fn run_gui(
                 break;
             }
             let actions = controller.on_timer(now);
-            apply_timed(window, controller, log, actions, ack);
+            let mut actions = actions;
+            poll_hover(window, controller, &mut actions);
+            apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
         }
 
         // Arm the clock for the nearest deadline; disarming when none. The
@@ -770,11 +910,26 @@ fn run_gui(
         let event = match window.next_event() {
             Ok(Some(event)) => event,
             Ok(None) => {
-                // A wake message (deadline due, or a pipe event) or WM_QUIT:
-                // drain queued pipe events; the catch-up loop above handles
-                // any deadline that is now due.
-                let actions = drain_pipe(controller, receiver, journal);
-                apply_timed(window, controller, log, actions, ack);
+                // A wake message (deadline due, pipe event, or fresh
+                // thumbnails) or WM_QUIT: drain everything queued; the
+                // catch-up loop above handles any deadline that is now due.
+                let iteration = || {
+                    let actions = drain_pipe(controller, receiver, journal);
+                    let thumb_present = drain_thumbs(window, controller, thumb_receiver);
+                    let mut actions = actions;
+                    actions.present_frame = actions.present_frame || thumb_present;
+                    poll_hover(window, controller, &mut actions);
+                    actions.next_deadline_ms = controller.next_deadline_ms();
+                    apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
+                };
+                // A panic here must never kill the overlay: log (via the
+                // hook), rebuild a known-good still, and keep running.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(iteration)).is_err()
+                {
+                    log_error(log, LogComponent::Window, LogEvent::PresentFailed, 66);
+                    controller.fallback_to_still();
+                    present_current(window, controller, log, ack.as_mut(), Some(backdrop_request));
+                }
                 continue;
             }
             Err(error) => {
@@ -791,8 +946,12 @@ fn run_gui(
         let mut actions = match event {
             WindowEvent::Timer => controller.on_timer(now_ms()),
             WindowEvent::DisplayChanged => {
-                // The wndproc already re-clamped the rect; blit the frame.
-                ControllerActions::default()
+                // The wndproc re-clamped classic rects; island needs a re-anchor
+                // so force a repaint which will SetWindowPos to top-center.
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
             }
             WindowEvent::Quit => {
                 window.destroy();
@@ -802,9 +961,160 @@ fn run_gui(
                 window.destroy();
                 return true;
             }
+            WindowEvent::LayoutChanged(layout) => {
+                config.island.layout = layout;
+                config.island.clamp();
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                theme::resolve_theme(&mut config.island);
+                controller.set_island_config(config.island.clone(), now_ms());
+                window.set_island(config.island.is_enabled());
+                window.set_glass(&config.island.glass);
+                thumb_cfg.enabled.store(
+                    config.island.is_enabled() && config.island.show_tasks,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                thumb_cfg.max_thumbs.store(
+                    config.island.max_thumbnails,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ThemeChanged(theme) => {
+                config.island.theme = theme;
+                theme::resolve_theme(&mut config.island);
+                window.set_glass(&config.island.glass);
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::YOffsetChanged(y) => {
+                config.island.y_offset = y;
+                config.island.clamp();
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ClickAt(x, y) => match controller.handle_click(x, y, now_ms()) {
+                termielle_app::app::ClickOutcome::ActivateWindow(hwnd) => {
+                    activate_window(hwnd);
+                    ControllerActions::default()
+                }
+                termielle_app::app::ClickOutcome::Expanded
+                | termielle_app::app::ClickOutcome::Collapsed => ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                },
+                termielle_app::app::ClickOutcome::None => ControllerActions::default(),
+            }
+            WindowEvent::HoverChanged(inside) => {
+                let changed = controller.set_hover(inside, now_ms());
+                ControllerActions {
+                    present_frame: changed,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ToggleTasks => {
+                config.island.show_tasks = !config.island.show_tasks;
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                thumb_cfg.enabled.store(
+                    config.island.is_enabled() && config.island.show_tasks,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ToggleHoverExpand => {
+                config.island.expand_on_hover = !config.island.expand_on_hover;
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ToggleFace => {
+                if config.island.has_widget("face") {
+                    config.island.widgets.retain(|w| w != "face");
+                } else {
+                    config.island.widgets.push("face".to_string());
+                }
+                config.island.clamp();
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::SystemThemeChanged => {
+                // The Windows light/dark setting flipped: re-resolve `auto`
+                // and repaint. The persisted config keeps `theme: auto`.
+                theme::resolve_theme(&mut config.island);
+                window.set_glass(&config.island.glass);
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
         };
         actions = merge(actions, drain_pipe(controller, receiver, journal));
-        apply_timed(window, controller, log, actions, ack);
+        if drain_thumbs(window, controller, thumb_receiver) {
+            actions.present_frame = true;
+            actions.next_deadline_ms = controller.next_deadline_ms();
+        }
+        poll_hover(window, controller, &mut actions);
+        let iteration = || {
+            apply_timed(window, controller, log, actions, ack, Some(backdrop_request));
+        };
+        // Same fault tolerance as the wake path.
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(iteration)).is_err() {
+            log_error(log, LogComponent::Window, LogEvent::PresentFailed, 66);
+            controller.fallback_to_still();
+            present_current(window, controller, log, ack.as_mut(), Some(backdrop_request));
+        }
     }
 }
 
@@ -858,6 +1168,17 @@ fn run_smoke(
             }
             Ok(Some(WindowEvent::DisplayChanged)) => {}
             Ok(Some(WindowEvent::Quit | WindowEvent::Restart)) => {}
+            Ok(Some(
+                WindowEvent::LayoutChanged(_)
+                | WindowEvent::ThemeChanged(_)
+                | WindowEvent::YOffsetChanged(_)
+                | WindowEvent::SystemThemeChanged
+                | WindowEvent::ClickAt(..)
+                | WindowEvent::HoverChanged(_)
+                | WindowEvent::ToggleTasks
+                | WindowEvent::ToggleHoverExpand
+                | WindowEvent::ToggleFace,
+            )) => {}
             Ok(None) => {}
             Err(error) => {
                 log_error(
@@ -875,6 +1196,28 @@ fn run_smoke(
             window.destroy();
             return 0;
         }
+    }
+}
+
+/// Brings a task window to the foreground: restores it if minimized, then
+/// sets foreground. The ALT tap satisfies the foreground-lock so the call
+/// from our (not foreground) process is honored.
+fn activate_window(hwnd: isize) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYEVENTF_KEYUP,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    };
+    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        // The ALT tap marks our input queue as "user interacted", which
+        // allows SetForegroundWindow to take the foreground.
+        keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

@@ -1,0 +1,16 @@
+{
+  "name": "light",
+  "display_name": "Light Glass",
+  "tint": [
+    245,
+    245,
+    245,
+    160
+  ],
+  "blur_radius": 12,
+  "border_alpha": 40,
+  "highlight_alpha": 90,
+  "shadow_alpha": 40,
+  "corner_radius": 18,
+  "description": "Light frosted glass for dark wallpapers."
+}

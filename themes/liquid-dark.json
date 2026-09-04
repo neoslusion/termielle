@@ -1,0 +1,16 @@
+{
+  "name": "liquid-dark",
+  "display_name": "Liquid Dark",
+  "tint": [
+    26,
+    26,
+    26,
+    180
+  ],
+  "blur_radius": 12,
+  "border_alpha": 38,
+  "highlight_alpha": 70,
+  "shadow_alpha": 60,
+  "corner_radius": 18,
+  "description": "Near-black liquid glass, frosted border + top highlight. Default."
+}

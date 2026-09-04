@@ -1,0 +1,16 @@
+{
+  "name": "midnight",
+  "display_name": "Midnight",
+  "tint": [
+    12,
+    18,
+    32,
+    200
+  ],
+  "blur_radius": 12,
+  "border_alpha": 28,
+  "highlight_alpha": 50,
+  "shadow_alpha": 80,
+  "corner_radius": 18,
+  "description": "Deep navy, stronger shadow \u00e2\u20ac\u201d best on light wallpapers."
+}

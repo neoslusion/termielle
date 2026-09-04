@@ -1,0 +1,16 @@
+{
+  "name": "transparent",
+  "display_name": "Transparent",
+  "tint": [
+    30,
+    30,
+    30,
+    90
+  ],
+  "blur_radius": 12,
+  "border_alpha": 20,
+  "highlight_alpha": 30,
+  "shadow_alpha": 30,
+  "corner_radius": 18,
+  "description": "Barely-there glass \u00e2\u20ac\u201d shows wallpaper through."
+}

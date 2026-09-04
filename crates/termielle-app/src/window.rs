@@ -3,29 +3,31 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
-use termielle_core::{AppConfig, RenderMode};
+use termielle_core::{AppConfig, GlassConfig, IslandLayout, RenderMode, island_anchored_position};
 use windows::Win32::Foundation::{
-    COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromRect,
-    MonitorFromWindow, RGBQUAD, ReleaseDC, SetDIBitsToDevice,
+    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFOEXW,
+    MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject, SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION, HTTRANSPARENT,
-    IDC_ARROW, KillTimer, LWA_COLORKEY, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING,
-    SWP_NOZORDER, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_EXITSIZEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION,
+    HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer, LWA_COLORKEY, LoadCursorW, MSG,
+    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
+    UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -75,6 +77,10 @@ pub fn straight_or_key(alpha: u8, b: u8, g: u8, r: u8) -> [u8; 3] {
 /// Message id used by [`WakeHandle::post`] to wake the message loop.
 const WAKE_MSG: u32 = WM_APP + 1;
 
+/// `WM_MOUSELEAVE` (0x02A3), posted after `TrackMouseEvent(TME_LEAVE)`.
+/// Not exported by windows 0.62's `WindowsAndMessaging`, so it lives here.
+const WM_MOUSELEAVE: u32 = 0x02A3;
+
 /// Timer id used by [`OverlayWindow::set_timer`].
 const TIMER_ID: usize = 1;
 
@@ -114,7 +120,7 @@ pub enum HitTestResult {
 }
 
 /// Window-local events the overlay loop has to react to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WindowEvent {
     /// The repaint/advance deadline set by [`OverlayWindow::set_timer`] was reached.
     Timer,
@@ -124,6 +130,24 @@ pub enum WindowEvent {
     Quit,
     /// The tray menu asked for a graceful exit followed by a relaunch.
     Restart,
+    /// Tray requested a layout switch.
+    LayoutChanged(termielle_core::IslandLayout),
+    /// Tray requested a theme switch.
+    ThemeChanged(String),
+    /// Tray requested a Y-offset change.
+    YOffsetChanged(i32),
+    /// User clicked the island at frame-local (x, y).
+    ClickAt(i32, i32),
+    /// Cursor entered (`true`) or left (`false`) the island pill.
+    HoverChanged(bool),
+    /// Tray toggled task thumbnails on/off.
+    ToggleTasks,
+    /// Tray toggled hover-to-expand on/off.
+    ToggleHoverExpand,
+    /// Tray toggled the termielle face widget on/off.
+    ToggleFace,
+    /// Windows light/dark theme setting changed; re-resolve `auto`.
+    SystemThemeChanged,
 }
 
 /// Why a window operation could not be completed.
@@ -192,10 +216,43 @@ struct AlphaMap {
     width: u32,
 }
 
+/// Whether the cursor is currently over an opaque pill pixel. Used by the
+/// wndproc to distrust spurious `WM_MOUSELEAVE`s (ULW resizes synthesize
+/// them) and by the hover poll as a backstop.
+fn cursor_over_pill_raw(hwnd: HWND, alpha: &AlphaMap) -> bool {
+    unsafe {
+        let mut point = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut point).is_err() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return false;
+        }
+        if point.x < rect.left
+            || point.x >= rect.right
+            || point.y < rect.top
+            || point.y >= rect.bottom
+        {
+            return false;
+        }
+        alpha_hit_test(
+            &alpha.bytes,
+            alpha.width,
+            point.x - rect.left,
+            point.y - rect.top,
+        ) == HitTestResult::Caption
+    }
+}
+
 /// Per-window state reachable from the window procedure through `GWLP_USERDATA`.
 struct WindowState {
     events: Sender<WindowEvent>,
     alpha: RefCell<AlphaMap>,
+    is_island: bool,
+    /// Whether the cursor is currently inside the opaque pill. Used to emit
+    /// each hover transition exactly once.
+    hover_inside: RefCell<bool>,
 }
 
 /// Converts an `LPARAM` mouse message payload into client coordinates.
@@ -264,11 +321,107 @@ unsafe extern "system" fn window_proc(
             } else {
                 HitTestResult::Transparent
             };
+            let is_island = unsafe { (*state).is_island };
             let value = match result {
                 HitTestResult::Transparent => HTTRANSPARENT as isize,
-                HitTestResult::Caption => HTCAPTION as isize,
+                HitTestResult::Caption => {
+                    if is_island {
+                        HTCLIENT as isize
+                    } else {
+                        HTCAPTION as isize
+                    }
+                }
             };
             return LRESULT(value);
+        }
+        WM_LBUTTONUP => {
+            let is_island = unsafe { (*state).is_island };
+            if is_island {
+                let (x, y) = lparam_point(lparam);
+                let mut rect = RECT::default();
+                let hit = if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+                    let alpha = unsafe { (*state).alpha.borrow() };
+                    alpha_hit_test(&alpha.bytes, alpha.width, x, y)
+                } else {
+                    HitTestResult::Transparent
+                };
+                if hit == HitTestResult::Caption {
+                    let _ = unsafe {
+                        (*state)
+                            .events
+                            .send(WindowEvent::ClickAt(x - rect.left, y - rect.top))
+                    };
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_MOUSEMOVE => {
+            // Hover-to-expand: report the enter transition once, then arm
+            // leave tracking. Transparent pixels never reach us — NCHITTEST
+            // already returns HTTRANSPARENT there — so any MOVE here is over
+            // the pill... except the alpha map may lag a fresh frame by one
+            // present, hence the re-test.
+            let is_island = unsafe { (*state).is_island };
+            if is_island {
+                let (x, y) = lparam_point(lparam);
+                let over_pill = {
+                    let alpha = unsafe { (*state).alpha.borrow() };
+                    alpha_hit_test(&alpha.bytes, alpha.width, x, y) == HitTestResult::Caption
+                };
+                let mut inside = unsafe { (*state).hover_inside.borrow_mut() };
+                if over_pill && !*inside {
+                    *inside = true;
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = unsafe { TrackMouseEvent(&mut track) };
+                    let _ = unsafe { (*state).events.send(WindowEvent::HoverChanged(true)) };
+                }
+            }
+        }
+        WM_MOUSELEAVE => {
+            let is_island = unsafe { (*state).is_island };
+            let mut inside = unsafe { (*state).hover_inside.borrow_mut() };
+            if *inside {
+                // UpdateLayeredWindow resizes synthesize spurious leaves
+                // while the cursor is still over the pill. Verify with the
+                // real cursor position; a false leave collapsed the pill
+                // under a stationary cursor (the "hover makes it disappear"
+                // bug) because no further WM_MOUSEMOVE would re-enter.
+                let still_inside = is_island && {
+                    let alpha = unsafe { (*state).alpha.borrow() };
+                    cursor_over_pill_raw(hwnd, &alpha)
+                };
+                if still_inside {
+                    // Re-arm so a genuine later leave is still reported.
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = unsafe { TrackMouseEvent(&mut track) };
+                } else {
+                    *inside = false;
+                    let _ =
+                        unsafe { (*state).events.send(WindowEvent::HoverChanged(false)) };
+                }
+            }
+            return LRESULT(0);
+        }
+        WM_SETTINGCHANGE => {
+            // lParam points at a NUL-terminated string naming the changed
+            // setting; the light/dark toggle broadcasts "ImmersiveColorSet".
+            if lparam.0 != 0 {
+                let name =
+                    unsafe { windows::core::PCWSTR::from_raw(lparam.0 as *const u16).to_string() };
+                if matches!(name.as_deref(), Ok("ImmersiveColorSet")) {
+                    let _ = unsafe { (*state).events.send(WindowEvent::SystemThemeChanged) };
+                }
+            }
         }
         WM_TIMER => {
             if wparam.0 == TIMER_ID {
@@ -294,7 +447,33 @@ unsafe extern "system" fn window_proc(
             let _ = unsafe { (*state).events.send(WindowEvent::DisplayChanged) };
             return LRESULT(0);
         }
-        WM_SETCURSOR => return LRESULT(1),
+        WM_SETCURSOR => {
+            // Interactive affordance: a hand cursor over the pill tells the
+            // user the island is clickable, matching Dynamic Island behavior.
+            let is_island = unsafe { (*state).is_island };
+            if is_island {
+                let mut point = POINT { x: 0, y: 0 };
+                let mut rect = RECT::default();
+                if unsafe { GetCursorPos(&mut point) }.is_ok()
+                    && unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
+                {
+                    let alpha = unsafe { (*state).alpha.borrow() };
+                    if alpha_hit_test(
+                        &alpha.bytes,
+                        alpha.width,
+                        point.x - rect.left,
+                        point.y - rect.top,
+                    ) == HitTestResult::Caption
+                    {
+                        if let Ok(hand) = unsafe { LoadCursorW(None, IDC_HAND) } {
+                            unsafe { SetCursor(Some(hand)) };
+                            return LRESULT(1);
+                        }
+                    }
+                }
+            }
+            return LRESULT(1);
+        }
         WM_CLOSE => return LRESULT(0),
         WM_DESTROY => return LRESULT(0),
         tray::TRAY_MSG => {
@@ -307,6 +486,83 @@ unsafe extern "system" fn window_proc(
                         }
                         tray::TRAY_RESTART => {
                             let _ = unsafe { (*state).events.send(WindowEvent::Restart) };
+                        }
+                        tray::TRAY_LAYOUT_CLASSIC => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::LayoutChanged(
+                                    termielle_core::IslandLayout::Classic,
+                                ))
+                            };
+                        }
+                        tray::TRAY_LAYOUT_NOTCH => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::LayoutChanged(
+                                    termielle_core::IslandLayout::Notch,
+                                ))
+                            };
+                        }
+                        tray::TRAY_LAYOUT_ISLAND => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::LayoutChanged(
+                                    termielle_core::IslandLayout::Island,
+                                ))
+                            };
+                        }
+                        tray::TRAY_THEME_LIQUID_DARK => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("liquid-dark".into()))
+                            };
+                        }
+                        tray::TRAY_THEME_MIDNIGHT => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("midnight".into()))
+                            };
+                        }
+                        tray::TRAY_THEME_LIGHT => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("light".into()))
+                            };
+                        }
+                        tray::TRAY_THEME_TRANSPARENT => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("transparent".into()))
+                            };
+                        }
+                        tray::TRAY_YOFFSET_0 => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::YOffsetChanged(0)) };
+                        }
+                        tray::TRAY_YOFFSET_12 => {
+                            let _ =
+                                unsafe { (*state).events.send(WindowEvent::YOffsetChanged(12)) };
+                        }
+                        tray::TRAY_YOFFSET_80 => {
+                            let _ =
+                                unsafe { (*state).events.send(WindowEvent::YOffsetChanged(80)) };
+                        }
+                        tray::TRAY_YOFFSET_150 => {
+                            let _ =
+                                unsafe { (*state).events.send(WindowEvent::YOffsetChanged(150)) };
+                        }
+                        tray::TRAY_YOFFSET_300 => {
+                            let _ =
+                                unsafe { (*state).events.send(WindowEvent::YOffsetChanged(300)) };
+                        }
+                        tray::TRAY_TOGGLE_TASKS => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleTasks) };
+                        }
+                        tray::TRAY_TOGGLE_HOVER => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleHoverExpand) };
+                        }
+                        tray::TRAY_TOGGLE_FACE => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleFace) };
                         }
                         _ => {}
                     }
@@ -330,6 +586,12 @@ pub struct OverlayWindow {
     repositioned: bool,
     render: RenderMode,
     tray: bool,
+    glass: GlassConfig,
+    /// Blurred wallpaper captured by the worker thread, sampled under the
+    /// pill during draw. `None` until the first worker round lands.
+    backdrop: RefCell<Option<crate::backdrop::Backdrop>>,
+    /// Last ULW destination (x, y, w, h) in physical pixels.
+    last_dest: (i32, i32, u32, u32),
 }
 
 impl OverlayWindow {
@@ -363,7 +625,8 @@ impl OverlayWindow {
             return Err(WindowError::Win32(code));
         }
 
-        let ex_style = if config.always_on_top {
+        let island_enabled = config.island.layout != IslandLayout::Classic;
+        let ex_style = if config.always_on_top || island_enabled {
             WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW
         } else {
             WS_EX_LAYERED | WS_EX_TOOLWINDOW
@@ -393,6 +656,8 @@ impl OverlayWindow {
         let state = Box::new(WindowState {
             events: sender,
             alpha: RefCell::new(AlphaMap::default()),
+            is_island: config.island.is_enabled(),
+            hover_inside: RefCell::new(false),
         });
         let state_ptr = &*state as *const WindowState as isize;
         let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr) };
@@ -404,6 +669,9 @@ impl OverlayWindow {
             repositioned: false,
             render: config.render,
             tray: false,
+            glass: config.island.glass.clone(),
+            backdrop: RefCell::new(None),
+            last_dest: (0, 0, 1, 1),
         };
         if matches!(config.render, RenderMode::ColorKey) {
             // The color-key path paints straight RGB into the window surface
@@ -424,6 +692,18 @@ impl OverlayWindow {
     /// on size or first-present, then blitting the frame onto the layered
     /// surface with per-pixel alpha (or the configured fallback renderer).
     pub fn present(&mut self, frame: &FrameBuffer, scale: f32) -> Result<(), WindowError> {
+        self.present_with_anchor(frame, scale, None)
+    }
+
+    /// Present with optional island anchoring. When `island` is `Some` the
+    /// window is centered at the top edge (notch) or just below it (island)
+    /// instead of clamping to the work area.
+    pub fn present_with_anchor(
+        &mut self,
+        frame: &FrameBuffer,
+        scale: f32,
+        island: Option<(bool, i32)>,
+    ) -> Result<(), WindowError> {
         let (scaled_w, scaled_h) = scaled_size((frame.width, frame.height), scale);
         let mut rect = RECT::default();
         unsafe { GetWindowRect(self.hwnd, &mut rect) }?;
@@ -433,15 +713,28 @@ impl OverlayWindow {
             right: rect.right,
             bottom: rect.bottom,
         };
-        if current.width() != scaled_w as i32
+        let needs_move = current.width() != scaled_w as i32
             || current.height() != scaled_h as i32
-            || !self.repositioned
-        {
-            let (x, y) = self.clamped_position(
+            || !self.repositioned;
+        let (x, y) = if let Some((attached, y_offset)) = island {
+            self.island_anchored_position(scaled_w as i32, scaled_h as i32, attached, y_offset)
+        } else {
+            self.clamped_position(
                 scaled_w as i32,
                 scaled_h as i32,
                 (current.left, current.top),
-            );
+            )
+        };
+        if self.render == RenderMode::PerPixel {
+            // The per-pixel path updates position, size, and content in ONE
+            // UpdateLayeredWindow call. The content-only variant (pptDst and
+            // psize NULL) is silently ignored by some DWM configurations,
+            // which left the window composited empty.
+            self.repositioned = true;
+            self.last_dest = (x, y, scaled_w, scaled_h);
+            return self.draw_at(frame, scaled_w, scaled_h, x, y);
+        }
+        if needs_move {
             unsafe {
                 SetWindowPos(
                     self.hwnd,
@@ -455,10 +748,7 @@ impl OverlayWindow {
             }?;
             self.repositioned = true;
         }
-        match self.render {
-            RenderMode::PerPixel => self.draw(frame, scaled_w, scaled_h),
-            RenderMode::ColorKey => self.draw_color_key(frame, scaled_w, scaled_h),
-        }
+        self.draw_color_key(frame, scaled_w, scaled_h)
     }
 
     /// Blocks until a window message arrives, dispatches it, and returns the
@@ -543,6 +833,17 @@ impl OverlayWindow {
         !self.tray || tray::set_tooltip(self.hwnd, tip)
     }
 
+    /// Updates the island hit-test flag live when layout changes via the tray.
+    pub fn set_island(&mut self, is_island: bool) {
+        self.state.is_island = is_island;
+    }
+
+    /// Updates the glass material live (theme switches); the new tint and
+    /// blur apply on the next present.
+    pub fn set_glass(&mut self, glass: &GlassConfig) {
+        self.glass = glass.clone();
+    }
+
     /// Destroys the window and posts `WM_QUIT` to the owning thread's queue.
     /// Must be called from the thread that created the window.
     pub fn destroy(&self) {
@@ -569,7 +870,84 @@ impl OverlayWindow {
         preferred
     }
 
-    fn draw(&self, frame: &FrameBuffer, scaled_w: u32, scaled_h: u32) -> Result<(), WindowError> {
+    /// Supplies a freshly captured+blurred backdrop from the worker thread.
+    pub fn set_backdrop(&mut self, bg: crate::backdrop::Backdrop) {
+        *self.backdrop.borrow_mut() = Some(bg);
+    }
+
+    /// The last destination rect the pill was drawn at (physical pixels), so
+    /// the worker knows what region to capture for the glass.
+    pub fn last_dest(&self) -> (i32, i32, u32, u32) {
+        self.last_dest
+    }
+
+    /// Whether the cursor is currently over an opaque pill pixel. Polled by
+    /// the GUI loop as a backstop for spurious `WM_MOUSELEAVE`s.
+    pub fn cursor_over_pill(&self) -> bool {
+        let alpha = self.state.alpha.borrow();
+        cursor_over_pill_raw(self.hwnd, &alpha)
+    }
+
+    /// Cursor position in frame-local coordinates when it is over the pill.
+    pub fn cursor_client_pos(&self) -> Option<(i32, i32)> {
+        unsafe {
+            let mut point = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut point).is_err() {
+                return None;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(self.hwnd, &mut rect).is_err() {
+                return None;
+            }
+            let (x, y) = (point.x - rect.left, point.y - rect.top);
+            let alpha = self.state.alpha.borrow();
+            if alpha_hit_test(&alpha.bytes, alpha.width, x, y) == HitTestResult::Caption {
+                Some((x, y))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn island_anchored_position(
+        &self,
+        width: i32,
+        height: i32,
+        attached: bool,
+        y_offset: i32,
+    ) -> (i32, i32) {
+        // Always anchor to the primary work area so the notch/island is
+        // visible where the user looks, not on a secondary monitor where
+        // MonitorFromWindow would follow a dragged 1×1 window.
+        let monitor = unsafe {
+            windows::Win32::Graphics::Gdi::MonitorFromPoint(
+                POINT { x: 0, y: 0 },
+                MONITOR_DEFAULTTOPRIMARY,
+            )
+        };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let work = (
+                info.monitorInfo.rcWork.left,
+                info.monitorInfo.rcWork.top,
+                info.monitorInfo.rcWork.right,
+                info.monitorInfo.rcWork.bottom,
+            );
+            return island_anchored_position(width, height, attached, y_offset, work);
+        }
+        // Fallback: center on 1920 if no monitor info
+        island_anchored_position(width, height, attached, y_offset, (0, 0, 1920, 1080))
+    }
+
+    fn draw_at(
+        &self,
+        frame: &FrameBuffer,
+        scaled_w: u32,
+        scaled_h: u32,
+        x: i32,
+        y: i32,
+    ) -> Result<(), WindowError> {
         let expected = frame.width as usize * frame.height as usize * 4;
         if frame.pixels_pbgra.len() != expected {
             return Err(WindowError::FrameBuffer);
@@ -607,18 +985,82 @@ impl OverlayWindow {
             return Err(WindowError::Win32(error));
         };
 
+        // Frosted glass: capture the live backdrop once (cached) and blur
+        // it under the frame's own tint. The backdrop excludes layered windows,
+        // so the pill can never feed back into itself. `None` means blur is off
+        // or capture failed — fall back to the flat procedural frame.
+        let backdrop = if self.glass.blur_radius > 0 {
+            self.backdrop.borrow().clone()
+        } else {
+            None
+        };
+
         let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
         let len = scaled_w as usize * scaled_h as usize * 4;
         let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, len) };
-        for y in 0..scaled_h {
-            for x in 0..scaled_w {
-                let source_x = (x * frame.width / scaled_w) as usize;
-                let source_y = (y * frame.height / scaled_h) as usize;
-                let source =
-                    &frame.pixels_pbgra[(source_y * frame.width as usize + source_x) * 4..][..4];
-                let target = (y as usize * scaled_w as usize + x as usize) * 4;
-                dst[target..target + 4].copy_from_slice(source);
-                alpha_map.push(source[3]);
+        match backdrop.as_ref() {
+            Some(bg) => {
+                for yy in 0..scaled_h {
+                    for xx in 0..scaled_w {
+                        let source_x = (xx * frame.width / scaled_w) as usize;
+                        let source_y = (yy * frame.height / scaled_h) as usize;
+                        let source = &frame.pixels_pbgra
+                            [(source_y * frame.width as usize + source_x) * 4..][..4];
+                        let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                        if source[3] == 0 {
+                            // Outside the pill: stay fully transparent so clicks
+                            // pass through and the desktop shows untouched.
+                            dst[target..target + 4].fill(0);
+                        } else {
+                            // Sample the backdrop proportionally and clamped:
+                            // during morphs the stored backdrop was captured
+                            // for the previous pill size, and blur hides the
+                            // stretch. Never panics on size mismatch.
+                            let bx = ((u64::from(xx) * u64::from(bg.width))
+                                / u64::from(scaled_w))
+                                .min(u64::from(bg.width.saturating_sub(1)))
+                                as usize;
+                            let by = ((u64::from(yy) * u64::from(bg.height))
+                                / u64::from(scaled_h))
+                                .min(u64::from(bg.height.saturating_sub(1)))
+                                as usize;
+                            let bi = (by * bg.width as usize + bx) * 4;
+                            let ia = 255 - u32::from(source[3]);
+                            dst[target] = (u32::from(source[0])
+                                + u32::from(bg.pixels.get(bi).copied().unwrap_or(0))
+                                    * ia
+                                    / 255)
+                                as u8;
+                            dst[target + 1] = (u32::from(source[1])
+                                + u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0))
+                                    * ia
+                                    / 255)
+                                as u8;
+                            dst[target + 2] = (u32::from(source[2])
+                                + u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0))
+                                    * ia
+                                    / 255)
+                                as u8;
+                            dst[target + 3] = 255;
+                        }
+                        // Hit-testing still follows the frame's own alpha, so the
+                        // rounded corners stay click-through.
+                        alpha_map.push(source[3]);
+                    }
+                }
+            }
+            None => {
+                for yy in 0..scaled_h {
+                    for xx in 0..scaled_w {
+                        let source_x = (xx * frame.width / scaled_w) as usize;
+                        let source_y = (yy * frame.height / scaled_h) as usize;
+                        let source = &frame.pixels_pbgra
+                            [(source_y * frame.width as usize + source_x) * 4..][..4];
+                        let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                        dst[target..target + 4].copy_from_slice(source);
+                        alpha_map.push(source[3]);
+                    }
+                }
             }
         }
 
@@ -628,17 +1070,32 @@ impl OverlayWindow {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
+        // The DIB must be selected into the source DC before UpdateLayeredWindow:
+        // CreateDIBSection only allocates the section and returns the `bits`
+        // pointer, it does not select the bitmap. Without this the DC still has
+        // the stock 1x1 monochrome bitmap, ULW composites nothing, and the
+        // window shows an empty (fully transparent) surface.
+        let previous = unsafe { SelectObject(memory, HGDIOBJ(dib.0)) };
         let origin = POINT { x: 0, y: 0 };
         // The window is already sized and positioned by `present` via
         // SetWindowPos; leaving pptDst and psize NULL updates only the surface
         // contents, which is the one variant that also works on systems where
         // DWM rejects a full redirection update.
+        // Full-form ULW: destination position, size, and content are set
+        // atomically. The content-only variant (pptDst/psize NULL) is
+        // silently ignored by some DWM configurations, which left this
+        // window composited empty — invisible, despite "success".
+        let dest = POINT { x, y };
+        let size = SIZE {
+            cx: scaled_w as i32,
+            cy: scaled_h as i32,
+        };
         let update = unsafe {
             UpdateLayeredWindow(
                 self.hwnd,
-                None,
-                None,
-                None,
+                Some(screen),
+                Some(&dest),
+                Some(&size),
                 Some(memory),
                 Some(&origin),
                 COLORREF(0),
@@ -646,6 +1103,10 @@ impl OverlayWindow {
                 ULW_ALPHA,
             )
         };
+        // Restore the stock bitmap so DeleteDC's cleanup bookkeeping stays
+        // symmetric, then release everything. ULW has already copied the
+        // pixels into the redirection surface at this point.
+        unsafe { SelectObject(memory, previous) };
         let _ = unsafe { DeleteObject(HGDIOBJ(dib.0)) };
         let _ = unsafe { DeleteDC(memory) };
         let _ = unsafe { ReleaseDC(None, screen) };

@@ -20,6 +20,7 @@ fn sample_config() -> AppConfig {
         }),
         render: RenderMode::ColorKey,
         frame_rate: Some(60),
+        island: Default::default(),
     }
 }
 

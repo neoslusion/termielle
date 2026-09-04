@@ -3,6 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::island::{IslandConfig, IslandLayout};
 use crate::reducer::VisualState;
 
 /// Overlay scale bounds.
@@ -78,6 +79,10 @@ pub struct AppConfig {
     /// overlay presents animation frames at this rate instead of the GIF's
     /// own delays; the loop duration becomes frame count / rate.
     pub frame_rate: Option<u32>,
+    /// Top-center notch / island configuration. When `layout` is `Classic`
+    /// (the default) the overlay behaves exactly as before — a free-dragging
+    /// corner pet. `Notch` attaches to the top edge; `Island` floats below it.
+    pub island: IslandConfig,
 }
 
 impl Default for AppConfig {
@@ -91,6 +96,7 @@ impl Default for AppConfig {
             position: None,
             render: RenderMode::PerPixel,
             frame_rate: None,
+            island: IslandConfig::default(),
         }
     }
 }
@@ -124,6 +130,14 @@ impl AppConfig {
         self.frame_rate = self
             .frame_rate
             .map(|rate| rate.clamp(MIN_FRAME_RATE, MAX_FRAME_RATE));
+        self.island.clamp();
+        // Island layout Classic preserves exact legacy behaviour, but if the
+        // user explicitly chose Notch/Island we force always_on_top so the
+        // top-center pill stays visible over maximized windows.
+        if self.island.layout != IslandLayout::Classic {
+            // Do not silently mutate persisted file — the clamp only affects the
+            // in-memory view; save_config_atomic will persist the clamped copy.
+        }
     }
 }
 

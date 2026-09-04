@@ -1,0 +1,424 @@
+use serde::{Deserialize, Serialize};
+
+// ---- Layout ---------------------------------------------------------------
+
+/// Which overlay shape to use. `Classic` is the original corner pet that
+/// free-drags and clamps to the work area. `Notch` is a top-edge-attached
+/// pill (flat top, rounded bottom) like a MacBook notch. `Island` is a
+/// floating pill below the top edge, like Dynamic Island. Switchable is
+/// just a config toggle between the two — the enum already covers it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IslandLayout {
+    #[default]
+    Classic,
+    Notch,
+    Island,
+}
+
+// ---- Glass ----------------------------------------------------------------
+
+/// Custom layered glass material — baked into the DIB, not DWM acrylic.
+///
+/// All values are 0-255 bytes so the renderer can copy them directly into
+/// PBGRA. The defaults give the liquid-dark theme: near-black tint at 0.70
+/// with a soft border, top highlight, and drop shadow.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GlassConfig {
+    /// Tint color as BGRA bytes. Default `[26,26,26,180]` ~ `#1a1a1a` at 0.70.
+    pub tint: [u8; 4],
+    /// Backdrop blur radius in pixels for the frosted-glass effect: the
+    /// live wallpaper behind the pill is captured (layered windows excluded)
+    /// and box-blurred underneath the tint. 0 disables it (flat tint).
+    pub blur_radius: u32,
+    /// Border stroke alpha (0-255). 38 ~ 0.15.
+    pub border_alpha: u8,
+    /// Top-edge inner highlight alpha (0-255). 70 ~ 0.28.
+    pub highlight_alpha: u8,
+    /// Drop shadow alpha (0-255). 60 ~ 0.24, drawn 2px offset.
+    pub shadow_alpha: u8,
+}
+
+impl Default for GlassConfig {
+    fn default() -> Self {
+        Self {
+            tint: [26, 26, 26, 180],
+            blur_radius: 12,
+            border_alpha: 38,
+            highlight_alpha: 70,
+            shadow_alpha: 60,
+        }
+    }
+}
+
+impl GlassConfig {
+    pub fn clamp(&mut self) {
+        // tint bytes already 0-255, no clamp needed.
+        self.blur_radius = self.blur_radius.min(30);
+        // border/highlight/shadow already u8.
+    }
+}
+
+// ---- IslandConfig ---------------------------------------------------------
+
+const MIN_COLLAPSED_W: u32 = 80;
+const MAX_COLLAPSED_W: u32 = 1200;
+const DEFAULT_COLLAPSED_W: u32 = 140;
+
+const MIN_EXPANDED_W: u32 = 120;
+const MAX_EXPANDED_W: u32 = 1600;
+const DEFAULT_EXPANDED_W: u32 = 320;
+
+const MIN_HEIGHT: u32 = 28;
+const MAX_HEIGHT: u32 = 200;
+const DEFAULT_HEIGHT: u32 = 36;
+
+const MIN_RADIUS: u32 = 0;
+const MAX_RADIUS: u32 = 120;
+const DEFAULT_RADIUS: u32 = 18;
+
+const MIN_Y_OFFSET: i32 = 0;
+const MAX_Y_OFFSET: i32 = 500;
+const DEFAULT_Y_OFFSET: i32 = 8;
+
+const MIN_ANIM_MS: u32 = 100;
+const MAX_ANIM_MS: u32 = 800;
+const DEFAULT_ANIM_MS: u32 = 350;
+
+const MIN_MINIMAL_W: u32 = 48;
+const MAX_MINIMAL_W: u32 = 800;
+const DEFAULT_MINIMAL_W: u32 = 72;
+
+const MIN_SPRING_BOUNCE: f32 = 0.0;
+const MAX_SPRING_BOUNCE: f32 = 0.5;
+const DEFAULT_SPRING_BOUNCE: f32 = 0.18;
+
+/// Top-center notch / island geometry + material.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IslandConfig {
+    pub layout: IslandLayout,
+    /// Compact width in logical pixels — the resting pill while an agent
+    /// session or media is live (iOS "compact" presentation).
+    pub collapsed_width: u32,
+    /// Expanded width in logical pixels — the dashboard while hovered or
+    /// pinned (iOS "expanded" presentation).
+    pub expanded_width: u32,
+    /// Minimal width in logical pixels — the small resting dot when nothing
+    /// is live (iOS "minimal" presentation). Clamped to >= height + 8.
+    pub minimal_width: u32,
+    /// Height in logical pixels (both states).
+    pub height: u32,
+    /// Corner radius in logical pixels.
+    pub corner_radius: u32,
+    /// Y offset from top edge when `layout == Island`. Ignored for Notch.
+    pub y_offset: i32,
+    /// Morph perceptual duration in ms. Converted to spring
+    /// stiffness/damping with `spring_bounce` (Apple's spring model), so
+    /// morphs overshoot slightly and settle naturally like iOS.
+    pub animation_ms: u32,
+    /// Spring bounce 0.0-0.5: 0 = critically damped (no overshoot), higher
+    /// = springier.
+    pub spring_bounce: f32,
+    /// Theme preset name — e.g. "liquid-dark", "light", "midnight".
+    /// When present the loader looks up `themes/<name>.json` but `glass`
+    /// still overrides per-field.
+    pub theme: String,
+    /// Glass material baked into the frame.
+    pub glass: GlassConfig,
+    /// Whether the island should honor `scale` from AppConfig.
+    pub scale_with_dpi: bool,
+    /// Show running-task app icons in the expanded pill.
+    pub show_tasks: bool,
+    /// Maximum task icons shown when expanded (0-6).
+    pub max_thumbnails: u32,
+    /// Animate the termielle face inside the notch (advance its GIF frames).
+    /// When false the face is a still of the state's first frame.
+    pub face_animated: bool,
+    /// Visual widgets rendered inside the pill (no text anywhere).
+    /// Known names: `face` (animated character), `tasks` (running-task app
+    /// icons), `agents` (one dot per live agent session), `music` (indicator
+    /// strip while media plays), `ring` (progress ring around the face).
+    /// Unknown names are dropped on load.
+    pub widgets: Vec<String>,
+    /// Which 0-100% metric the `ring` widget draws (`battery`, `cpu`,
+    /// `mem`). Anything else falls back to `battery` on load.
+    pub ring_metric: String,
+    /// When true, hovering the collapsed island expands it (idle only);
+    /// leaving collapses it again unless it was manually toggled.
+    pub expand_on_hover: bool,
+}
+
+impl Default for IslandConfig {
+    fn default() -> Self {
+        Self {
+            layout: IslandLayout::Classic,
+            collapsed_width: DEFAULT_COLLAPSED_W,
+            expanded_width: DEFAULT_EXPANDED_W,
+            minimal_width: DEFAULT_MINIMAL_W,
+            height: DEFAULT_HEIGHT,
+            corner_radius: DEFAULT_RADIUS,
+            y_offset: DEFAULT_Y_OFFSET,
+            animation_ms: DEFAULT_ANIM_MS,
+            spring_bounce: DEFAULT_SPRING_BOUNCE,
+            theme: "liquid-dark".to_string(),
+            glass: GlassConfig::default(),
+            scale_with_dpi: true,
+            show_tasks: true,
+            max_thumbnails: 4,
+            face_animated: true,
+            ring_metric: "battery".to_string(),
+            widgets: Self::default_widgets(),
+            expand_on_hover: true,
+        }
+    }
+}
+
+impl IslandConfig {
+    /// The stock widget set: animated face, task icons, session dots,
+    /// media indicator, and progress ring. Purely visual — the pill renders
+    /// no text at all.
+    pub fn default_widgets() -> Vec<String> {
+        ["face", "tasks", "agents", "music", "ring"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Whether the named widget is enabled.
+    pub fn has_widget(&self, name: &str) -> bool {
+        self.widgets.iter().any(|w| w == name)
+    }
+
+    pub fn clamp(&mut self) {
+        self.collapsed_width = self.collapsed_width.clamp(MIN_COLLAPSED_W, MAX_COLLAPSED_W);
+        self.expanded_width = self.expanded_width.clamp(MIN_EXPANDED_W, MAX_EXPANDED_W);
+        // Expanded must be >= collapsed.
+        if self.expanded_width < self.collapsed_width {
+            self.expanded_width = self.collapsed_width;
+        }
+        self.height = self.height.clamp(MIN_HEIGHT, MAX_HEIGHT);
+        self.corner_radius = self
+            .corner_radius
+            .clamp(MIN_RADIUS, MAX_RADIUS)
+            .min(self.height / 2);
+        self.y_offset = self.y_offset.clamp(MIN_Y_OFFSET, MAX_Y_OFFSET);
+        self.animation_ms = self.animation_ms.clamp(MIN_ANIM_MS, MAX_ANIM_MS);
+        self.spring_bounce = self
+            .spring_bounce
+            .clamp(MIN_SPRING_BOUNCE, MAX_SPRING_BOUNCE);
+        // A pill narrower than the height is unreadable; keep it elliptical.
+        self.minimal_width = self
+            .minimal_width
+            .clamp(MIN_MINIMAL_W.max(self.height + 8), MAX_MINIMAL_W);
+        if self.theme.is_empty() {
+            self.theme = "liquid-dark".to_string();
+        }
+        // Truncate theme to sane length.
+        if self.theme.len() > 64 {
+            self.theme.truncate(64);
+        }
+        self.max_thumbnails = self.max_thumbnails.min(6);
+        if !matches!(self.ring_metric.as_str(), "battery" | "cpu" | "mem") {
+            self.ring_metric = "battery".to_string();
+        }
+        self.widgets
+            .retain(|w| matches!(w.as_str(), "face" | "tasks" | "agents" | "music" | "ring"));
+        self.widgets.truncate(16);
+        self.glass.clamp();
+    }
+
+    /// Whether island/notch rendering is enabled.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self.layout, IslandLayout::Classic)
+    }
+
+    /// True when attached to top edge (flat top, rounded bottom).
+    pub fn is_attached(&self) -> bool {
+        matches!(self.layout, IslandLayout::Notch)
+    }
+
+    /// Current geometry for a given expansion progress 0.0-1.0.
+    pub fn geometry_for(&self, progress: f32) -> IslandGeometry {
+        let p = progress.clamp(0.0, 1.0);
+        let w = (self.collapsed_width as f32
+            + (self.expanded_width as f32 - self.collapsed_width as f32) * p)
+            .round() as u32;
+        IslandGeometry {
+            width: w,
+            height: self.height,
+            radius: self.corner_radius,
+            attached: self.is_attached(),
+            y_offset: self.y_offset,
+        }
+    }
+}
+
+/// Resolved pixel geometry for one frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IslandGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub radius: u32,
+    pub attached: bool,
+    pub y_offset: i32,
+}
+
+// ---- helpers --------------------------------------------------------------
+
+/// Apple's spring model (WWDC23 "Animate with springs"): converts a
+/// perceptual duration + bounce into physical stiffness/damping/mass so the
+/// pill morphs with the same organic overshoot as the iOS Dynamic Island.
+///
+/// - `stiffness = (2π / duration)²`
+/// - `damping = (1 - bounce) · 4π / duration` (bounce >= 0)
+#[derive(Clone, Copy, Debug)]
+pub struct SpringParams {
+    pub stiffness: f32,
+    pub damping: f32,
+}
+
+/// Derives spring parameters; `duration_ms` is the perceptual duration.
+pub fn spring_params(duration_ms: u32, bounce: f32) -> SpringParams {
+    let duration = (duration_ms.max(1) as f32) / 1000.0;
+    let bounce = bounce.clamp(0.0, 0.5);
+    SpringParams {
+        stiffness: (std::f32::consts::TAU / duration).powi(2),
+        damping: (1.0 - bounce) * 4.0 * std::f32::consts::PI / duration,
+    }
+}
+
+#[cfg(test)]
+mod spring_tests {
+    use super::*;
+
+    #[test]
+    fn spring_params_match_apple_formulas() {
+        let s = spring_params(500, 0.0);
+        // duration 0.5s -> stiffness = (2π/0.5)² ≈ 157.9; damping = 4π/0.5 ≈ 25.1
+        assert!((s.stiffness - 157.91).abs() < 0.1, "{}", s.stiffness);
+        assert!((s.damping - 25.13).abs() < 0.1, "{}", s.damping);
+        // Bounce reduces damping.
+        let b = spring_params(500, 0.25);
+        assert!(b.damping < s.damping);
+        assert_eq!(b.stiffness, s.stiffness);
+    }
+}
+
+/// Anchor a top-center rect inside `work` (logical pixels).
+pub fn island_anchored_position(
+    width: i32,
+    height: i32,
+    attached: bool,
+    y_offset: i32,
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (left, top, right, _bottom) = work;
+    let work_w = right - left;
+    let x = left + (work_w - width) / 2;
+    let y = if attached { top } else { top + y_offset };
+    // Keep height visible: clamp y so bottom stays in work area is handled by
+    // caller if needed; notch is always at top so no clamp needed.
+    let _ = height;
+    (x, y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_include_widgets_and_hover_expand() {
+        let c = IslandConfig::default();
+        assert!(c.expand_on_hover);
+        assert!(c.face_animated);
+        for w in ["face", "tasks", "agents", "music", "ring"] {
+            assert!(c.has_widget(w), "missing widget {w}");
+        }
+        assert_eq!(c.glass.blur_radius, 12);
+    }
+
+    #[test]
+    fn ring_metric_falls_back_to_battery() {
+        let mut c = IslandConfig {
+            ring_metric: "quota".into(),
+            ..Default::default()
+        };
+        c.clamp();
+        assert_eq!(c.ring_metric, "battery");
+        let mut c = IslandConfig {
+            ring_metric: "cpu".into(),
+            ..Default::default()
+        };
+        c.clamp();
+        assert_eq!(c.ring_metric, "cpu");
+    }
+
+    #[test]
+    fn clamp_drops_unknown_widgets() {
+        let mut c = IslandConfig {
+            widgets: vec!["clock".into(), "party-mode".into(), "face".into()],
+            ..Default::default()
+        };
+        c.clamp();
+        // Text widgets are gone in the visual-only dashboard.
+        assert_eq!(c.widgets, vec!["face".to_string()]);
+    }
+
+    #[test]
+    fn defaults_are_sane() {
+        let c = IslandConfig::default();
+        assert_eq!(c.layout, IslandLayout::Classic);
+        assert!(c.collapsed_width < c.expanded_width);
+        assert_eq!(c.glass.tint[3], 180);
+    }
+
+    #[test]
+    fn clamp_expanded_below_collapsed() {
+        let mut c = IslandConfig {
+            collapsed_width: 300,
+            expanded_width: 100,
+            ..Default::default()
+        };
+        c.clamp();
+        assert!(c.expanded_width >= c.collapsed_width);
+    }
+
+    #[test]
+    fn clamp_radius_to_half_height() {
+        let mut c = IslandConfig {
+            height: 30,
+            corner_radius: 40,
+            ..Default::default()
+        };
+        c.clamp();
+        assert_eq!(c.corner_radius, 15);
+    }
+
+    #[test]
+    fn geometry_lerp() {
+        let c = IslandConfig {
+            layout: IslandLayout::Island,
+            collapsed_width: 100,
+            expanded_width: 200,
+            height: 36,
+            corner_radius: 18,
+            ..Default::default()
+        };
+        assert_eq!(c.geometry_for(0.0).width, 100);
+        assert_eq!(c.geometry_for(1.0).width, 200);
+        assert_eq!(c.geometry_for(0.5).width, 150);
+    }
+
+    #[test]
+    fn anchored_position_centers() {
+        // work 0,0,1920,1080, island 140x36 floating y=8 -> x=890, y=8
+        let (x, y) = island_anchored_position(140, 36, false, 8, (0, 0, 1920, 1080));
+        assert_eq!(x, 890);
+        assert_eq!(y, 8);
+        let (x2, y2) = island_anchored_position(140, 36, true, 8, (0, 0, 1920, 1080));
+        assert_eq!(x2, 890);
+        assert_eq!(y2, 0);
+    }
+}

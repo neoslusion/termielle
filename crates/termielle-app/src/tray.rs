@@ -41,6 +41,29 @@ pub const TRAY_EXIT: u32 = 100;
 /// Menu command: relaunch the overlay after quitting.
 pub const TRAY_RESTART: u32 = 101;
 
+/// Layout switches
+pub const TRAY_LAYOUT_CLASSIC: u32 = 102;
+pub const TRAY_LAYOUT_NOTCH: u32 = 103;
+pub const TRAY_LAYOUT_ISLAND: u32 = 104;
+
+/// Theme switches
+pub const TRAY_THEME_LIQUID_DARK: u32 = 110;
+pub const TRAY_THEME_MIDNIGHT: u32 = 111;
+pub const TRAY_THEME_LIGHT: u32 = 112;
+pub const TRAY_THEME_TRANSPARENT: u32 = 113;
+
+/// Y-offset presets
+pub const TRAY_YOFFSET_0: u32 = 120;
+pub const TRAY_YOFFSET_12: u32 = 121;
+pub const TRAY_YOFFSET_80: u32 = 122;
+pub const TRAY_YOFFSET_150: u32 = 123;
+pub const TRAY_YOFFSET_300: u32 = 124;
+
+/// Widget toggles
+pub const TRAY_TOGGLE_TASKS: u32 = 130;
+pub const TRAY_TOGGLE_HOVER: u32 = 131;
+pub const TRAY_TOGGLE_FACE: u32 = 132;
+
 /// Edge length of the notification icon, in pixels.
 const ICON_SIZE: u32 = 32;
 
@@ -132,6 +155,116 @@ pub fn show_menu(hwnd: HWND) -> u32 {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return 0;
     };
+    // Layout submenu
+    let Ok(layout_menu) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(menu) };
+        return 0;
+    };
+    for (id, label) in [
+        (TRAY_LAYOUT_CLASSIC, "Layout: Classic (pet)"),
+        (TRAY_LAYOUT_NOTCH, "Layout: Notch (macOS)"),
+        (TRAY_LAYOUT_ISLAND, "Layout: Island (floating)"),
+    ] {
+        let w = crate::window::encode_wide(label);
+        let _ = unsafe { AppendMenuW(layout_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+    }
+    let layout_label = crate::window::encode_wide("Layout");
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
+            layout_menu.0 as usize,
+            PCWSTR(layout_label.as_ptr()),
+        )
+    };
+
+    // Theme submenu
+    let Ok(theme_menu) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(layout_menu) };
+        let _ = unsafe { DestroyMenu(menu) };
+        return 0;
+    };
+    for (id, label) in [
+        (TRAY_THEME_LIQUID_DARK, "Theme: Liquid Dark"),
+        (TRAY_THEME_MIDNIGHT, "Theme: Midnight"),
+        (TRAY_THEME_LIGHT, "Theme: Light"),
+        (TRAY_THEME_TRANSPARENT, "Theme: Transparent"),
+    ] {
+        let w = crate::window::encode_wide(label);
+        let _ = unsafe { AppendMenuW(theme_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+    }
+    let theme_label = crate::window::encode_wide("Theme");
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
+            theme_menu.0 as usize,
+            PCWSTR(theme_label.as_ptr()),
+        )
+    };
+
+    // Y-offset submenu
+    let Ok(y_menu) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(theme_menu) };
+        let _ = unsafe { DestroyMenu(layout_menu) };
+        let _ = unsafe { DestroyMenu(menu) };
+        return 0;
+    };
+    for (id, label) in [
+        (TRAY_YOFFSET_0, "Y Offset: 0 (flush)"),
+        (TRAY_YOFFSET_12, "Y Offset: 12"),
+        (TRAY_YOFFSET_80, "Y Offset: 80"),
+        (TRAY_YOFFSET_150, "Y Offset: 150"),
+        (TRAY_YOFFSET_300, "Y Offset: 300 (center)"),
+    ] {
+        let w = crate::window::encode_wide(label);
+        let _ = unsafe { AppendMenuW(y_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+    }
+    let y_label = crate::window::encode_wide("Position");
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
+            y_menu.0 as usize,
+            PCWSTR(y_label.as_ptr()),
+        )
+    };
+
+    // Widgets submenu: live toggles, no restart needed.
+    let Ok(widgets_menu) = (unsafe { CreatePopupMenu() }) else {
+        let _ = unsafe { DestroyMenu(y_menu) };
+        let _ = unsafe { DestroyMenu(theme_menu) };
+        let _ = unsafe { DestroyMenu(layout_menu) };
+        let _ = unsafe { DestroyMenu(menu) };
+        return 0;
+    };
+    for (id, label) in [
+        (TRAY_TOGGLE_TASKS, "Widgets: task icons on/off"),
+        (TRAY_TOGGLE_HOVER, "Widgets: hover to expand on/off"),
+        (TRAY_TOGGLE_FACE, "Widgets: termielle face on/off"),
+    ] {
+        let w = crate::window::encode_wide(label);
+        let _ = unsafe { AppendMenuW(widgets_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+    }
+    let widgets_label = crate::window::encode_wide("Widgets");
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
+            widgets_menu.0 as usize,
+            PCWSTR(widgets_label.as_ptr()),
+        )
+    };
+
+    // Separator + Restart/Exit
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            windows::Win32::UI::WindowsAndMessaging::MF_SEPARATOR,
+            0,
+            PCWSTR::null(),
+        )
+    };
     let restart = crate::window::encode_wide("Restart");
     let exit = crate::window::encode_wide("Exit");
     let _ = unsafe {
@@ -145,11 +278,19 @@ pub fn show_menu(hwnd: HWND) -> u32 {
     let _ = unsafe { AppendMenuW(menu, MF_STRING, TRAY_EXIT as usize, PCWSTR(exit.as_ptr())) };
     let mut point = POINT::default();
     if unsafe { GetCursorPos(&mut point) }.is_err() {
+        let _ = unsafe { DestroyMenu(widgets_menu) };
+        let _ = unsafe { DestroyMenu(y_menu) };
+        let _ = unsafe { DestroyMenu(theme_menu) };
+        let _ = unsafe { DestroyMenu(layout_menu) };
         let _ = unsafe { DestroyMenu(menu) };
         return 0;
     }
     let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_LEFTALIGN.0 | TPM_RIGHTBUTTON.0);
     let choice = unsafe { TrackPopupMenu(menu, flags, point.x, point.y, None, hwnd, None) }.0;
+    let _ = unsafe { DestroyMenu(widgets_menu) };
+    let _ = unsafe { DestroyMenu(y_menu) };
+    let _ = unsafe { DestroyMenu(theme_menu) };
+    let _ = unsafe { DestroyMenu(layout_menu) };
     let _ = unsafe { DestroyMenu(menu) };
     choice.max(0) as u32
 }
