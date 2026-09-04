@@ -523,6 +523,11 @@ fn blend_pixel(frame: &mut FrameBuffer, x: u32, y: u32, src: [u8; 4]) {
     dst[3] = (sa + dst[3] as u32 * ia / 255) as u8;
 }
 
+/// Public re-export of the rect painter for dashboard elements.
+pub fn fill_rect_pub(frame: &mut FrameBuffer, left: i32, top: i32, w: u32, h: u32, color: [u8; 4]) {
+    fill_rect(frame, left, top, w, h, color)
+}
+
 fn fill_rect(frame: &mut FrameBuffer, left: i32, top: i32, w: u32, h: u32, color: [u8; 4]) {
     let left = left.clamp(0, frame.width as i32 - 1);
     let top = top.clamp(0, frame.height as i32 - 1);

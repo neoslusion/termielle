@@ -352,16 +352,25 @@ impl Controller {
         );
         let cy = (island.height / 2) as i32;
         let pad = 16i32;
+        let accent = crate::system::accent_color_bgra();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         // 1. Collect the elements to lay out.
         enum Elem {
             Face,
+            Media,
             Icon { index: usize, hwnd: isize },
             Dots { count: usize },
         }
         let mut elements: Vec<Elem> = Vec::new();
         if island.has_widget("face") {
             elements.push(Elem::Face);
+        }
+        if island.has_widget("music") && self.media_playing() {
+            elements.push(Elem::Media);
         }
         if island.show_tasks && island.has_widget("tasks") && presentation != Presentation::Minimal
         {
@@ -386,6 +395,7 @@ impl Controller {
         let elem_w = |e: &Elem| -> i32 {
             match e {
                 Elem::Face => (island.height.saturating_sub(12)).min(48) as i32,
+                Elem::Media => 44, // artwork 24 + gap + three 3px bars
                 Elem::Icon { .. } => crate::animation::notch::ICON_PX as i32,
                 Elem::Dots { count } => (*count as i32 * 6) + (*count as i32 - 1) * 4,
             }
@@ -415,6 +425,51 @@ impl Controller {
                         size as u32,
                         size as u32,
                     );
+                }
+                Elem::Media => {
+                    // Artwork when the source exposes it, else an accent disc.
+                    if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+                        crate::animation::notch::blit_scaled(
+                            &mut frame,
+                            &crate::animation::FrameBuffer {
+                                width: thumb.width,
+                                height: thumb.height,
+                                pixels_pbgra: thumb.pixels_pbgra.clone(),
+                                delay_ms: 0,
+                                loop_index: 0,
+                            },
+                            x,
+                            cy - 12,
+                            24,
+                            24,
+                        );
+                    } else {
+                        crate::animation::notch::draw_disc(
+                            &mut frame,
+                            x + 12,
+                            cy,
+                            12,
+                            [accent[0], accent[1], accent[2], 255],
+                        );
+                    }
+                    // Three equalizer bars oscillating with the wall clock.
+                    let bx = x + 28;
+                    let base = cy + 8;
+                    for (i, &phase) in [0u64, 170, 340].iter().enumerate() {
+                        let t = ((now.saturating_add(phase) % 900) as f32 / 900.0)
+                            * std::f32::consts::TAU;
+                        let h = (4.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
+                        crate::animation::notch::fill_rect_pub(
+                            &mut frame,
+                            bx + i as i32 * 5,
+                            base - h,
+                            3,
+                            h as u32,
+                            accent,
+                        );
+                    }
+                    // hwnd sentinel 0: the media element toggles playback.
+                    self.icon_hits.push((0, x, cy - 12, 44, 24));
                 }
                 Elem::Icon { index, hwnd } => {
                     let size = elem_w(e);

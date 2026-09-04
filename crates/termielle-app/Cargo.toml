@@ -35,6 +35,9 @@ windows = { workspace = true, features = [
   "Media",
   "Media_Control",
   "Foundation",
+  "Storage_Streams",
+  "Graphics",
+  "Graphics_Imaging",
 ] }
 
 [dev-dependencies]

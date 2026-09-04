@@ -38,6 +38,14 @@ pub struct TaskWindow {
     pub title: String,
 }
 
+/// A small premultiplied-BGRA bitmap (media artwork), drawn rounded.
+#[derive(Clone, Debug)]
+pub struct ThumbBitmap {
+    pub width: u32,
+    pub height: u32,
+    pub pixels_pbgra: Vec<u8>,
+}
+
 /// One app icon for the dashboard row, premultiplied BGRA at [`ICON_PX`].
 #[derive(Clone, Debug)]
 pub struct TaskIcon {
@@ -49,13 +57,29 @@ pub struct TaskIcon {
 }
 
 /// Now-playing media from the System Media Transport Controls.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct MediaInfo {
     pub title: String,
     pub artist: String,
     /// Source app user-model id (e.g. `Spotify.exe`), may be empty.
     pub app: String,
     pub playing: bool,
+    /// Decoded artwork thumbnail (premultiplied BGRA), when the source
+    /// exposes one. None on decode failure or absent artwork.
+    pub thumbnail: Option<ThumbBitmap>,
+}
+
+/// Toggles play/pause on the system's active media session via the
+/// standard multimedia key. Works for any SMTC source (YouTube in a
+/// browser, Spotify, media players) without touching that app directly.
+pub fn toggle_media_playback() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MEDIA_PLAY_PAUSE, keybd_event,
+    };
+    unsafe {
+        keybd_event(VK_MEDIA_PLAY_PAUSE.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+        keybd_event(VK_MEDIA_PLAY_PAUSE.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
 }
 
 /// One worker round: fresh icons, the current media state, and (when a
@@ -401,6 +425,7 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
         |op| op.Status(),
         |op| op.GetResults(),
     )?;
+    let thumbnail = decode_media_thumbnail(&props).unwrap_or(None);
     Ok(Some(MediaInfo {
         title: props.Title()?.to_string(),
         artist: props.Artist()?.to_string(),
@@ -409,6 +434,89 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
             .map(|id| id.to_string())
             .unwrap_or_default(),
         playing: true,
+        thumbnail,
+    }))
+}
+
+/// Decodes the SMTC artwork thumbnail to a small premultiplied BGRA bitmap.
+/// The WinRT random-access stream is bridged to a COM IStream with
+/// `CreateStreamOverRandomAccessStream`, then decoded through WIC and
+/// scaled to [`ICON_PX`]. Fails soft: any error yields `None`.
+fn decode_media_thumbnail(
+    props: &windows::Media::Control::GlobalSystemMediaTransportControlsSessionMediaProperties,
+) -> windows::core::Result<Option<ThumbBitmap>> {
+    use windows::Win32::Graphics::Imaging::{
+        GUID_WICPixelFormat32bppBGRA, WICDecodeMetadataCacheOnDemand,
+    };
+    use windows::Win32::System::WinRT::CreateStreamOverRandomAccessStream;
+
+    let stream_ref = props.Thumbnail()?;
+    let stream = block_async(
+        stream_ref.OpenReadAsync()?,
+        |op| op.Status(),
+        |op| op.GetResults(),
+    )?;
+
+    // Bridge WinRT stream -> COM IStream for WIC.
+    let istream: windows::Win32::System::Com::IStream = unsafe {
+        CreateStreamOverRandomAccessStream::<_, windows::Win32::System::Com::IStream>(&stream)?
+    };
+
+    let factory: windows::Win32::Graphics::Imaging::IWICImagingFactory = unsafe {
+        windows::Win32::System::Com::CoCreateInstance(
+            &windows::Win32::Graphics::Imaging::CLSID_WICImagingFactory,
+            None,
+            windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+        )?
+    };
+    let decoder = unsafe {
+        factory.CreateDecoderFromStream(
+            &istream,
+            std::ptr::null(),
+            WICDecodeMetadataCacheOnDemand,
+        )?
+    };
+    let frame = unsafe { decoder.GetFrame(0)? };
+
+    let converter = unsafe { factory.CreateFormatConverter()? };
+    unsafe {
+        converter.Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppBGRA,
+            windows::Win32::Graphics::Imaging::WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            windows::Win32::Graphics::Imaging::WICBitmapPaletteTypeCustom,
+        )?;
+    }
+
+    // Scale to the dashboard icon size through WIC (high-quality Fant filter).
+    let scaler = unsafe { factory.CreateBitmapScaler()? };
+    unsafe {
+        scaler.Initialize(
+            &converter,
+            ICON_PX,
+            ICON_PX,
+            windows::Win32::Graphics::Imaging::WICBitmapInterpolationModeFant,
+        )?;
+    }
+
+    let mut pixels = vec![0u8; (ICON_PX * ICON_PX * 4) as usize];
+    unsafe {
+        scaler.CopyPixels(std::ptr::null(), ICON_PX * 4, &mut pixels)?;
+    }
+    // WIC gives straight BGRA; force alpha opaque and premultiply for blit.
+    for px in pixels.chunks_exact_mut(4) {
+        px[0] = ((px[0] as u32 * 255) / 255) as u8;
+        px[1] = ((px[1] as u32 * 255) / 255) as u8;
+        px[2] = ((px[2] as u32 * 255) / 255) as u8;
+        px[3] = 255;
+    }
+
+    Ok(Some(ThumbBitmap {
+        width: ICON_PX,
+        height: ICON_PX,
+        pixels_pbgra: pixels,
     }))
 }
 

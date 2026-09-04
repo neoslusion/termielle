@@ -9,7 +9,7 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 - **Floating island** (`layout: island`) with `y_offset` 0-500.
 - **Auto theme** (`theme: "auto"`) — follows the Windows light/dark setting (`AppsUseLightTheme`), hot-swaps live on `WM_SETTINGCHANGE("ImmersiveColorSet")`.
 - **Animated termielle inside the notch** — each agent state's GIF is pre-decoded once per state change (downscaled to 44px) and cycled on its own deadline. `face_animated: false` or reduced-motion freezes it on the first frame.
-- **Visual-only mini dashboard** — no text anywhere: the animated face, one app **icon** per running task (window icons, not screenshots), one dot per live agent session (`agents`), a teal strip while media plays (`music`, via SMTC), and a macOS-style progress ring (`ring`, battery/CPU/mem via `ring_metric`).
+- **Visual-only mini dashboard** — no text anywhere: the animated face, one app **icon** per running task (window icons, not screenshots), one dot per live agent session (`agents`), and a **live media element** (`music` widget): the SMTC artwork thumbnail when the source exposes one (YouTube shows the video thumbnail), else the source app icon, with three equalizer bars pulsing while playback runs. Clicking the media element toggles play/pause via the multimedia key.
 - **Agent states** — lifecycle events morph the pill; a 2px accent strip along the top edge colors by state (amber thinking, green working, blue needs-input, teal ready, red failed).
 - **Click to expand/collapse** — `WM_LBUTTONUP` toggles manual expansion (idle only); hovering expands when `expand_on_hover` is set.
 - **Idle clock + stats** — collapsed shows `HH:MM`; expanded adds `XX% MEM`, `XX% CPU`, battery `+` when charging, and the focused app name.
@@ -60,8 +60,8 @@ Switchable is just a config toggle — set `notch` or `island` and restart (tray
 | `face` | animated termielle face (state GIF, 44px) | left of the pill, all states |
 | `tasks` | running-task app icons (with `show_tasks`) | expanded pill |
 | `agents` | one dot per live agent session (accent color) | after the icons |
-| `music` | teal accent strip while media plays (SMTC) | top edge when idle |
-| `ring` (`ring_metric`) | macOS-style arc around the face: battery/CPU/mem % | around the face |
+| `music` | media artwork + animated equalizer bars; click toggles play/pause (SMTC) | expanded pill; teal strip on top edge when idle |
+| `ring` (`ring_metric`) | macOS-style arc around the face: battery/CPU/mem % | around the face (config kept for compat; widget currently omitted from the compact layout) |
 
 
 > **On agent "quota/usage":** the event protocol is content-free by design
