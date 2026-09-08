@@ -157,6 +157,12 @@ pub struct IslandConfig {
     /// popping down into the pill format on top-edge hover (macOS / iOS behavior).
     /// When false, it rests as the minimal dot or compact pill.
     pub auto_hide: bool,
+    /// Forward Windows app toast notifications to the island as transient
+    /// alert banners (app name plus the first text lines). Local-only:
+    /// nothing leaves the machine. Needs notification-listener access
+    /// (Settings > Privacy > Notifications); without it the watcher exits
+    /// silently and the island is unaffected.
+    pub forward_toasts: bool,
 }
 
 impl Default for IslandConfig {
@@ -181,6 +187,7 @@ impl Default for IslandConfig {
             widgets: Self::default_widgets(),
             expand_on_hover: true,
             auto_hide: false,
+            forward_toasts: true,
         }
     }
 }

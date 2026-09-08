@@ -10,13 +10,12 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MONITORINFOEXW, MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject,
-    SetDIBitsToDevice,
+    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
+    MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject, SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
@@ -29,9 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
     UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -278,6 +277,11 @@ fn wide_to_string(bytes: &[u16]) -> String {
 }
 
 /// Clamps `rect` to the work area of the monitor it lies on.
+///
+/// The overlay owns its size (the present loop derives it from the frame and
+/// the render scale), so only the position comes from the suggested rect: an
+/// OS DPI suggestion would otherwise resize us behind the present loop's
+/// back for one frame — and race its size assertions in tests.
 unsafe fn reposition_to_work_area(hwnd: HWND, rect: &RECT) {
     let monitor = unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFOEXW::default();
@@ -289,19 +293,21 @@ unsafe fn reposition_to_work_area(hwnd: HWND, rect: &RECT) {
             right: info.monitorInfo.rcWork.right,
             bottom: info.monitorInfo.rcWork.bottom,
         };
-        let (x, y) = clamp_to_work_area(
-            (rect.left, rect.top),
-            (rect.right - rect.left, rect.bottom - rect.top),
-            work,
-        );
+        let mut current = RECT::default();
+        let (w, h) = if unsafe { GetWindowRect(hwnd, &mut current) }.is_ok() {
+            (current.right - current.left, current.bottom - current.top)
+        } else {
+            (rect.right - rect.left, rect.bottom - rect.top)
+        };
+        let (x, y) = clamp_to_work_area((rect.left, rect.top), (w, h), work);
         let _ = unsafe {
             SetWindowPos(
                 hwnd,
                 None,
                 x,
                 y,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                w,
+                h,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
             )
         };
@@ -441,6 +447,12 @@ unsafe extern "system" fn window_proc(
                     let _ = unsafe { (*state).events.send(WindowEvent::SystemThemeChanged) };
                 }
             }
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // Accent color (and its prevalence) changed: same re-resolve as
+            // a light/dark flip, so `auto` tints track Settings live.
+            let _ = unsafe { (*state).events.send(WindowEvent::SystemThemeChanged) };
+            return LRESULT(0);
         }
         WM_TIMER => {
             if wparam.0 == TIMER_ID {
@@ -614,6 +626,11 @@ pub struct OverlayWindow {
     backdrop: RefCell<Option<crate::backdrop::Backdrop>>,
     /// Last ULW destination (x, y, w, h) in physical pixels.
     last_dest: (i32, i32, u32, u32),
+    /// Monitor the island is anchored to. Picked from the cursor position on
+    /// the first present and re-picked on display changes, so the notch
+    /// follows the display the user is on — but never jumps mid-morph just
+    /// because the cursor crossed a screen edge.
+    anchor_monitor: Option<windows::Win32::Graphics::Gdi::HMONITOR>,
 }
 
 impl OverlayWindow {
@@ -689,6 +706,7 @@ impl OverlayWindow {
             state,
             receiver,
             repositioned: false,
+            anchor_monitor: None,
             render: config.render,
             tray: false,
             glass: config.island.glass.clone(),
@@ -905,6 +923,14 @@ impl OverlayWindow {
         self.last_dest
     }
 
+    /// Monitor DPI scale for the window's current monitor: physical pixels
+    /// per logical pixel. Falls back to 1.0 when the query fails — the
+    /// overlay keeps presenting, just unscaled.
+    pub fn dpi_scale(&self) -> f32 {
+        let dpi = unsafe { GetDpiForWindow(self.hwnd) };
+        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+    }
+
     /// Whether the cursor is currently over an opaque pill pixel. Polled by
     /// the GUI loop as a backstop for spurious `WM_MOUSELEAVE`s.
     pub fn cursor_over_pill(&self) -> bool {
@@ -932,35 +958,49 @@ impl OverlayWindow {
             }
         }
     }
+    /// Clears the tracked anchor monitor so the next present re-picks it
+    /// from the cursor position. Called on display/DPI changes, when the
+    /// monitor set may have been rearranged out from under the island.
+    pub fn reset_anchor_monitor(&mut self) {
+        self.anchor_monitor = None;
+    }
 
+    /// Top-center position on the tracked anchor monitor. The monitor is
+    /// picked once from the cursor position — the display the user is
+    /// looking at — and then kept: re-picking on every morph would teleport
+    /// the island whenever the cursor crosses a screen edge mid-animation.
     fn island_anchored_position(
-        &self,
+        &mut self,
         width: i32,
         height: i32,
         attached: bool,
         y_offset: i32,
     ) -> (i32, i32) {
-        // Always anchor to the primary work area so the notch/island is
-        // visible where the user looks, not on a secondary monitor where
-        // MonitorFromWindow would follow a dragged 1×1 window.
-        let monitor = unsafe {
-            windows::Win32::Graphics::Gdi::MonitorFromPoint(
-                POINT { x: 0, y: 0 },
-                MONITOR_DEFAULTTOPRIMARY,
-            )
-        };
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-            let work = (
-                info.rcWork.left,
-                info.rcWork.top,
-                info.rcWork.right,
-                info.rcWork.bottom,
-            );
-            return island_anchored_position(width, height, attached, y_offset, work);
+        if self.anchor_monitor.is_none() {
+            let mut point = POINT { x: 0, y: 0 };
+            let _ = unsafe { GetCursorPos(&mut point) };
+            self.anchor_monitor = Some(unsafe {
+                windows::Win32::Graphics::Gdi::MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+            });
+        }
+        if let Some(monitor) = self.anchor_monitor {
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                let work = (
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                );
+                return island_anchored_position(width, height, attached, y_offset, work);
+            }
+            // A tracked monitor that no longer resolves (unplugged between
+            // the pick and this present): drop it so the next present
+            // re-picks instead of pinning to a dead rectangle.
+            self.anchor_monitor = None;
         }
         // Fallback: center on 1920 if no monitor info
         island_anchored_position(width, height, attached, y_offset, (0, 0, 1920, 1080))
@@ -1037,14 +1077,23 @@ impl OverlayWindow {
             }
             alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
         } else {
+            // Physical-pixel resample: the frame is authored in logical pixels
+            // and must be filtered up to the window size — but at 1.0 the
+            // bilinear taps land exactly on texel centers, so borrow the
+            // frame instead of paying a full float copy on every present.
+            let scaled;
+            let frame = if scaled_w == frame.width && scaled_h == frame.height {
+                frame
+            } else {
+                scaled = crate::animation::notch::resample_bilinear(frame, scaled_w, scaled_h);
+                &scaled
+            };
             match backdrop.as_ref() {
                 Some(bg) => {
                     for yy in 0..scaled_h {
                         for xx in 0..scaled_w {
-                            let source_x = (xx * frame.width / scaled_w) as usize;
-                            let source_y = (yy * frame.height / scaled_h) as usize;
                             let source = &frame.pixels_pbgra
-                                [(source_y * frame.width as usize + source_x) * 4..][..4];
+                                [(yy as usize * scaled_w as usize + xx as usize) * 4..][..4];
                             let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
                             if source[3] == 0 {
                                 // Outside the pill: stay fully transparent so clicks
@@ -1086,10 +1135,8 @@ impl OverlayWindow {
                 None => {
                     for yy in 0..scaled_h {
                         for xx in 0..scaled_w {
-                            let source_x = (xx * frame.width / scaled_w) as usize;
-                            let source_y = (yy * frame.height / scaled_h) as usize;
                             let source = &frame.pixels_pbgra
-                                [(source_y * frame.width as usize + source_x) * 4..][..4];
+                                [(yy as usize * scaled_w as usize + xx as usize) * 4..][..4];
                             let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
                             dst[target..target + 4].copy_from_slice(source);
                             alpha_map.push(source[3]);
@@ -1188,12 +1235,17 @@ impl OverlayWindow {
             }
             alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
         } else {
+            let resampled;
+            let frame = if scaled_w == frame.width && scaled_h == frame.height {
+                frame
+            } else {
+                resampled = crate::animation::notch::resample_bilinear(frame, scaled_w, scaled_h);
+                &resampled
+            };
             for y in 0..scaled_h {
                 for x in 0..scaled_w {
-                    let source_x = (x * frame.width / scaled_w) as usize;
-                    let source_y = (y * frame.height / scaled_h) as usize;
                     let source = &frame.pixels_pbgra
-                        [(source_y * frame.width as usize + source_x) * 4..][..4];
+                        [(y as usize * scaled_w as usize + x as usize) * 4..][..4];
                     let target = y as usize * stride + x as usize * 3;
                     rgb[target..target + 3].copy_from_slice(&straight_or_key(
                         source[3], source[0], source[1], source[2],

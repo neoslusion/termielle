@@ -597,3 +597,155 @@ fn notch_material_is_true_black_island_is_glass() {
     assert!(pixel[3] > 150);
     assert!(pixel[0] + pixel[1] + pixel[2] > 30, "glass tint must show");
 }
+
+#[test]
+fn render_scale_defaults_to_one() {
+    let c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    assert_eq!(c.render_scale(), 1.0);
+}
+
+#[test]
+fn render_scale_multiplies_dpi_and_user_zoom() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.set_dpi_scale(1.5);
+    assert_eq!(c.render_scale(), 1.5);
+    c.set_user_scale(2.0);
+    assert_eq!(c.render_scale(), 3.0);
+}
+
+#[test]
+fn render_scale_ignores_dpi_when_opted_out() {
+    let mut cfg = island_140_320();
+    cfg.scale_with_dpi = false;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+    c.set_dpi_scale(2.0);
+    assert_eq!(c.render_scale(), 1.0);
+    c.set_user_scale(1.5);
+    assert_eq!(c.render_scale(), 1.5);
+}
+
+#[test]
+fn render_scale_rejects_garbage_and_clamps() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.set_dpi_scale(f32::NAN);
+    c.set_dpi_scale(0.0);
+    c.set_dpi_scale(-2.0);
+    c.set_user_scale(f32::INFINITY);
+    assert_eq!(c.render_scale(), 1.0);
+    c.set_dpi_scale(100.0);
+    assert_eq!(c.render_scale(), 4.0);
+    c.set_user_scale(100.0);
+    assert_eq!(c.render_scale(), 4.0);
+}
+
+#[test]
+fn physical_click_maps_to_logical_hit_rect() {
+    // Same scenario as `click_extends_to_tall_card`, but the client reports
+    // physical pixels at 200%: (140, 36) must land on logical (70, 18).
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.set_hover(true, 10000);
+    c.on_timer(10160);
+    c.set_dpi_scale(2.0);
+    assert_eq!(
+        c.handle_click(140, 36, 10200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+    c.on_timer(10360);
+    assert_eq!(
+        c.handle_click(140, 36, 10500),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+}
+
+#[test]
+fn island_anchor_scales_y_offset_with_dpi() {
+    let mut cfg = island_140_320();
+    cfg.y_offset = 12;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+    assert_eq!(c.island_anchor(), Some((false, 12)));
+    c.set_dpi_scale(2.0);
+    assert_eq!(c.island_anchor(), Some((false, 24)));
+    // Attached notches stay flush regardless of scale.
+    let mut notch = island_140_320();
+    notch.layout = IslandLayout::Notch;
+    let mut n = Controller::new_with_island(5000, 60000, catalog(), false, None, notch);
+    n.set_dpi_scale(2.0);
+    assert_eq!(n.island_anchor(), Some((true, 0)));
+}
+
+#[test]
+fn manual_expansion_survives_mid_turn_flips() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    c.set_hover(true, 10000);
+    c.on_timer(10160);
+    assert_eq!(
+        c.handle_click(70, 18, 10200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+    c.on_timer(10360);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 154);
+
+    // Thinking -> Working must not collapse the user's open card.
+    c.on_timer(11200);
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Working);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 154);
+    // Still the user's card: the next click collapses, not re-expands.
+    assert_eq!(
+        c.handle_click(70, 18, 11300),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+}
+
+#[test]
+fn ending_the_turn_retires_the_open_card() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    c.set_hover(true, 10000);
+    c.on_timer(10160);
+    assert_eq!(
+        c.handle_click(70, 18, 10200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+    c.on_timer(10360);
+    assert_eq!(c.current_frame().height, 154);
+
+    // The turn completes: the card stays open through Ready ...
+    c.handle_event(event("s1", EventKind::TurnCompleted, 10400), 10400);
+    c.on_timer(10600);
+    // ... and retires once the ready hold expires into Idle. Leaving the
+    // hover lets it fall all the way back to the hidden sensor.
+    c.on_timer(15600);
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Idle);
+    c.set_hover(false, 15600);
+    c.on_timer(15760);
+    c.on_timer(16000);
+    assert_eq!(c.current_frame().width, 140);
+    assert_eq!(c.current_frame().height, 2);
+}
+
+#[test]
+fn stale_replayed_needs_input_raises_no_banner() {
+    // Journal replay on startup: a days-old needs_input still folds into
+    // state (the face shows waiting) but must not resurrect its banner.
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 200000);
+    // Settle past the morph end (but inside the 3.5 s banner life, so a
+    // buggy banner would be fully up): the pill must stay compact.
+    c.on_timer(200200);
+    c.on_timer(200600);
+    assert_eq!(c.visible_state(), termielle_core::VisualState::NeedsInput);
+    assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn alert_freshness_boundary_still_banners() {
+    // Exactly at the freshness horizon the event is still news.
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 70000);
+    c.on_timer(70200);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 124);
+}

@@ -14,11 +14,19 @@ use termielle_core::{
     AssetCatalog, EventMessage, IslandConfig, SessionReducer, VisualState, spring_params,
 };
 
-/// Edge length of the termielle face rendered inside the notch.
-const FACE_SIZE: u32 = 44;
+/// Edge length of the cached termielle face. Larger than any display size
+/// (faces show at <= 32 logical px), so the downsample stays crisp and a
+/// scaled-up present still resolves real detail instead of blur.
+const FACE_SIZE: u32 = 64;
 
 /// Square edge length of procedural fallback frames.
 pub const FALLBACK_FRAME_SIZE: u32 = 360;
+
+/// How old an event may be while still raising an alert banner. Live pipe
+/// delivery is instant, so anything older is a journal replay or a delayed
+/// ghost — and a notification about a days-old prompt is not news. The
+/// reducer still folds the event into state; only the banner is gated.
+const ALERT_FRESHNESS_MS: u64 = 60_000;
 
 /// What the GUI thread must do after one controller step.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -313,6 +321,11 @@ pub struct Controller {
     tasks: Vec<crate::tasks::TaskIcon>,
     /// Transient notification alert banner.
     alert: Option<AlertBanner>,
+    /// Monitor DPI scale (physical px per logical px), refreshed from the
+    /// window on every present. 1.0 until the first present.
+    dpi_scale: f32,
+    /// User zoom from `AppConfig.scale`, applied on top of DPI.
+    user_scale: f32,
 }
 
 impl Controller {
@@ -381,6 +394,8 @@ impl Controller {
             tasks: Vec::new(),
             glass_cache: None,
             alert: None,
+            dpi_scale: 1.0,
+            user_scale: 1.0,
         };
         if controller.island.is_enabled() {
             controller.refresh_face(state);
@@ -2085,14 +2100,54 @@ impl Controller {
             return None;
         }
         let attached = self.island.is_attached();
-        let y_offset = if attached { 0 } else { self.island.y_offset };
+        let y_offset = if attached {
+            0
+        } else {
+            (self.island.y_offset as f32 * self.render_scale()).round() as i32
+        };
         Some((attached, y_offset))
     }
 
-    /// Routes a click at frame-local (`x`, `y`):
+    /// Refreshes the monitor DPI scale from the window. Called on every
+    /// present, so dragging the pill across monitors with different DPIs
+    /// tracks without any cache-invalidation path. Garbage in is ignored.
+    pub fn set_dpi_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.dpi_scale = scale.clamp(0.5, 4.0);
+        }
+    }
+
+    /// User zoom from `AppConfig.scale`, applied on top of monitor DPI.
+    pub fn set_user_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.user_scale = scale.clamp(0.5, 2.0);
+        }
+    }
+
+    /// Physical pixels per logical pixel for the next present: monitor DPI
+    /// (unless the island opts out via `scale_with_dpi`) times the user
+    /// zoom. The frame stays logical; `window.rs` resamples to physical.
+    pub fn render_scale(&self) -> f32 {
+        let dpi = if self.island.scale_with_dpi {
+            self.dpi_scale
+        } else {
+            1.0
+        };
+        (dpi * self.user_scale).clamp(0.5, 4.0)
+    }
+
+    /// Maps one physical client pixel back to frame (logical) space for
+    /// hit-testing against `icon_hits` and `hover_point`.
+    fn to_logical(&self, v: i32) -> i32 {
+        (v as f32 / self.render_scale()).round() as i32
+    }
+
+    /// Routes a click at physical client (`x`, `y`): coordinates are mapped
+    /// to frame space before hit-testing, then —
     /// - over interactive buttons (media control, window switcher, notification dismiss)
     /// - over the pill otherwise: toggles expansion and returns the outcome.
     pub fn handle_click(&mut self, x: i32, y: i32, now_ms: u64) -> ClickOutcome {
+        let (x, y) = (self.to_logical(x), self.to_logical(y));
         for &(id, hx, hy, hw, hh) in &self.icon_hits {
             if x >= hx && x < hx + hw as i32 && y >= hy && y < hy + hh as i32 {
                 match id {
@@ -2120,10 +2175,12 @@ impl Controller {
         ClickOutcome::None
     }
 
-    /// Stores the cursor position in frame coordinates for icon hover
-    /// highlighting. Triggers a repaint only when the highlighted icon
-    /// changed.
+    /// Stores the cursor position for icon hover highlighting. The poll
+    /// reports physical client pixels; they are mapped to frame space before
+    /// comparing against `icon_hits`. Triggers a repaint only when the
+    /// highlighted icon changed.
     pub fn set_hover_point(&mut self, point: Option<(i32, i32)>) -> bool {
+        let point = point.map(|(x, y)| (self.to_logical(x), self.to_logical(y)));
         if self.hover_point == point {
             return false;
         }
@@ -2258,13 +2315,14 @@ impl Controller {
     pub fn handle_event(&mut self, event: EventMessage, now_ms: u64) -> ControllerActions {
         let kind = event.event;
         let session = event.session_id.clone();
+        let fresh = now_ms.saturating_sub(event.timestamp_ms) <= ALERT_FRESHNESS_MS;
         self.reducer.advance(now_ms);
         self.reducer.apply(event);
         let mut actions = self.sync_state(now_ms);
 
         if self.island.is_enabled() {
             match kind {
-                termielle_core::EventKind::NeedsInput => {
+                termielle_core::EventKind::NeedsInput if fresh => {
                     self.trigger_alert(
                         "Input Required",
                         format!("Session: {session}"),
@@ -2274,7 +2332,7 @@ impl Controller {
                     );
                     actions.present_frame = true;
                 }
-                termielle_core::EventKind::TurnFailed => {
+                termielle_core::EventKind::TurnFailed if fresh => {
                     self.trigger_alert(
                         "Task Failed",
                         format!("Session: {session}"),
@@ -2470,7 +2528,10 @@ impl Controller {
             self.state = state;
             actions.visible_state = Some(state);
             actions.present_frame = true;
-            if state != VisualState::Idle {
+            // A manual expansion is the user's explicit open: mid-turn flips
+            // (thinking -> working) must not collapse it from under them.
+            // Only the turn ending retires the card.
+            if state == VisualState::Idle {
                 self.manually_expanded = false;
             }
             if self.island.is_enabled() {

@@ -208,6 +208,30 @@ pub fn transparency_enabled() -> bool {
     if status.is_err() { true } else { value == 1 }
 }
 
+/// Whether Windows paints the accent color onto Start and the taskbar
+/// ("Show accent color on Start and taskbar"). When on, the taskbar acrylic
+/// is tinted toward the accent and the island follows it in `auto` mode.
+/// `None` is treated as off: a neutral taskbar needs no accent mixing.
+pub fn taskbar_shows_accent() -> bool {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    // SAFETY: same live key/value/size contract as the readers above.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("ColorPrevalence"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    !status.is_err() && value == 1
+}
+
 /// Resolves the `auto` theme name from the system light/dark setting.
 pub fn auto_theme_name() -> &'static str {
     match apps_use_light_theme() {

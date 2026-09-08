@@ -4,8 +4,8 @@
 //! The glass material is baked into premultiplied BGRA so `UpdateLayeredWindow`
 //! composites it with per-pixel alpha — no DWM acrylic dependency.
 //!
-//! Geometry is logical pixels before `scale`; `window.rs` scales the buffer
-//! with nearest-neighbor if needed.
+//! Geometry is logical pixels before `scale`; `window.rs` resamples the buffer
+//! with bilinear filtering when physical pixels differ.
 
 use termielle_core::{GlassConfig, IslandGeometry, VisualState};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -382,6 +382,81 @@ pub fn glass_layer_blobs(
     frame
 }
 
+/// Bilinear sample of a premultiplied BGRA frame at fractional source
+/// coordinates. Taps clamp to the edge texel, so the four weights always sum
+/// to one. Filtering premultiplied components (alpha included) keeps the
+/// result a valid premultiplied texel — the same rule the GIF compositor
+/// relies on — so filtered edges composite exactly like authored ones.
+fn sample_bilinear(src: &FrameBuffer, fx: f32, fy: f32) -> [u8; 4] {
+    if src.width == 0 || src.height == 0 {
+        return [0, 0, 0, 0];
+    }
+    let fx = fx.clamp(0.0, src.width as f32 - 1.0);
+    let fy = fy.clamp(0.0, src.height as f32 - 1.0);
+    let x0 = fx.floor() as u32;
+    let y0 = fy.floor() as u32;
+    let x1 = (x0 + 1).min(src.width - 1);
+    let y1 = (y0 + 1).min(src.height - 1);
+    let tx = fx - fx.floor();
+    let ty = fy - fy.floor();
+    let tap = |x: u32, y: u32| -> [f32; 4] {
+        let i = ((y * src.width + x) * 4) as usize;
+        [
+            f32::from(src.pixels_pbgra[i]),
+            f32::from(src.pixels_pbgra[i + 1]),
+            f32::from(src.pixels_pbgra[i + 2]),
+            f32::from(src.pixels_pbgra[i + 3]),
+        ]
+    };
+    let a = tap(x0, y0);
+    let b = tap(x1, y0);
+    let c = tap(x0, y1);
+    let d = tap(x1, y1);
+    let weights = [
+        (1.0 - tx) * (1.0 - ty),
+        tx * (1.0 - ty),
+        (1.0 - tx) * ty,
+        tx * ty,
+    ];
+    let taps = [a, b, c, d];
+    let mut out = [0u8; 4];
+    for ch in 0..4 {
+        let mut acc = 0.0f32;
+        for (tap, weight) in taps.iter().zip(weights.iter()) {
+            acc += tap[ch] * weight;
+        }
+        out[ch] = acc.round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
+/// Resamples `src` to exactly (`w`, `h`) with bilinear filtering. Dest pixel
+/// centers map into source space, so a downscale averages source texels and
+/// an upscale ramps between them instead of stair-stepping. The 1:1 case
+/// lands exactly on texel centers and copies.
+pub fn resample_bilinear(src: &FrameBuffer, w: u32, h: u32) -> FrameBuffer {
+    let mut out = FrameBuffer {
+        width: w,
+        height: h,
+        pixels_pbgra: vec![0u8; (w as usize) * (h as usize) * 4],
+        delay_ms: 0,
+        loop_index: 0,
+    };
+    if src.width == 0 || src.height == 0 || w == 0 || h == 0 {
+        return out;
+    }
+    for ty in 0..h {
+        let fy = (ty as f32 + 0.5) * src.height as f32 / h as f32 - 0.5;
+        for tx in 0..w {
+            let fx = (tx as f32 + 0.5) * src.width as f32 / w as f32 - 0.5;
+            let px = sample_bilinear(src, fx, fy);
+            let i = ((ty * w + tx) * 4) as usize;
+            out.pixels_pbgra[i..i + 4].copy_from_slice(&px);
+        }
+    }
+    out
+}
+
 /// Blits a premultiplied BGRA frame with squircle rounded corners.
 pub fn blit_rounded(
     frame: &mut FrameBuffer,
@@ -413,10 +488,9 @@ pub fn blit_rounded(
             if cov == 0 {
                 continue;
             }
-            let sx = (tx as u32 * src.width / tw).min(src.width - 1);
-            let sy = (ty as u32 * src.height / th).min(src.height - 1);
-            let si = ((sy * src.width + sx) * 4) as usize;
-            let pixel = &src.pixels_pbgra[si..si + 4];
+            let fx = (tx as f32 + 0.5) * src.width as f32 / tw as f32 - 0.5;
+            let fy = (ty as f32 + 0.5) * src.height as f32 / th as f32 - 0.5;
+            let pixel = sample_bilinear(src, fx, fy);
             let alpha = (pixel[3] as u32 * cov / 255) as u8;
             if alpha == 0 {
                 continue;
@@ -436,7 +510,9 @@ pub fn blit_rounded(
     }
 }
 
-/// Renders native Windows GDI ClearType antialiased text into the frame.
+/// Renders native Windows GDI antialiased text into the frame. Glyphs
+/// rasterize at 2x and downsample on blend, so small sizes keep smooth
+/// curves instead of snapped stems; position and advance stay in dest pixels.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     frame: &mut FrameBuffer,
@@ -453,12 +529,15 @@ pub fn draw_text(
     }
     let h = (font_size * 2).max(18) as u32;
     let w = max_w;
+    // Supersampled scratch dimensions. The 2x2 box average in the blend loop
+    // below is what turns the extra raster into extra edge information.
+    let (sw, sh) = (w * 2, h * 2);
 
     let font_name = crate::window::encode_wide("Segoe UI");
     let weight = if bold { 700 } else { 400 };
     let font = unsafe {
         CreateFontW(
-            -font_size,
+            -font_size * 2,
             0,
             0,
             0,
@@ -469,7 +548,9 @@ pub fn draw_text(
             FONT_CHARSET(0),
             FONT_OUTPUT_PRECISION(0),
             FONT_CLIP_PRECISION(0),
-            FONT_QUALITY(5), // CLEARTYPE_QUALITY
+            FONT_QUALITY(4), // ANTIALIASED_QUALITY: grayscale AA. ClearType
+            // subpixel rendering assumes an opaque background and fringes on
+            // a transparent layered window; grayscale stays neutral.
             0,
             PCWSTR(font_name.as_ptr()),
         )
@@ -493,8 +574,8 @@ pub fn draw_text(
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w as i32,
-            biHeight: -(h as i32),
+            biWidth: sw as i32,
+            biHeight: -(sh as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -516,7 +597,7 @@ pub fn draw_text(
     let prev_obj = unsafe { SelectObject(memory_dc, HGDIOBJ(dib.0)) };
     let prev_font = unsafe { SelectObject(memory_dc, HGDIOBJ(font.0)) };
 
-    let total_bytes = (w * h * 4) as usize;
+    let total_bytes = (sw * sh * 4) as usize;
     unsafe {
         std::ptr::write_bytes(bits as *mut u8, 0, total_bytes);
         SetBkMode(memory_dc, TRANSPARENT);
@@ -526,8 +607,8 @@ pub fn draw_text(
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: w as i32,
-        bottom: h as i32,
+        right: sw as i32,
+        bottom: sh as i32,
     };
     let mut wide_text = crate::window::encode_wide(text);
     if wide_text.ends_with(&[0]) {
@@ -554,10 +635,19 @@ pub fn draw_text(
             if target_x < 0 || target_x >= frame.width as i32 {
                 continue;
             }
-            let src_idx = ((row * w as i32 + col) * 4) as usize;
-            let val = src_slice[src_idx]
-                .max(src_slice[src_idx + 1])
-                .max(src_slice[src_idx + 2]);
+            // Box-average the 2x2 supersampled block into one coverage
+            // value: luminance per tap, then the mean of four. Grayscale AA
+            // keeps channels in agreement, so no subpixel fringes survive.
+            let mut acc = 0u32;
+            for dy in 0..2i32 {
+                for dx in 0..2i32 {
+                    let src_idx = (((row * 2 + dy) * sw as i32 + (col * 2 + dx)) * 4) as usize;
+                    acc += u32::from(src_slice[src_idx]) * 77
+                        + u32::from(src_slice[src_idx + 1]) * 150
+                        + u32::from(src_slice[src_idx + 2]) * 29;
+                }
+            }
+            let val = ((acc / 4 + 128) / 256) as u8;
             if val == 0 {
                 continue;
             }
@@ -588,31 +678,29 @@ pub fn draw_text(
 }
 
 /// Blits a premultiplied BGRA frame (the termielle face) scaled to
-/// (tw, th) at (x, y), nearest-sampled.
+/// (tw, th) at (x, y), bilinear-filtered so downscaled faces and thumbnails
+/// average source texels instead of dropping rows and columns.
 pub fn blit_scaled(frame: &mut FrameBuffer, src: &FrameBuffer, x: i32, y: i32, tw: u32, th: u32) {
     if src.width == 0 || src.height == 0 || tw == 0 || th == 0 {
         return;
     }
     for ty in 0..th as i32 {
+        let dst_y = y + ty;
+        if dst_y < 0 || dst_y >= frame.height as i32 {
+            continue;
+        }
+        let fy = (ty as f32 + 0.5) * src.height as f32 / th as f32 - 0.5;
         for tx in 0..tw as i32 {
-            let sx = (tx as u64 * src.width as u64 / tw as u64) as u32;
-            let sy = (ty as u64 * src.height as u64 / th as u64) as u32;
-            let si = ((sy * src.width + sx) * 4) as usize;
-            let a = src.pixels_pbgra[si + 3];
-            if a == 0 {
+            let dst_x = x + tx;
+            if dst_x < 0 || dst_x >= frame.width as i32 {
                 continue;
             }
-            blend_pixel(
-                frame,
-                (x + tx) as u32,
-                (y + ty) as u32,
-                [
-                    src.pixels_pbgra[si],
-                    src.pixels_pbgra[si + 1],
-                    src.pixels_pbgra[si + 2],
-                    a,
-                ],
-            );
+            let fx = (tx as f32 + 0.5) * src.width as f32 / tw as f32 - 0.5;
+            let px = sample_bilinear(src, fx, fy);
+            if px[3] == 0 {
+                continue;
+            }
+            blend_pixel(frame, dst_x as u32, dst_y as u32, px);
         }
     }
 }

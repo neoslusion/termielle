@@ -218,6 +218,8 @@ fn main() {
             .map(|rate| ((1000u64 + u64::from(rate) / 2) / u64::from(rate)).max(1)),
         config.island.clone(),
     );
+    // User zoom rides on top of monitor DPI inside `render_scale`.
+    controller.set_user_scale(config.scale);
 
     // Only the production overlay journals and replays: diagnostics runs on
     // custom pipes must neither inherit nor pollute the live state.
@@ -679,11 +681,16 @@ fn present_current(
     ack: Option<&mut AckWriter>,
     backdrop_request: Option<&Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>>,
 ) {
+    // Fresh DPI on every present: dragging the pill across monitors with
+    // different DPIs tracks without an invalidation path (the DisplayChanged
+    // repaint covers the transition frame).
+    controller.set_dpi_scale(window.dpi_scale());
+    let scale = controller.render_scale();
     let anchor = controller.island_anchor();
     let attempt = if let Some((attached, y_off)) = anchor {
-        window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
+        window.present_with_anchor(controller.current_frame(), scale, Some((attached, y_off)))
     } else {
-        window.present(controller.current_frame(), 1.0)
+        window.present(controller.current_frame(), scale)
     };
     // Publish the glass capture request: the rect the pill was just drawn
     // at. The worker owns the (potentially slow) capture and blur.
@@ -716,9 +723,13 @@ fn present_current(
             );
             let retry_anchor = controller.island_anchor();
             let retry = if let Some((attached, y_off)) = retry_anchor {
-                window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
+                window.present_with_anchor(
+                    controller.current_frame(),
+                    scale,
+                    Some((attached, y_off)),
+                )
             } else {
-                window.present(controller.current_frame(), 1.0)
+                window.present(controller.current_frame(), scale)
             };
             match retry {
                 Ok(()) => {
@@ -738,11 +749,11 @@ fn present_current(
                     let _ = if let Some((attached, y_off)) = fallback_anchor {
                         window.present_with_anchor(
                             controller.current_frame(),
-                            1.0,
+                            scale,
                             Some((attached, y_off)),
                         )
                     } else {
-                        window.present(controller.current_frame(), 1.0)
+                        window.present(controller.current_frame(), scale)
                     };
                 }
             }
@@ -797,8 +808,33 @@ fn drain_thumbs(
     while let Ok(mut batch) = receiver.try_recv() {
         if let Some(backdrop) = batch.backdrop.take() {
             window.set_backdrop(backdrop);
+            // Fresh glass with no repaint is invisible: force one so the new
+            // backdrop actually reaches the screen.
+            present = true;
         }
         if controller.set_task_update(batch) {
+            present = true;
+        }
+    }
+    present
+}
+
+/// Drains toast batches into alert banners. Returns whether any banner wants
+/// a repaint.
+fn drain_toasts(
+    controller: &mut Controller,
+    receiver: &Receiver<termielle_app::toast::ToastBatch>,
+) -> bool {
+    let mut present = false;
+    while let Ok(batch) = receiver.try_recv() {
+        for event in batch.events {
+            controller.trigger_alert(
+                event.display_title(),
+                event.display_subtitle(),
+                termielle_app::system::accent_color_bgra(),
+                6000,
+                now_ms(),
+            );
             present = true;
         }
     }
@@ -877,6 +913,18 @@ fn run_gui(
     // The animation clock thread paces frames; the smoke test's timeout timer
     // is separate and unaffected.
     let clock = AnimationClock::spawn(window.wake_handle());
+    // Windows toast forwarding: own STA thread plus channel. Gated on
+    // config only — smoke runs never reach run_gui, so diagnostics stays
+    // free of consent prompts.
+    let toast_receiver = if config.island.forward_toasts {
+        let (toast_sender, toast_receiver) =
+            std::sync::mpsc::channel::<termielle_app::toast::ToastBatch>();
+        let _toast_watcher =
+            termielle_app::toast::spawn_toast_watcher(toast_sender, window.wake_handle());
+        Some(toast_receiver)
+    } else {
+        None
+    };
     loop {
         // Catch up on deadlines that became due while we were blocked.
         loop {
@@ -914,8 +962,12 @@ fn run_gui(
                 let iteration = || {
                     let actions = drain_pipe(controller, receiver, journal);
                     let thumb_present = drain_thumbs(window, controller, thumb_receiver);
+                    let toast_present = toast_receiver
+                        .as_ref()
+                        .map(|rx| drain_toasts(controller, rx))
+                        .unwrap_or(false);
                     let mut actions = actions;
-                    actions.present_frame = actions.present_frame || thumb_present;
+                    actions.present_frame = actions.present_frame || thumb_present || toast_present;
                     poll_hover(window, controller, &mut actions);
                     actions.next_deadline_ms = controller.next_deadline_ms();
                     apply_timed(
@@ -956,8 +1008,10 @@ fn run_gui(
         let mut actions = match event {
             WindowEvent::Timer => controller.on_timer(now_ms()),
             WindowEvent::DisplayChanged => {
-                // The wndproc re-clamped classic rects; island needs a re-anchor
-                // so force a repaint which will SetWindowPos to top-center.
+                // The wndproc re-clamped classic rects; the island drops its
+                // tracked monitor so the repaint re-picks the display the
+                // cursor is on, then SetWindowPos re-anchors top-center there.
+                window.reset_anchor_monitor();
                 ControllerActions {
                     present_frame: true,
                     ..Default::default()
@@ -1139,7 +1193,12 @@ fn run_gui(
             }
         };
         actions = merge(actions, drain_pipe(controller, receiver, journal));
-        if drain_thumbs(window, controller, thumb_receiver) {
+        let thumbs = drain_thumbs(window, controller, thumb_receiver);
+        let toasts = toast_receiver
+            .as_ref()
+            .map(|rx| drain_toasts(controller, rx))
+            .unwrap_or(false);
+        if thumbs || toasts {
             actions.present_frame = true;
             actions.next_deadline_ms = controller.next_deadline_ms();
         }

@@ -5,7 +5,10 @@
 
 use std::borrow::Cow;
 
-use termielle_app::animation::{AnimationSource, GifAnimation, fallback_frame};
+use termielle_app::animation::{
+    AnimationSource, FrameBuffer, GifAnimation, blit_scaled, draw_text, fallback_frame,
+    resample_bilinear,
+};
 use termielle_core::VisualState;
 
 struct TestFrame {
@@ -238,4 +241,89 @@ fn gif_source_and_still_source_both_carry_frames() {
         }
         AnimationSource::Gif(_) => panic!("expected a still source"),
     }
+}
+
+fn opaque_frame(width: u32, height: u32, pixels: &[[u8; 4]]) -> FrameBuffer {
+    assert_eq!(pixels.len() as u32, width * height);
+    let mut bytes = Vec::with_capacity(pixels.len() * 4);
+    for px in pixels {
+        bytes.extend_from_slice(px);
+    }
+    FrameBuffer {
+        width,
+        height,
+        pixels_pbgra: bytes,
+        delay_ms: 0,
+        loop_index: 0,
+    }
+}
+
+#[test]
+fn upscale_ramps_instead_of_stair_stepping() {
+    // A 2 px black-to-white edge stretched to 5 px must be a strict ramp.
+    // Nearest sampling repeats texels ([0,0,0,255,255]) and fails this.
+    let src = opaque_frame(2, 1, &[[0, 0, 0, 255], [255, 255, 255, 255]]);
+    let out = resample_bilinear(&src, 5, 1);
+    let luma: Vec<u8> = out.pixels_pbgra.chunks_exact(4).map(|px| px[0]).collect();
+    assert_eq!(luma.len(), 5);
+    assert!(
+        luma.windows(2).all(|w| w[0] < w[1]),
+        "expected a strict ramp, got {luma:?}"
+    );
+    assert_eq!(
+        out.pixels_pbgra
+            .chunks_exact(4)
+            .map(|px| px[3])
+            .collect::<Vec<_>>(),
+        vec![255; 5]
+    );
+}
+
+#[test]
+fn identity_resample_copies_texels() {
+    let src = opaque_frame(
+        3,
+        1,
+        &[[10, 20, 30, 255], [100, 110, 120, 200], [250, 251, 252, 0]],
+    );
+    let out = resample_bilinear(&src, 3, 1);
+    assert_eq!(out.width, 3);
+    assert_eq!(out.pixels_pbgra, src.pixels_pbgra);
+}
+
+#[test]
+fn blit_scaled_downscale_averages_the_edge() {
+    // A 4 px half-black/half-white row blitted to 3 px straddles the edge in
+    // the middle column: it must be gray, not a pure step. Nearest sampling
+    // snaps it to black and fails this.
+    let src = opaque_frame(
+        4,
+        1,
+        &[
+            [0, 0, 0, 255],
+            [0, 0, 0, 255],
+            [255, 255, 255, 255],
+            [255, 255, 255, 255],
+        ],
+    );
+    let mut dst = opaque_frame(3, 1, &[[0, 0, 0, 0]; 3]);
+    blit_scaled(&mut dst, &src, 0, 0, 3, 1);
+    let mid = dst.pixels_pbgra[4];
+    assert!(
+        (64..192).contains(&mid),
+        "middle column must be a blend, got {mid}"
+    );
+    assert!(dst.pixels_pbgra[0] < 64, "left column must stay dark");
+    assert!(dst.pixels_pbgra[8] > 192, "right column must stay bright");
+}
+
+#[test]
+fn text_renders_visible_glyphs() {
+    // Guards the grayscale-AA change: glyph pixels must still land on canvas.
+    let mut frame = opaque_frame(120, 32, &[[0, 0, 0, 0]; 120 * 32]);
+    draw_text(&mut frame, "Ag", 4, 4, 112, 14, true, [255, 255, 255, 255]);
+    assert!(
+        frame.pixels_pbgra.chunks_exact(4).any(|px| px[3] > 0),
+        "expected visible glyph pixels"
+    );
 }

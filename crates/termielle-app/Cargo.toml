@@ -38,6 +38,9 @@ windows = { workspace = true, features = [
   "Storage_Streams",
   "Graphics",
   "Graphics_Imaging",
+  "UI_Notifications",
+  "UI_Notifications_Management",
+  "ApplicationModel",
 ] }
 
 [dev-dependencies]

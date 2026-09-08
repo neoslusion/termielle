@@ -14,13 +14,13 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteDC, DeleteObject, GetDC, HGDIOBJ, ReleaseDC, SelectObject,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
+    GetObjectW, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DI_NORMAL, DrawIconEx, EnumWindows, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GetClassLongPtrW,
-    GetClassNameW, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, HICON, ICON_BIG, ICON_SMALL2,
-    IsIconic, IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL,
+    EnumWindows, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GetClassLongPtrW, GetClassNameW,
+    GetIconInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, HICON, ICON_BIG, ICON_SMALL2,
+    ICONINFO, IsIconic, IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL,
     SW_RESTORE, SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_GETICON, WS_EX_TOOLWINDOW,
 };
 
@@ -173,6 +173,11 @@ pub fn spawn_worker(
         ensure_winrt();
         let mut last_sig: Option<(i32, i32, u32, u32, u32, [u8; 4])> = None;
         let mut last_capture_ms: u64 = 0;
+        // Last pill rect the GUI thread published. Retained so a static pill
+        // (no presents, no fresh requests) still gets a live backdrop
+        // instead of a capture frozen from its last animation.
+        let mut last_req: Option<BackdropRequest> = None;
+        let mut last_req_ms: u64 = 0;
         let mut last_media_ms: u64 = 0;
         let mut last_tasks_ms: u64 = 0;
         let mut last_media: Option<MediaInfo> = None;
@@ -185,13 +190,23 @@ pub fn spawn_worker(
                     .unwrap_or(0);
                 // Backdrop: capture when the pill geometry/material changed
                 // or the previous capture aged out, so the glass tracks the
-                // live desktop behind it rather than a stale snapshot.
-                let request = backdrop_request
+                // live desktop behind it rather than a stale snapshot. The
+                // last published rect is retained: a static pill sends no
+                // fresh requests, but its glass must not freeze.
+                if let Some(req) = backdrop_request
                     .lock()
                     .ok()
-                    .and_then(|mut guard| guard.take());
+                    .and_then(|mut guard| guard.take())
+                {
+                    last_req = Some(req);
+                    last_req_ms = now_ms;
+                } else if now_ms.saturating_sub(last_req_ms) > 5_000 {
+                    // The GUI went quiet (idle hidden sensor): stop capturing
+                    // until it presents again instead of burning laptop CPU.
+                    last_req = None;
+                }
                 let mut backdrop = None;
-                if let Some(req) = request {
+                if let Some(req) = last_req {
                     let sig = (req.x, req.y, req.w, req.h, req.radius, req.tint);
                     let due = last_sig != Some(sig)
                         || now_ms.saturating_sub(last_capture_ms) > BACKDROP_REFRESH_MS;
@@ -209,9 +224,6 @@ pub fn spawn_worker(
                         backdrop = bg;
                         last_sig = Some(sig);
                         last_capture_ms = now_ms;
-                    } else if !due {
-                        // Keep the request for the next cycle.
-                        *backdrop_request.lock().unwrap() = Some(req);
                     }
                 }
 
@@ -491,141 +503,325 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> windows::cor
     });
     windows::core::BOOL(1)
 }
+/// Combines DrawIconEx image bits with the AND-mask bits into premultiplied
+/// BGRA. `mask` is white where the icon is transparent; `mask_valid` tells
+/// whether the mask pass succeeded. Classic XOR/AND icons leave image alpha
+/// at 0 with the glyph composited on black — the mask (not a blind opaque
+/// force) decides those pixels. Alpha-channel icons carry an empty mask, so
+/// they keep per-pixel alpha. A failed mask pass leaves image alpha
+/// untouched rather than inventing boxes.
+fn apply_icon_mask(pixels: &mut [u8], mask: &[u8], mask_valid: bool) {
+    for (px, m) in pixels.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
+        if mask_valid {
+            let luma = (u32::from(m[0]) + u32::from(m[1]) + u32::from(m[2])) / 3;
+            if luma > 127 {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+                px[3] = 0;
+                continue;
+            }
+        }
+        if px[3] == 0 && (px[0] > 0 || px[1] > 0 || px[2] > 0) {
+            // Legacy XOR pixel under an opaque mask bit: solid color.
+            px[3] = 255;
+        } else {
+            let a = u32::from(px[3]);
+            px[0] = (u32::from(px[0]) * a / 255) as u8;
+            px[1] = (u32::from(px[1]) * a / 255) as u8;
+            px[2] = (u32::from(px[2]) * a / 255) as u8;
+        }
+    }
+}
 
 /// Reads one window's app icon: per-window icon first, falling back to window-class icons.
+/// Decoded at native size with true per-pixel alpha (see [`decode_icon`]), then
+/// filtered to [`TASK_ICON_PX`] on the way out.
 pub fn window_icon(hwnd: isize, title: &str) -> Option<TaskIcon> {
     let h_wnd = HWND(hwnd as *mut core::ffi::c_void);
     let hicon = icon_handle(h_wnd)?;
 
-    let screen = unsafe { GetDC(None) };
-    if screen.is_invalid() {
-        return None;
-    }
-    let memory = unsafe { CreateCompatibleDC(Some(screen)) };
-    if memory.is_invalid() {
-        let _ = unsafe { ReleaseDC(None, screen) };
-        return None;
-    }
-
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: TASK_ICON_PX as i32,
-            biHeight: -(TASK_ICON_PX as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
+    let (w, h, native) = decode_icon(hicon)?;
+    let frame = crate::animation::FrameBuffer {
+        width: w,
+        height: h,
+        pixels_pbgra: native,
+        delay_ms: 0,
+        loop_index: 0,
     };
-    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-    let dib = unsafe { CreateDIBSection(Some(memory), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
-    let Ok(dib) = dib else {
-        let _ = unsafe { DeleteDC(memory) };
-        let _ = unsafe { ReleaseDC(None, screen) };
-        return None;
+    let scaled = if w == TASK_ICON_PX && h == TASK_ICON_PX {
+        frame
+    } else {
+        crate::animation::resample_bilinear(&frame, TASK_ICON_PX, TASK_ICON_PX)
     };
-    let previous = unsafe { SelectObject(memory, HGDIOBJ(dib.0)) };
-
-    let drawn = unsafe {
-        DrawIconEx(
-            memory,
-            0,
-            0,
-            hicon,
-            TASK_ICON_PX as i32,
-            TASK_ICON_PX as i32,
-            0,
-            None,
-            DI_NORMAL,
-        )
-        .is_ok()
-    };
-
-    let mut pixels = vec![0u8; (TASK_ICON_PX * TASK_ICON_PX * 4) as usize];
-    if drawn && !bits.is_null() {
-        let src = unsafe { std::slice::from_raw_parts(bits as *const u8, pixels.len()) };
-        pixels.copy_from_slice(src);
-    }
-
-    unsafe {
-        let _ = SelectObject(memory, previous);
-        let _ = DeleteObject(HGDIOBJ(dib.0));
-        let _ = DeleteDC(memory);
-        let _ = ReleaseDC(None, screen);
-    }
-
-    if !drawn {
-        return None;
-    }
-    // Check if any pixels are non-zero (avoid invisible icons)
-    let has_content = pixels
-        .chunks_exact(4)
-        .any(|px| px[3] > 10 || (px[0] > 0 || px[1] > 0 || px[2] > 0));
-    if !has_content {
-        return None;
-    }
-    // Premultiply alpha
-    for px in pixels.chunks_exact_mut(4) {
-        if px[3] == 0 && (px[0] > 0 || px[1] > 0 || px[2] > 0) {
-            px[3] = 255;
-        } else {
-            let a = px[3] as u32;
-            px[0] = ((px[0] as u32 * a) / 255) as u8;
-            px[1] = ((px[1] as u32 * a) / 255) as u8;
-            px[2] = ((px[2] as u32 * a) / 255) as u8;
-        }
-    }
-
     Some(TaskIcon {
         hwnd,
         title: title.to_string(),
         width: TASK_ICON_PX,
         height: TASK_ICON_PX,
-        pixels_pbgra: pixels,
+        pixels_pbgra: scaled.pixels_pbgra,
     })
 }
 
-fn icon_handle(hwnd: HWND) -> Option<HICON> {
-    // 1. Try WM_GETICON with ICON_BIG (hung-app safe: 50 ms timeout)
-    let mut out: usize = 0;
-    let flags = SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_NORMAL.0);
-    let _ = unsafe {
-        SendMessageTimeoutW(
-            hwnd,
-            WM_GETICON,
-            WPARAM(ICON_BIG as usize),
-            LPARAM(0),
-            flags,
-            50,
-            Some(&mut out as *mut usize),
+/// Native icon dimensions from a GDI bitmap handle.
+fn bitmap_dims(hbm: HBITMAP) -> Option<(i32, i32)> {
+    let mut bm = BITMAP::default();
+    if unsafe {
+        GetObjectW(
+            HGDIOBJ(hbm.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&raw mut bm).cast()),
+        )
+    } == 0
+    {
+        return None;
+    }
+    (bm.bmWidth > 0 && bm.bmHeight > 0).then_some((bm.bmWidth, bm.bmHeight))
+}
+
+/// Reads `h` top-down rows of a GDI bitmap as bytes: 32bpp BGRA, or 1bpp
+/// stride-padded rows with MSB first for masks.
+fn dib_bits(hdc: HDC, hbm: HBITMAP, w: i32, h: i32, bpp: u16) -> Option<Vec<u8>> {
+    let stride = if bpp == 1 {
+        (w as usize).div_ceil(32) * 4
+    } else {
+        w as usize * 4
+    };
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w,
+            biHeight: -h,
+            biPlanes: 1,
+            biBitCount: bpp,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = vec![0u8; stride * h as usize];
+    let lines = unsafe {
+        GetDIBits(
+            hdc,
+            hbm,
+            0,
+            h as u32,
+            Some(bits.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
         )
     };
-    if out != 0 {
-        return Some(HICON(out as *mut core::ffi::c_void));
+    if lines != h {
+        return None;
     }
-    // 2. Try WM_GETICON with ICON_SMALL2
-    let _ = unsafe {
-        SendMessageTimeoutW(
-            hwnd,
-            WM_GETICON,
-            WPARAM(ICON_SMALL2 as usize),
-            LPARAM(0),
-            flags,
-            50,
-            Some(&mut out as *mut usize),
-        )
-    };
-    if out != 0 {
-        return Some(HICON(out as *mut core::ffi::c_void));
-    }
-    // 3. Class icons
-    for id in [GCLP_HICON, GCLP_HICONSM] {
-        let raw = unsafe { GetClassLongPtrW(hwnd, id) };
-        if raw != 0 {
-            return Some(HICON(raw as *mut core::ffi::c_void));
+    Some(bits)
+}
+
+/// AND-mask bits (true = transparent) for a `w`x`h` icon mask.
+fn and_mask(hdc: HDC, hbm: HBITMAP, w: i32, h: i32) -> Option<Vec<bool>> {
+    let bits = dib_bits(hdc, hbm, w, h, 1)?;
+    let stride = (w as usize).div_ceil(32) * 4;
+    let mut out = Vec::with_capacity((w * h) as usize);
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            out.push((bits[y * stride + x / 8] >> (7 - (x % 8))) & 1 == 1);
         }
     }
-    None
+    Some(out)
+}
+
+/// Extracts an HICON into premultiplied BGRA at native size: the color
+/// bitmap's alpha channel is real for 32bpp icons, and the 1bpp AND mask
+/// decides legacy XOR art. Returns `None` for undecodable or
+fn decode_icon(hicon: HICON) -> Option<(u32, u32, Vec<u8>)> {
+    let mut info = ICONINFO::default();
+    if unsafe { GetIconInfo(hicon, &mut info) }.is_err() {
+        return None;
+    }
+    let screen = unsafe { GetDC(None) };
+    if screen.is_invalid() {
+        free_icon_bitmaps(&info);
+        return None;
+    }
+    let result = decode_icon_bits(screen, &info);
+    unsafe {
+        let _ = ReleaseDC(None, screen);
+    }
+    free_icon_bitmaps(&info);
+    result
+}
+
+/// Frees the caller-owned bitmaps from [`GetIconInfo`].
+fn free_icon_bitmaps(info: &ICONINFO) {
+    unsafe {
+        if !info.hbmColor.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(info.hbmColor.0));
+        }
+        if !info.hbmMask.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(info.hbmMask.0));
+        }
+    }
+}
+
+/// Core extraction once the device context and icon info are in hand.
+fn decode_icon_bits(screen: HDC, info: &ICONINFO) -> Option<(u32, u32, Vec<u8>)> {
+    if info.hbmColor.is_invalid() {
+        return decode_monochrome_icon(screen, info);
+    }
+    let (w, h) = bitmap_dims(info.hbmColor)?;
+    if w <= 0 || h <= 0 || w > 256 || h > 256 {
+        return None;
+    }
+    let mut pixels = dib_bits(screen, info.hbmColor, w, h, 32)?;
+    if pixels.chunks_exact(4).any(|px| px[3] != 0) {
+        // True alpha channel (opaque art included): premultiply in place.
+        for px in pixels.chunks_exact_mut(4) {
+            let a = u32::from(px[3]);
+            px[0] = (u32::from(px[0]) * a / 255) as u8;
+            px[1] = (u32::from(px[1]) * a / 255) as u8;
+            px[2] = (u32::from(px[2]) * a / 255) as u8;
+        }
+    } else {
+        // Legacy XOR art: the AND mask (same dims for color icons) decides.
+        // A mismatched mask would shear the image, so bail instead.
+        let (mw, mh) = bitmap_dims(info.hbmMask)?;
+        if (mw, mh) != (w, h) {
+            return None;
+        }
+        let mask = and_mask(screen, info.hbmMask, w, h)?;
+        let mut mask32 = vec![0u8; pixels.len()];
+        for (slot, transparent) in mask32.chunks_exact_mut(4).zip(mask.iter()) {
+            let v = u8::from(*transparent) * 255;
+            slot.copy_from_slice(&[v, v, v, 255]);
+        }
+        apply_icon_mask(&mut pixels, &mask32, true);
+    }
+    if !pixels.chunks_exact(4).any(|px| px[3] > 0) {
+        return None;
+    }
+    Some((w as u32, h as u32, pixels))
+}
+
+/// Monochrome fallback: no color bitmap, so the mask stacks the AND mask
+/// over the XOR image, each `h` tall. White XOR pixels light up.
+fn decode_monochrome_icon(screen: HDC, info: &ICONINFO) -> Option<(u32, u32, Vec<u8>)> {
+    let (w, mh) = bitmap_dims(info.hbmMask)?;
+    if w <= 0 || mh <= 0 || w > 256 || mh > 512 || mh % 2 != 0 {
+        return None;
+    }
+    let h = mh / 2;
+    let bits = dib_bits(screen, info.hbmMask, w, mh, 1)?;
+    let stride = (w as usize).div_ceil(32) * 4;
+    let bit = |x: usize, y: usize| (bits[y * stride + x / 8] >> (7 - (x % 8))) & 1 == 1;
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    let mut visible = false;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let o = (y * w as usize + x) * 4;
+            if bit(x, y) {
+                // AND set: transparent.
+                pixels[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+            } else {
+                visible = true;
+                let v = if bit(x, y + h as usize) { 255 } else { 0 };
+                pixels[o..o + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+    }
+    visible.then_some((w as u32, h as u32, pixels))
+}
+
+/// Best-available icon handle for a window: per-window BIG/SMALL plus both
+/// class icons, largest native art wins. A 16px per-window icon must never
+/// upscale-soften a tile when a bigger class icon exists; ties keep
+/// discovery order (per-window first). Handles are owned by their window or
+/// class and must not be freed.
+fn icon_handle(hwnd: HWND) -> Option<HICON> {
+    let flags = SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0 | SMTO_NORMAL.0);
+    let query = |which: usize| {
+        let mut out: usize = 0;
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(which),
+                LPARAM(0),
+                flags,
+                50,
+                Some(&mut out as *mut usize),
+            )
+        };
+        out
+    };
+    let mut candidates = vec![
+        query(ICON_BIG as usize),
+        query(ICON_SMALL2 as usize),
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HICON) as usize },
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HICONSM) as usize },
+    ];
+    candidates.retain(|h| *h != 0);
+    candidates.dedup();
+    let mut best: Option<(HICON, u64)> = None;
+    for raw in &candidates {
+        let hicon = HICON(*raw as *mut core::ffi::c_void);
+        let area = icon_area(hicon);
+        if area > best.map(|(_, b)| b).unwrap_or(0) {
+            best = Some((hicon, area));
+        }
+    }
+    // Fall back to first-available when nothing reports a size: decode may
+    // still succeed, and a missing tile is worse than a soft one.
+    best.map(|(h, _)| h).or_else(|| {
+        candidates
+            .first()
+            .map(|raw| HICON(*raw as *mut core::ffi::c_void))
+    })
+}
+
+/// Native pixel area of an icon for candidate ranking. Reads headers only,
+/// never pixels; 0 when the icon cannot even be measured.
+fn icon_area(hicon: HICON) -> u64 {
+    let mut info = ICONINFO::default();
+    if unsafe { GetIconInfo(hicon, &mut info) }.is_err() {
+        return 0;
+    }
+    let area = if info.hbmColor.is_invalid() {
+        bitmap_dims(info.hbmMask).map(|(w, h)| (w as u64) * (h as u64) / 2)
+    } else {
+        bitmap_dims(info.hbmColor).map(|(w, h)| (w as u64) * (h as u64))
+    }
+    .unwrap_or(0);
+    free_icon_bitmaps(&info);
+    area
+}
+
+#[cfg(test)]
+mod icon_mask_tests {
+    use super::apply_icon_mask;
+
+    #[test]
+    fn masked_background_goes_transparent() {
+        // Legacy icon: red glyph on black, mask white around it.
+        let mut pixels = vec![200, 0, 0, 0, 0, 0, 0, 0];
+        let mask = vec![0, 0, 0, 255, 255, 255, 255, 255];
+        apply_icon_mask(&mut pixels, &mask, true);
+        assert_eq!(pixels, vec![200, 0, 0, 255, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn alpha_pixels_premultiply_under_empty_mask() {
+        let mut pixels = vec![200, 100, 50, 128];
+        let mask = vec![0, 0, 0, 255];
+        apply_icon_mask(&mut pixels, &mask, true);
+        assert_eq!(pixels, vec![100, 50, 25, 128]);
+    }
+
+    #[test]
+    fn failed_mask_keeps_legacy_force_opaque_rule() {
+        let mut pixels = vec![200, 0, 0, 0, 0, 0, 0, 0];
+        let mask = vec![0; 8];
+        apply_icon_mask(&mut pixels, &mask, false);
+        assert_eq!(pixels[3], 255);
+        assert_eq!(pixels[7], 0);
+    }
 }

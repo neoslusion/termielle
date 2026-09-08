@@ -46,6 +46,8 @@ impl Default for ThemeFile {
 /// The glass material matches the Windows 11 taskbar: dark ≈ #202020 at 80%
 /// opacity, light ≈ #F3F3F3 at 90%, and fully opaque when the user turns
 /// transparency effects off.
+/// In `auto` mode with accent-on-taskbar enabled, the tint additionally
+/// leans toward the system accent color; explicit themes stay exact.
 pub fn apply_theme(config: &mut IslandConfig, name: &str) {
     let resolved = if name == "auto" {
         crate::system::auto_theme_name().to_string()
@@ -53,7 +55,7 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
         name.to_string()
     };
     let transparency = crate::system::transparency_enabled();
-    let (tint, blur, border_alpha, highlight_alpha, shadow_alpha): ([u8; 4], u32, u8, u8, u8) =
+    let (mut tint, blur, border_alpha, highlight_alpha, shadow_alpha): ([u8; 4], u32, u8, u8, u8) =
         match resolved.as_str() {
             "light" => (
                 [243, 243, 243, if transparency { 230 } else { 255 }],
@@ -72,6 +74,19 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
                 if transparency { 60 } else { 0 },
             ),
         };
+    // System-following dark mode uses the measured taskbar acrylic instead
+    // of the generic preset: a cool luminous veil at ~73% (sampled from a
+    // transparency-on neutral taskbar — it reads blue-gray, never muddy).
+    // Opaque mode stays flat like the opaque taskbar.
+    if name == "auto" && resolved != "light" {
+        tint = [40, 50, 62, if transparency { 185 } else { 255 }];
+    }
+    // System-following mode tracks the taskbar: when Windows paints the
+    // accent onto the taskbar, the acrylic — and the island — tints toward
+    // it. Explicit named themes stay exact.
+    if name == "auto" && crate::system::taskbar_shows_accent() {
+        tint = blend_toward_accent(tint, crate::system::accent_color_bgra());
+    }
     config.glass.tint = tint;
     config.glass.blur_radius = blur;
     config.glass.border_alpha = border_alpha;
@@ -79,6 +94,23 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
     config.glass.shadow_alpha = shadow_alpha;
     config.glass.clamp();
     config.clamp();
+}
+
+/// How far an `auto` glass tint leans toward the taskbar accent color.
+/// Approximates the DWM colorization balance of the taskbar acrylic, so the
+/// two read as one material.
+const ACCENT_MIX: f32 = 0.4;
+
+/// Linear blend of a BGRA tint toward the accent color. Alpha is preserved:
+/// translucency stays the theme's decision, only the hue follows.
+fn blend_toward_accent(base: [u8; 4], accent: [u8; 4]) -> [u8; 4] {
+    let mut out = base;
+    for ch in 0..3 {
+        out[ch] = (f32::from(base[ch]) * (1.0 - ACCENT_MIX) + f32::from(accent[ch]) * ACCENT_MIX)
+            .round()
+            .clamp(0.0, 255.0) as u8;
+    }
+    out
 }
 
 /// Try to load a theme file from `roots` (user first, install second).
@@ -199,12 +231,41 @@ mod tests {
         };
         apply_theme(&mut c, "auto");
         let light = crate::system::apps_use_light_theme() == Some(true);
-        let expected: [u8; 4] = if light {
+        // Must mirror apply_theme: taskbar-matched dark veil, then the
+        // accent lean when the taskbar shows it.
+        let mut expected: [u8; 4] = if light {
             [243, 243, 243, 230]
+        } else if crate::system::transparency_enabled() {
+            [40, 50, 62, 185]
         } else {
-            [32, 32, 32, 205]
+            [40, 50, 62, 255]
         };
+        // An accent-painted taskbar tints the island too.
+        if crate::system::taskbar_shows_accent() {
+            expected = blend_toward_accent(expected, crate::system::accent_color_bgra());
+        }
         assert_eq!(c.glass.tint, expected);
+    }
+
+    #[test]
+    fn blend_leans_toward_accent_and_keeps_alpha() {
+        // 40% of the way from near-black to Windows blue, alpha untouched.
+        assert_eq!(
+            blend_toward_accent([32, 32, 32, 205], [215, 120, 0, 255]),
+            [105, 67, 19, 205]
+        );
+    }
+
+    #[test]
+    fn explicit_themes_ignore_the_taskbar_accent() {
+        // Midnight stays navy even on an accent-painted taskbar: only `auto`
+        // follows the system.
+        let mut c = IslandConfig {
+            theme: "midnight".into(),
+            ..Default::default()
+        };
+        apply_theme(&mut c, "midnight");
+        assert_eq!(c.glass.tint[..3], [12, 18, 32]);
     }
 
     #[test]
