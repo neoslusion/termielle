@@ -239,7 +239,7 @@ pub fn show_menu(hwnd: HWND) -> u32 {
         return 0;
     };
     for (id, label) in [
-        (TRAY_TOGGLE_TASKS, "Widgets: task icons on/off"),
+        (TRAY_TOGGLE_TASKS, "Widgets: live media on/off"),
         (TRAY_TOGGLE_HOVER, "Widgets: hover to expand on/off"),
         (TRAY_TOGGLE_FACE, "Widgets: termielle face on/off"),
     ] {

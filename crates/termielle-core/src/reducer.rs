@@ -217,6 +217,21 @@ impl SessionReducer {
             .map_or(VisualState::Idle, |(_, session)| session.state)
     }
 
+    /// The primary active session (source, session_id, state), or `None` when
+    /// no session is active.
+    pub fn primary_session(&self) -> Option<(Source, String, VisualState)> {
+        self.sessions
+            .iter()
+            .max_by(|(left_key, left), (right_key, right)| {
+                left.state
+                    .priority()
+                    .cmp(&right.state.priority())
+                    .then(left.last_activity_ms.cmp(&right.last_activity_ms))
+                    .then_with(|| stable_cmp(right_key, left_key))
+            })
+            .map(|(key, session)| (key.0.clone(), key.1.clone(), session.state))
+    }
+
     /// The earliest moment [`SessionReducer::advance`] can change anything.
     pub fn next_deadline_ms(&self) -> Option<u64> {
         self.sessions.values().map(Session::next_deadline_ms).min()

@@ -4,15 +4,30 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 
 ## Features (current)
 
-- **iOS presentation model** — the pill moves through the same three size classes as the Dynamic Island: **Minimal** (small resting dot when nothing is live), **Compact** (resting pill while an agent session or media is live), **Expanded** (hovered/pinned dashboard). Transitions are driven by a real **spring** (Apple's model: `stiffness = (2π/duration)²`, `damping = (1-bounce)·4π/duration`), so morphs overshoot slightly and interrupted morphs inherit velocity — the "living organism" feel.
-- **Attached notch** (`layout: notch`) flush with the top edge — flat top, rounded bottom; the pill is drawn *from* `y=0`.
+- **Authentic macOS & iOS Presentation Lifecycle**:
+  - **Idle is Hidden**: When idle and unhovered, the island completely hides from view, leaving your workspace unobstructed. An invisible 2px sensor strip along the top screen bezel detects incoming hover gestures.
+  - **Live Activities Ride in Compact** — the real island never auto-expands: an active agent session (`Thinking`, `Working`, `Ready`, ...) keeps the **Compact pill** up, hugging its live content, until the turn ends. Needs-input and failure still get prominent treatment as auto-expanding **notification alert banners** (124px) that spring back after 3.5s.
+  - **Hover to Pop Out**: Bumping or hovering the top bezel pops the island down into the **Compact pill format** with organic Apple spring physics, showing the character face, liquid glass, and status. Leaving smoothly retracts it back into hidden.
+  - **Click to Extend**: Clicking the pill extends it vertically and horizontally into the full **Expanded tall card** (320×154px). Clicking it again collapses it back to the pill or hidden. Tapping the media blob toggles playback.
+  - **Press Swell**: Holding the pointer down swells the pill ~3% and it settles back on release — the Dynamic Island under the fingertip.
+- **Liquid Blob Split & Merge** — the signature Dynamic Island morphology. When an agent session and media playback are live at once, the compact pill **splits in two**: the agent blob narrows while the media blob pulls out, connected by a liquid bridge (a smooth-min fillet over both signed-distance fields) that thins and **snaps** as the separation spring extends. When one activity ends, the blobs **flow back and merge** into one pill.
+- **3-Axis Spring Morphing** — Apple's WWDC23 spring physics (`stiffness = (2π/duration)²`, `damping = (1-bounce)·4π/duration`) drives width, height, **and corner radius** through one integrator (semi-implicit Euler, sub-stepped at ~0.35/ω), so the silhouette never snaps: pill ends stay near-semicircular deep into an expansion, and **interrupted morphs inherit their velocity** and settle naturally.
+- **Content Rides the Morph** — content is drawn on its own canvas and composited with a mid-spring opacity dip and a slight rise-into-place, so it fades and settles with the container instead of popping. The face animation keeps ticking **during** morphs, and worker updates (media, tasks) apply mid-flight instead of waiting for the morph to end.
+- **Windows 11 Taskbar Fluent Acrylic & Liquid Glass** — uses native Windows 11 Taskbar Acrylic composition (`SetWindowCompositionAttribute` with `ACCENT_ENABLE_ACRYLICBLURBEHIND` state 4, `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, 3)`, and `DwmEnableBlurBehindWindow`). Solves desktop double-blending with opaque internal compositing and renders:
+  - Top parabolic specular sheen across the upper surface.
+  - Optical refraction groove mimicking curved glass refraction.
+  - Chamfered outer specular rim catching overhead lighting.
+  - Subtle acrylic dither texture eliminating banding on dark gradients.
+- **Dynamic Content-Based Sizing** — no rigid fixed widths; compact mode automatically scales to hug active content (scaling smoothly as multiple agent sessions or live media sessions activate).
+- **Prominent Tall Media Player Card** — expanded mode features a 56×56 album art card with squircle rounded corners, crisp native ClearType typography (track title, artist, app source), an animated 4-bar equalizer wave, interactive play/pause hit-rect click toggle, and a sleek timeline progress bar.
+- **Window Notification Alerts** — transient auto-expanding notification banners (124px tall dropdown) when agent events arrive (`needs_input`, `turn_failed`) or songs change. Displays prominent titles, session context, and accent beacon badges for 3.5s before gracefully springing back. These are the only auto-expanding surfaces — the island itself never springs open on its own.
+- **Attached notch** (`layout: notch`) flush with the top edge — flat top, rounded bottom; the pill is drawn *from* `y=0` **in every presentation** (the anchor never moves mid-morph, so expansions grow downward from the bezel like the real thing).
+- **True-black notch material** — in notch layout the body renders as opaque `#000` (`glass.notch_black`, default on), fusing with the display bezel like real hardware instead of reading as a floating glass widget. Floating islands keep the translucent glass.
 - **Floating island** (`layout: island`) with `y_offset` 0-500.
 - **Auto theme** (`theme: "auto"`) — follows the Windows light/dark setting (`AppsUseLightTheme`), hot-swaps live on `WM_SETTINGCHANGE("ImmersiveColorSet")`.
 - **Animated termielle inside the notch** — each agent state's GIF is pre-decoded once per state change (downscaled to 44px) and cycled on its own deadline. `face_animated: false` or reduced-motion freezes it on the first frame.
-- **Visual-only mini dashboard** — no text anywhere: the animated face, one app **icon** per running task (window icons, not screenshots), one dot per live agent session (`agents`), and a **live media element** (`music` widget): the SMTC artwork thumbnail when the source exposes one (YouTube shows the video thumbnail), else the source app icon, with three equalizer bars pulsing while playback runs. Clicking the media element toggles play/pause via the multimedia key.
 - **Agent states** — lifecycle events morph the pill; a 2px accent strip along the top edge colors by state (amber thinking, green working, blue needs-input, teal ready, red failed).
-- **Click to expand/collapse** — `WM_LBUTTONUP` toggles manual expansion (idle only); hovering expands when `expand_on_hover` is set.
-- **Idle clock + stats** — collapsed shows `HH:MM`; expanded adds `XX% MEM`, `XX% CPU`, battery `+` when charging, and the focused app name.
+- **Click to expand/collapse** — `WM_LBUTTONUP` toggles manual expansion (idle only); hovering expands when `expand_on_hover` is set. Clicking the media element toggles play/pause.
 
 ## Modes
 
@@ -43,10 +58,8 @@ Switchable is just a config toggle — set `notch` or `island` and restart (tray
   "spring_bounce": 0.18,    // 0 = no overshoot, 0.5 = very springy
   "theme": "auto",          // liquid-dark | midnight | light | transparent | auto
   "glass": { "tint": [26,26,26,180], "blur_radius": 0, "border_alpha": 38, "highlight_alpha": 70, "shadow_alpha": 60 },
-  "show_tasks": true,
-  "max_thumbnails": 4,      // 0..6 app icons in the expanded pill
   "face_animated": true,    // cycle the termielle GIF inside the notch
-  "widgets": ["face","tasks","agents","music","ring"],
+  "widgets": ["face","agents","music","ring"],
   "expand_on_hover": true
 }
 ```
@@ -57,11 +70,10 @@ Switchable is just a config toggle — set `notch` or `island` and restart (tray
 
 | name | shows | where |
 |------|-------|-------|
-| `face` | animated termielle face (state GIF, 44px) | left of the pill, all states |
-| `tasks` | running-task app icons (with `show_tasks`) | expanded pill |
-| `agents` | one dot per live agent session (accent color) | after the icons |
-| `music` | media artwork + animated equalizer bars; click toggles play/pause (SMTC) | expanded pill; teal strip on top edge when idle |
-| `ring` (`ring_metric`) | macOS-style arc around the face: battery/CPU/mem % | around the face (config kept for compat; widget currently omitted from the compact layout) |
+| `face` | animated termielle face (state GIF, 44px) | leading / left of the pill, all states |
+| `agents` | live agent session dots + state beacon | center (expanded) or trailing (compact) |
+| `music` | media artwork + animated equalizer bars; click toggles play/pause (SMTC) | trailing / right side; teal strip on top edge when idle |
+| `ring` (`ring_metric`) | progress ring around the face: battery/CPU/mem % | around the face (config kept for compat) |
 
 
 > **On agent "quota/usage":** the event protocol is content-free by design
@@ -70,41 +82,38 @@ Switchable is just a config toggle — set `notch` or `island` and restart (tray
 > the notch. The `agents` widget shows live session activity instead: one dot
 > per connected session, in the agent state's accent color.
 
-Remove a name to hide it, e.g. `"widgets": ["face","tasks","ring"]` for a
-minimal island. Tray → `Widgets` toggles tasks / hover-expand / face live.
+Remove a name to hide it, e.g. `"widgets": ["face","music"]` for a
+minimal island. Tray → `Widgets` toggles live media / hover-expand / face live.
 
 ### Interactivity
 
-- **Hover to expand** (`expand_on_hover`, default on): entering the pill
-  morphs it open when idle; leaving collapses it unless toggled or an agent
-  is active. Hover is edge-triggered (`TrackMouseEvent(TME_LEAVE)`), so no
-  polling.
-- **Click to toggle**: a click takes control from hover — the pill stays as
-  toggled until the next click, agent event, or config change.
-- **Hand cursor** over the pill signals clickability; transparent corners
-  stay click-through via the per-pixel alpha map.
+- **Idle is Hidden**: By default (`auto_hide: true`), the island stays hidden when idle, resting as an invisible 2px sensor along the top bezel.
+- **Hover to Pop Out**: Moving the cursor to the top edge pops out the compact pill (140×36px). Leaving smoothly retracts it back into hidden.
+- **Click to Extend**: Clicking the popped-out pill extends it vertically and horizontally into the full tall card (320×154px). Clicking again collapses it back.
+- **Live Activity**: Active agent turns (`Thinking`, `Working`, `NeedsInput`, `Ready`) stay in extended mode live until the turn is completely done.
+- **Hand cursor** over the visible pill signals clickability; when hidden, the cursor remains a standard arrow. Transparent corners stay click-through via the per-pixel alpha map.
 
 ### Rendering pipeline (no-freeze design)
 
-Icon reads, media queries, and face pre-decoding run on a **background worker thread** (`tasks.rs:
+Media queries, artwork decoding, and backdrop captures run on a **background worker thread** (`tasks.rs:
 spawn_worker`, every 1.5s), which posts batches to the GUI thread. The GUI
 thread only composites the cached frames — hovering and morphing never
 stall. The face GIF is decoded once per agent state, never on clock ticks.
 
-`collapsed_width` is Idle/Failed; `expanded_width` is all other states. Morph interpolates width with `easeInOutCubic(progress)` at `frame_interval_ms` (default 16ms) while `AnimationClock` (dedicated thread, not `WM_TIMER`) paces.
+Presentations size to their content: the compact pill hugs face/dots/media, the expanded card uses `expanded_width` with a content-dependent height (154/180/210). Morphs are spring-integrated (width, height, corner radius, blob separation) at `frame_interval_ms` (default 16ms) while `AnimationClock` (dedicated thread, not `WM_TIMER`) paces and the measured present cost is subtracted from each interval.
 
 All values clamp like `scale:0.5..2.0` — a bad value never discards the file.
 
 ### Glass — live frosted glass
 
-The pill composites over a **live capture of the wallpaper behind it**: a
+The pill composites over a **live capture of the desktop behind it**: a
 plain `BitBlt` (which excludes layered windows, so the glass never feeds
-back into itself) fills the pill rect, a separable box blur at
-`glass.blur_radius` (default 12, 0 = flat tint) frosts it, and the theme
-tint goes over the top — the same frosted look as Windows acrylic, tracking
-the wallpaper and the light/dark `auto` theme. The capture is cached and
-only refreshed when the pill moves or every second, so animated faces stay
-smooth. If capture fails (locked/secure desktop) it falls back to flat.
+back into itself) fills the pill rect, a three-pass box blur at
+`glass.blur_radius` (the standard gaussian approximation — no banding or
+ringing) frosts it, and the theme tint goes over the top. The worker thread
+recaptures every ~140 ms, fast enough that the glass tracks windows moving
+behind the island instead of showing a seconds-stale snapshot. If capture
+fails (locked/secure desktop) it falls back to flat.
 
 On top of the blurred backdrop, baked into the `FrameBuffer` PBGRA before
 `UpdateLayeredWindow(ULW_ALPHA)`:
@@ -113,9 +122,9 @@ On top of the blurred backdrop, baked into the `FrameBuffer` PBGRA before
 2. body — `tint` BGRA at `tint[3]` (180 ~ 0.70) with AA rounded-rect coverage (2×2 supersample)
 3. border — 1px inner stroke `border_alpha` (38 ~ 0.15), tint lightened toward white
 4. highlight — top 1px `highlight_alpha` (70 ~ 0.28)
-5. content — animated face, ring, app icons, session dots (no text anywhere)
+5. content — animated face, live agent activity, media artwork + equalizer bars (no text anywhere)
 
-No `SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND)` — deterministic tint/highlight/shadow, works on remote desktop, falls back to `RenderMode::ColorKey` (magenta `#FF00FF` threshold 128) for broken DIB drivers.
+Uses `SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND)` with Windows 11 `DWMWA_SYSTEMBACKDROP_TYPE` and `DwmEnableBlurBehindWindow` for genuine hardware taskbar blur, with software backdrop compositing fallback for remote desktop, and `RenderMode::ColorKey` (magenta `#FF00FF` threshold 128) for broken DIB drivers.
 
 ### Themes — `themes/*.json` and `auto`
 

@@ -270,8 +270,7 @@ fn main() {
     // on the GUI thread, so hovering and morphing never stall. The worker
     // exits when its receiver is dropped at shutdown.
     let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
-        config.island.is_enabled() && config.island.show_tasks,
-        config.island.max_thumbnails,
+        config.island.is_enabled(),
     ));
     let (thumb_sender, thumb_receiver) = channel();
     let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
@@ -680,12 +679,7 @@ fn present_current(
     ack: Option<&mut AckWriter>,
     backdrop_request: Option<&Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>>>,
 ) {
-    let anchor = if controller.is_island() {
-        let cfg = controller.island_config();
-        Some((cfg.is_attached(), cfg.y_offset))
-    } else {
-        None
-    };
+    let anchor = controller.island_anchor();
     let attempt = if let Some((attached, y_off)) = anchor {
         window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
     } else {
@@ -720,12 +714,7 @@ fn present_current(
                 LogEvent::PresentFailed,
                 window_error_code(&error),
             );
-            let retry_anchor = if controller.is_island() {
-                let cfg = controller.island_config();
-                Some((cfg.is_attached(), cfg.y_offset))
-            } else {
-                None
-            };
+            let retry_anchor = controller.island_anchor();
             let retry = if let Some((attached, y_off)) = retry_anchor {
                 window.present_with_anchor(controller.current_frame(), 1.0, Some((attached, y_off)))
             } else {
@@ -745,12 +734,7 @@ fn present_current(
                         window_error_code(&second),
                     );
                     controller.fallback_to_still();
-                    let fallback_anchor = if controller.is_island() {
-                        let cfg = controller.island_config();
-                        Some((cfg.is_attached(), cfg.y_offset))
-                    } else {
-                        None
-                    };
+                    let fallback_anchor = controller.island_anchor();
                     let _ = if let Some((attached, y_off)) = fallback_anchor {
                         window.present_with_anchor(
                             controller.current_frame(),
@@ -1001,11 +985,7 @@ fn run_gui(
                 window.set_island(config.island.is_enabled());
                 window.set_glass(&config.island.glass);
                 thumb_cfg.enabled.store(
-                    config.island.is_enabled() && config.island.show_tasks,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                thumb_cfg.max_thumbs.store(
-                    config.island.max_thumbnails,
+                    config.island.is_enabled(),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 ControllerActions {
@@ -1045,11 +1025,36 @@ fn run_gui(
                 }
             }
             WindowEvent::ClickAt(x, y) => match controller.handle_click(x, y, now_ms()) {
-                termielle_app::app::ClickOutcome::ActivateWindow(hwnd) => {
-                    activate_window(hwnd);
-                    ControllerActions::default()
+                termielle_app::app::ClickOutcome::MediaToggle => {
+                    termielle_app::tasks::toggle_media_playback();
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
                 }
-                termielle_app::app::ClickOutcome::Expanded
+                termielle_app::app::ClickOutcome::MediaPrev => {
+                    termielle_app::tasks::media_prev_track();
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::MediaNext => {
+                    termielle_app::tasks::media_next_track();
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::ActivateWindow(hwnd) => {
+                    termielle_app::tasks::activate_window(hwnd);
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::AlertDismiss
+                | termielle_app::app::ClickOutcome::Expanded
                 | termielle_app::app::ClickOutcome::Collapsed => ControllerActions {
                     present_frame: true,
                     ..Default::default()
@@ -1063,17 +1068,24 @@ fn run_gui(
                     ..Default::default()
                 }
             }
+            WindowEvent::PressChanged(pressed) => {
+                let changed = controller.set_pressed(pressed, now_ms());
+                ControllerActions {
+                    present_frame: changed,
+                    ..Default::default()
+                }
+            }
             WindowEvent::ToggleTasks => {
-                config.island.show_tasks = !config.island.show_tasks;
+                if config.island.has_widget("music") {
+                    config.island.widgets.retain(|w| w != "music");
+                } else {
+                    config.island.widgets.push("music".to_string());
+                }
                 let _ = save_config_atomic(
                     &data_dir()
                         .map(|d| d.join("config.json"))
                         .unwrap_or_else(|| PathBuf::from("config.json")),
                     config,
-                );
-                thumb_cfg.enabled.store(
-                    config.island.is_enabled() && config.island.show_tasks,
-                    std::sync::atomic::Ordering::Relaxed,
                 );
                 controller.set_island_config(config.island.clone(), now_ms());
                 ControllerActions {
@@ -1213,6 +1225,7 @@ fn run_smoke(
                 | WindowEvent::YOffsetChanged(_)
                 | WindowEvent::SystemThemeChanged
                 | WindowEvent::ClickAt(..)
+                | WindowEvent::PressChanged(_)
                 | WindowEvent::HoverChanged(_)
                 | WindowEvent::ToggleTasks
                 | WindowEvent::ToggleHoverExpand
@@ -1235,26 +1248,6 @@ fn run_smoke(
             window.destroy();
             return 0;
         }
-    }
-}
-
-/// Brings a task window to the foreground: restores it if minimized, then
-/// sets foreground. The ALT tap satisfies the foreground-lock so the call
-/// from our (not foreground) process is honored.
-fn activate_window(hwnd: isize) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, keybd_event};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindow,
-    };
-    let hwnd = windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void);
-    unsafe {
-        if IsIconic(hwnd).as_bool() {
-            let _ = ShowWindow(hwnd, SW_RESTORE);
-        }
-        // The ALT tap marks our input queue as "user interacted", which
-        // allows SetForegroundWindow to take the foreground.
-        keybd_event(0x12, 0, KEYEVENTF_KEYUP, 0);
-        let _ = SetForegroundWindow(hwnd);
     }
 }
 

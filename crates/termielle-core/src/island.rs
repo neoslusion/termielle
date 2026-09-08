@@ -38,6 +38,10 @@ pub struct GlassConfig {
     pub highlight_alpha: u8,
     /// Drop shadow alpha (0-255). 60 ~ 0.24, drawn 2px offset.
     pub shadow_alpha: u8,
+    /// When the layout is a bezel-attached notch, render the body as opaque
+    /// true black so it reads as display hardware, like the real MacBook
+    /// notch and the iOS island (which must fuse with the camera housing).
+    pub notch_black: bool,
 }
 
 impl Default for GlassConfig {
@@ -48,6 +52,7 @@ impl Default for GlassConfig {
             border_alpha: 38,
             highlight_alpha: 70,
             shadow_alpha: 60,
+            notch_black: true,
         }
     }
 }
@@ -148,6 +153,10 @@ pub struct IslandConfig {
     /// When true, hovering the collapsed island expands it (idle only);
     /// leaving collapses it again unless it was manually toggled.
     pub expand_on_hover: bool,
+    /// When true, the island completely hides when idle and unhovered,
+    /// popping down into the pill format on top-edge hover (macOS / iOS behavior).
+    /// When false, it rests as the minimal dot or compact pill.
+    pub auto_hide: bool,
 }
 
 impl Default for IslandConfig {
@@ -171,6 +180,7 @@ impl Default for IslandConfig {
             ring_metric: "battery".to_string(),
             widgets: Self::default_widgets(),
             expand_on_hover: true,
+            auto_hide: false,
         }
     }
 }
@@ -317,9 +327,11 @@ pub fn island_anchored_position(
     let (left, top, right, _bottom) = work;
     let work_w = right - left;
     let x = left + (work_w - width) / 2;
-    let y = if attached { top } else { top + y_offset };
-    // Keep height visible: clamp y so bottom stays in work area is handled by
-    // caller if needed; notch is always at top so no clamp needed.
+    let y = if attached || height <= 4 {
+        top
+    } else {
+        top + y_offset
+    };
     let _ = height;
     (x, y)
 }

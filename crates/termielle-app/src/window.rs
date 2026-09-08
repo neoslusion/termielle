@@ -10,14 +10,17 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
     CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFOEXW,
-    MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject, SetDIBitsToDevice,
+    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MONITORINFOEXW, MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject,
+    SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION,
@@ -26,8 +29,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
     UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_EXITSIZEMOVE, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -138,6 +142,9 @@ pub enum WindowEvent {
     YOffsetChanged(i32),
     /// User clicked the island at frame-local (x, y).
     ClickAt(i32, i32),
+    /// The pointer was pressed down on (`true`) or released from the island,
+    /// for the Dynamic Island press swell.
+    PressChanged(bool),
     /// Cursor entered (`true`) or left (`false`) the island pill.
     HoverChanged(bool),
     /// Tray toggled task thumbnails on/off.
@@ -334,23 +341,36 @@ unsafe extern "system" fn window_proc(
             };
             return LRESULT(value);
         }
-        WM_LBUTTONUP => {
+        WM_LBUTTONDOWN => {
+            // Press feedback: swell the pill while the pointer is held.
+            // Capture so the release is reported even if the swell moves
+            // the pill under the cursor.
             let is_island = unsafe { (*state).is_island };
             if is_island {
                 let (x, y) = lparam_point(lparam);
-                let mut rect = RECT::default();
-                let hit = if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+                let hit = {
                     let alpha = unsafe { (*state).alpha.borrow() };
                     alpha_hit_test(&alpha.bytes, alpha.width, x, y)
-                } else {
-                    HitTestResult::Transparent
                 };
                 if hit == HitTestResult::Caption {
-                    let _ = unsafe {
-                        (*state)
-                            .events
-                            .send(WindowEvent::ClickAt(x - rect.left, y - rect.top))
-                    };
+                    let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(true)) };
+                    let _ = unsafe { SetCapture(hwnd) };
+                    return LRESULT(0);
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            let is_island = unsafe { (*state).is_island };
+            if is_island {
+                let _ = unsafe { ReleaseCapture() };
+                let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(false)) };
+                let (x, y) = lparam_point(lparam);
+                let hit = {
+                    let alpha = unsafe { (*state).alpha.borrow() };
+                    alpha_hit_test(&alpha.bytes, alpha.width, x, y)
+                };
+                if hit == HitTestResult::Caption {
+                    let _ = unsafe { (*state).events.send(WindowEvent::ClickAt(x, y)) };
                     return LRESULT(0);
                 }
             }
@@ -456,17 +476,20 @@ unsafe extern "system" fn window_proc(
                 if unsafe { GetCursorPos(&mut point) }.is_ok()
                     && unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok()
                 {
-                    let alpha = unsafe { (*state).alpha.borrow() };
-                    if alpha_hit_test(
-                        &alpha.bytes,
-                        alpha.width,
-                        point.x - rect.left,
-                        point.y - rect.top,
-                    ) == HitTestResult::Caption
-                    {
-                        if let Ok(hand) = unsafe { LoadCursorW(None, IDC_HAND) } {
-                            unsafe { SetCursor(Some(hand)) };
-                            return LRESULT(1);
+                    let height = rect.bottom - rect.top;
+                    if height > 4 {
+                        let alpha = unsafe { (*state).alpha.borrow() };
+                        if alpha_hit_test(
+                            &alpha.bytes,
+                            alpha.width,
+                            point.x - rect.left,
+                            point.y - rect.top,
+                        ) == HitTestResult::Caption
+                        {
+                            if let Ok(hand) = unsafe { LoadCursorW(None, IDC_HAND) } {
+                                unsafe { SetCursor(Some(hand)) };
+                                return LRESULT(1);
+                            }
                         }
                     }
                 }
@@ -855,14 +878,16 @@ impl OverlayWindow {
 
     fn clamped_position(&self, width: i32, height: i32, preferred: (i32, i32)) -> (i32, i32) {
         let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
-        let mut info = MONITORINFOEXW::default();
-        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
             let work = Rect {
-                left: info.monitorInfo.rcWork.left,
-                top: info.monitorInfo.rcWork.top,
-                right: info.monitorInfo.rcWork.right,
-                bottom: info.monitorInfo.rcWork.bottom,
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
             };
             return clamp_to_work_area(preferred, (width, height), work);
         }
@@ -924,14 +949,16 @@ impl OverlayWindow {
                 MONITOR_DEFAULTTOPRIMARY,
             )
         };
-        let mut info = MONITORINFOEXW::default();
-        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
             let work = (
-                info.monitorInfo.rcWork.left,
-                info.monitorInfo.rcWork.top,
-                info.monitorInfo.rcWork.right,
-                info.monitorInfo.rcWork.bottom,
+                info.rcWork.left,
+                info.rcWork.top,
+                info.rcWork.right,
+                info.rcWork.bottom,
             );
             return island_anchored_position(width, height, attached, y_offset, work);
         }
@@ -994,62 +1021,79 @@ impl OverlayWindow {
             None
         };
 
+        let is_hidden_sensor = scaled_h <= 4;
         let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
         let len = scaled_w as usize * scaled_h as usize * 4;
         let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, len) };
-        match backdrop.as_ref() {
-            Some(bg) => {
-                for yy in 0..scaled_h {
-                    for xx in 0..scaled_w {
-                        let source_x = (xx * frame.width / scaled_w) as usize;
-                        let source_y = (yy * frame.height / scaled_h) as usize;
-                        let source = &frame.pixels_pbgra
-                            [(source_y * frame.width as usize + source_x) * 4..][..4];
-                        let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
-                        if source[3] == 0 {
-                            // Outside the pill: stay fully transparent so clicks
-                            // pass through and the desktop shows untouched.
-                            dst[target..target + 4].fill(0);
-                        } else {
-                            // Sample the backdrop proportionally and clamped:
-                            // during morphs the stored backdrop was captured
-                            // for the previous pill size, and blur hides the
-                            // stretch. Never panics on size mismatch.
-                            let bx = ((u64::from(xx) * u64::from(bg.width)) / u64::from(scaled_w))
+        if is_hidden_sensor {
+            // Assign alpha = 1 for the hidden sensor: 1/255 opacity is completely invisible
+            // to the human eye, but ensures Windows DWM treats the window as an active
+            // mouse hit target and dispatches WM_NCHITTEST / WM_MOUSEMOVE to window_proc.
+            for px in dst.chunks_exact_mut(4) {
+                px[0] = 0;
+                px[1] = 0;
+                px[2] = 0;
+                px[3] = 1;
+            }
+            alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
+        } else {
+            match backdrop.as_ref() {
+                Some(bg) => {
+                    for yy in 0..scaled_h {
+                        for xx in 0..scaled_w {
+                            let source_x = (xx * frame.width / scaled_w) as usize;
+                            let source_y = (yy * frame.height / scaled_h) as usize;
+                            let source = &frame.pixels_pbgra
+                                [(source_y * frame.width as usize + source_x) * 4..][..4];
+                            let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                            if source[3] == 0 {
+                                // Outside the pill: stay fully transparent so clicks
+                                // pass through and the desktop shows untouched.
+                                dst[target..target + 4].fill(0);
+                            } else {
+                                // Sample the backdrop proportionally and clamped:
+                                // during morphs the stored backdrop was captured
+                                // for the previous pill size, and blur hides the
+                                // stretch. Never panics on size mismatch.
+                                let bx = ((u64::from(xx) * u64::from(bg.width))
+                                    / u64::from(scaled_w))
                                 .min(u64::from(bg.width.saturating_sub(1)))
-                                as usize;
-                            let by = ((u64::from(yy) * u64::from(bg.height)) / u64::from(scaled_h))
+                                    as usize;
+                                let by = ((u64::from(yy) * u64::from(bg.height))
+                                    / u64::from(scaled_h))
                                 .min(u64::from(bg.height.saturating_sub(1)))
-                                as usize;
-                            let bi = (by * bg.width as usize + bx) * 4;
-                            let ia = 255 - u32::from(source[3]);
-                            dst[target] = (u32::from(source[0])
-                                + u32::from(bg.pixels.get(bi).copied().unwrap_or(0)) * ia / 255)
-                                as u8;
-                            dst[target + 1] = (u32::from(source[1])
-                                + u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0)) * ia / 255)
-                                as u8;
-                            dst[target + 2] = (u32::from(source[2])
-                                + u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0)) * ia / 255)
-                                as u8;
-                            dst[target + 3] = 255;
+                                    as usize;
+                                let bi = (by * bg.width as usize + bx) * 4;
+                                let ia = 255 - u32::from(source[3]);
+                                let bg_b = u32::from(bg.pixels.get(bi).copied().unwrap_or(0));
+                                let bg_g = u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0));
+                                let bg_r = u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0));
+                                dst[target] = (u32::from(source[0]) + bg_b * ia / 255) as u8;
+                                dst[target + 1] = (u32::from(source[1]) + bg_g * ia / 255) as u8;
+                                dst[target + 2] = (u32::from(source[2]) + bg_r * ia / 255) as u8;
+                                // Once the desktop backdrop is blended in, the pixel is fully composited.
+                                // Set opaque alpha (255) for interior pixels (source[3] >= 240) so DWM does
+                                // not double-blend the desktop underneath. Outer anti-aliased edge pixels
+                                // preserve source alpha for smooth edge blending into the screen.
+                                dst[target + 3] = if source[3] >= 240 { 255 } else { source[3] };
+                            }
+                            // Hit-testing still follows the frame's own alpha, so the
+                            // rounded corners stay click-through.
+                            alpha_map.push(source[3]);
                         }
-                        // Hit-testing still follows the frame's own alpha, so the
-                        // rounded corners stay click-through.
-                        alpha_map.push(source[3]);
                     }
                 }
-            }
-            None => {
-                for yy in 0..scaled_h {
-                    for xx in 0..scaled_w {
-                        let source_x = (xx * frame.width / scaled_w) as usize;
-                        let source_y = (yy * frame.height / scaled_h) as usize;
-                        let source = &frame.pixels_pbgra
-                            [(source_y * frame.width as usize + source_x) * 4..][..4];
-                        let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
-                        dst[target..target + 4].copy_from_slice(source);
-                        alpha_map.push(source[3]);
+                None => {
+                    for yy in 0..scaled_h {
+                        for xx in 0..scaled_w {
+                            let source_x = (xx * frame.width / scaled_w) as usize;
+                            let source_y = (yy * frame.height / scaled_h) as usize;
+                            let source = &frame.pixels_pbgra
+                                [(source_y * frame.width as usize + source_x) * 4..][..4];
+                            let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                            dst[target..target + 4].copy_from_slice(source);
+                            alpha_map.push(source[3]);
+                        }
                     }
                 }
             }
@@ -1131,19 +1175,31 @@ impl OverlayWindow {
         // padded), and `SetDIBitsToDevice` reads rows at the padded stride:
         // a buffer without the padding shifts every row by one byte and
         // renders diagonal garbage.
+        let is_hidden_sensor = scaled_h <= 4;
         let stride = dib_stride(scaled_w);
         let mut rgb = vec![0u8; stride * scaled_h as usize];
         let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
-        for y in 0..scaled_h {
-            for x in 0..scaled_w {
-                let source_x = (x * frame.width / scaled_w) as usize;
-                let source_y = (y * frame.height / scaled_h) as usize;
-                let source =
-                    &frame.pixels_pbgra[(source_y * frame.width as usize + source_x) * 4..][..4];
-                let target = y as usize * stride + x as usize * 3;
-                rgb[target..target + 3]
-                    .copy_from_slice(&straight_or_key(source[3], source[0], source[1], source[2]));
-                alpha_map.push(source[3]);
+        if is_hidden_sensor {
+            for y in 0..scaled_h {
+                for x in 0..scaled_w {
+                    let target = y as usize * stride + x as usize * 3;
+                    rgb[target..target + 3].copy_from_slice(&COLOR_KEY_BGRA);
+                }
+            }
+            alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
+        } else {
+            for y in 0..scaled_h {
+                for x in 0..scaled_w {
+                    let source_x = (x * frame.width / scaled_w) as usize;
+                    let source_y = (y * frame.height / scaled_h) as usize;
+                    let source = &frame.pixels_pbgra
+                        [(source_y * frame.width as usize + source_x) * 4..][..4];
+                    let target = y as usize * stride + x as usize * 3;
+                    rgb[target..target + 3].copy_from_slice(&straight_or_key(
+                        source[3], source[0], source[1], source[2],
+                    ));
+                    alpha_map.push(source[3]);
+                }
             }
         }
 
@@ -1311,6 +1367,29 @@ mod tests {
         // A semi-transparent magenta pixel must convert back to the key
         // color itself so it does not leak a tinted fringe.
         assert_eq!(straight_or_key(200, 200, 0, 200), COLOR_KEY_BGRA);
+    }
+
+    #[test]
+    fn test_window_position_after_present() {
+        let mut config = AppConfig::default();
+        config.island.layout = IslandLayout::Island;
+        let mut win = OverlayWindow::create(&config, false).unwrap();
+        let frame = FrameBuffer {
+            width: 140,
+            height: 36,
+            pixels_pbgra: vec![255; 140 * 36 * 4],
+            delay_ms: 0,
+            loop_index: 0,
+        };
+        win.present_with_anchor(&frame, 1.0, Some((false, 10)))
+            .unwrap();
+        let (rect, mon) = win.position();
+        println!("Window pos: {:?}, monitor: {}", rect, mon);
+        let vis = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(win.hwnd) };
+        println!("IsWindowVisible: {}", vis.as_bool());
+        assert!(vis.as_bool());
+        assert_eq!(rect.width(), 140);
+        assert_eq!(rect.height(), 36);
     }
 }
 

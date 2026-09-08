@@ -7,8 +7,8 @@
 //! filled with the theme tint first, so the blur has defined edges.
 //!
 //! Cost is trivial for pill sizes (720x56): a separable box blur at radius
-//! 12 is ~2M ops, well under a millisecond. The window caches the capture
-//! and only re-captures when the geometry moves or the cache ages out.
+//! 24 is ~3.4M ops on the worker thread. The window caches the capture and
+//! only re-captures when the geometry moves or the cache ages out.
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
@@ -141,7 +141,6 @@ pub fn box_blur(backdrop: &mut Backdrop, radius: u32) {
     for y in 0..h {
         let row = y * w;
         let mut sum = [0u32; 3];
-        // Seed the window [0, r].
         for sx in 0..=r.min(w - 1) {
             let i = (row + sx) * 4;
             sum[0] += backdrop.pixels[i] as u32;
@@ -154,7 +153,6 @@ pub fn box_blur(backdrop: &mut Backdrop, radius: u32) {
             tmp[o] = (sum[0] / count) as u8;
             tmp[o + 1] = (sum[1] / count) as u8;
             tmp[o + 2] = (sum[2] / count) as u8;
-            // Slide: add x+r+1, drop x-r.
             let add = x + r + 1;
             if add < w {
                 let i = (row + add) * 4;
@@ -209,6 +207,19 @@ pub fn box_blur(backdrop: &mut Backdrop, radius: u32) {
     }
 }
 
+/// Three-pass box blur at a third of the radius — the standard box
+/// approximation of a gaussian. A single wide box pass rings and bands;
+/// three narrow passes produce the smooth falloff of real frosted glass.
+pub fn blur_soft(backdrop: &mut Backdrop, radius: u32) {
+    if radius == 0 || backdrop.width == 0 || backdrop.height == 0 {
+        return;
+    }
+    let pass = (radius / 3).max(1);
+    for _ in 0..3 {
+        box_blur(backdrop, pass);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +245,39 @@ mod tests {
         let before = bg.pixels.clone();
         box_blur(&mut bg, 0);
         assert_eq!(bg.pixels, before);
+    }
+
+    #[test]
+    fn blur_soft_smooths_like_a_gaussian() {
+        // A checkerboard blurred by blur_soft must lose its extremes
+        // entirely — the three-pass approximation of a gaussian has no
+        // ringing, which is what makes single wide box passes band.
+        let w = 32u32;
+        let h = 32u32;
+        let mut bg = Backdrop {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 4) as usize],
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                let v = if (x / 4 + y / 4) % 2 == 0 { 0u8 } else { 255u8 };
+                bg.pixels[i] = v;
+                bg.pixels[i + 1] = v;
+                bg.pixels[i + 2] = v;
+                bg.pixels[i + 3] = 255;
+            }
+        }
+        blur_soft(&mut bg, 12);
+        assert!(
+            bg.pixels
+                .iter()
+                .all(|&b| (0..=255).contains(&b) && (b == 255 || b < 250))
+        );
+        let min = bg.pixels.iter().copied().min().unwrap();
+        let max = bg.pixels.iter().copied().max().unwrap();
+        assert!(max - min < 255, "blur must remove the checker extremes");
     }
 
     #[test]
