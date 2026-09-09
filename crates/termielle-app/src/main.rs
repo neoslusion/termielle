@@ -19,9 +19,9 @@ use termielle_app::theme;
 use termielle_app::tray;
 use termielle_app::window::{AnimationClock, OverlayWindow, WakeHandle, WindowError, WindowEvent};
 use termielle_core::{
-    AppConfig, AssetCatalog, DEFAULT_EVENT_LOG_MAX_BYTES, EventKind, EventLog, EventMessage,
-    PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode, Source, VisualState,
-    decode_event_line, encode_event_line, load_config, save_config_atomic,
+    AppConfig, AssetCatalog, BarPosition, DEFAULT_EVENT_LOG_MAX_BYTES, EventKind, EventLog,
+    EventMessage, IslandLayout, PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode,
+    Source, VisualState, decode_event_line, encode_event_line, load_config, save_config_atomic,
 };
 use termielle_ipc::{DEFAULT_PIPE_NAME, EventClient, EventServer, IpcError};
 use windows::Win32::Foundation::{
@@ -84,6 +84,9 @@ struct Cli {
     pipe: String,
     ack_file: Option<PathBuf>,
     render: Option<RenderMode>,
+    layout: Option<IslandLayout>,
+    bar_pos: Option<BarPosition>,
+    replace_taskbar: Option<bool>,
 }
 
 impl Cli {
@@ -94,6 +97,9 @@ impl Cli {
         let mut pipe = String::from(DEFAULT_PIPE_NAME);
         let mut ack_file = None;
         let mut render = None;
+        let mut layout = None;
+        let mut bar_pos = None;
+        let mut replace_taskbar = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -107,6 +113,30 @@ impl Cli {
                         _ => None,
                     };
                 }
+                "--bar" => layout = Some(IslandLayout::Bar),
+                "--island" => layout = Some(IslandLayout::Island),
+                "--notch" => layout = Some(IslandLayout::Notch),
+                "--classic" => layout = Some(IslandLayout::Classic),
+                "--layout" => {
+                    layout = match iter.next().as_deref() {
+                        Some("bar") => Some(IslandLayout::Bar),
+                        Some("island") => Some(IslandLayout::Island),
+                        Some("notch") => Some(IslandLayout::Notch),
+                        Some("classic") => Some(IslandLayout::Classic),
+                        _ => None,
+                    };
+                }
+                "--top" => bar_pos = Some(BarPosition::Top),
+                "--bottom" => bar_pos = Some(BarPosition::Bottom),
+                "--bar-pos" => {
+                    bar_pos = match iter.next().as_deref() {
+                        Some("top") => Some(BarPosition::Top),
+                        Some("bottom") => Some(BarPosition::Bottom),
+                        _ => None,
+                    };
+                }
+                "--replace-taskbar" => replace_taskbar = Some(true),
+                "--keep-taskbar" => replace_taskbar = Some(false),
                 _ => {}
             }
         }
@@ -115,6 +145,9 @@ impl Cli {
             pipe,
             ack_file,
             render,
+            layout,
+            bar_pos,
+            replace_taskbar,
         }
     }
 }
@@ -161,6 +194,13 @@ fn main() {
             if cli.smoke_test {
                 std::process::exit(3);
             }
+            unsafe {
+                unsafe extern "system" {
+                    fn AttachConsole(dw_process_id: u32) -> windows::core::BOOL;
+                }
+                let _ = AttachConsole(u32::MAX);
+            }
+            eprintln!("Another Termielle instance is already running. Close it before launching, or switch layout via the system tray icon.");
             return;
         }
     };
@@ -168,13 +208,31 @@ fn main() {
     let log = Arc::new(Mutex::new(BoundedLog::new(log_path(), 1_048_576, 3)));
 
     let mut config = load_config_with_log(&log);
-    // Resolve island theme (builtin + file overlay)
-    theme::resolve_theme(&mut config.island);
 
-    // The command line wins over the persisted file: a doctor run can force a
-    // renderer without touching the user's config.
+    // The command line wins over the persisted file:
     if let Some(render) = cli.render {
         config.render = render;
+    }
+    let layout_cli_override = cli.layout.is_some() || cli.bar_pos.is_some() || cli.replace_taskbar.is_some();
+    if let Some(layout) = cli.layout {
+        config.island.layout = layout;
+    }
+    if let Some(pos) = cli.bar_pos {
+        config.island.bar.position = pos;
+    }
+    if let Some(replace) = cli.replace_taskbar {
+        config.island.bar.replace_taskbar = replace;
+    }
+    config.island.clamp();
+    theme::resolve_theme(&mut config.island);
+
+    if layout_cli_override {
+        let _ = save_config_atomic(
+            &data_dir()
+                .map(|d| d.join("config.json"))
+                .unwrap_or_else(|| PathBuf::from("config.json")),
+            &config,
+        );
     }
 
     let mut window =

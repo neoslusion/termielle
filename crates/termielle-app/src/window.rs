@@ -796,15 +796,16 @@ impl OverlayWindow {
         self.draw_color_key(frame)
     }
 
-    /// Presents a status bar frame, anchored to the top or bottom of the monitor work area.
+    /// Presents a status bar frame, anchored to the top or bottom of the monitor screen.
     pub fn present_with_bar(
         &mut self,
         frame: &FrameBuffer,
         position: termielle_core::BarPosition,
     ) -> Result<(), WindowError> {
         let (w, h) = (frame.width, frame.height);
-        let work = self.monitor_work_area();
-        let (x, y) = termielle_core::bar_anchored_position(h as i32, position, work);
+        let bounds = self.monitor_bounds();
+        let screen = (bounds.left, bounds.top, bounds.right, bounds.bottom);
+        let (x, y) = termielle_core::bar_anchored_position(h as i32, position, screen);
         if self.render == RenderMode::PerPixel {
             self.repositioned = true;
             self.last_dest = (x, y, w, h);
@@ -1108,8 +1109,8 @@ impl OverlayWindow {
 
     /// Monitor width in physical pixels.
     pub fn monitor_width(&mut self) -> u32 {
-        let work = self.monitor_work_area();
-        (work.2 - work.0).max(1) as u32
+        let bounds = self.monitor_bounds();
+        (bounds.right - bounds.left).max(1) as u32
     }
 
     /// Raw Win32 HWND handle.
