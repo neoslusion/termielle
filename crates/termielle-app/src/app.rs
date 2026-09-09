@@ -10,14 +10,16 @@ use crate::animation::{
     AnimationError, AnimationSource, FrameBuffer, GifAnimation, fallback_frame,
 };
 use crate::tasks::{MediaInfo, WorkerUpdate};
+use crate::window::scaled_size;
+use std::collections::VecDeque;
 use termielle_core::{
     AssetCatalog, EventMessage, IslandConfig, SessionReducer, VisualState, spring_params,
 };
 
 /// Edge length of the cached termielle face. Larger than any display size
-/// (faces show at <= 32 logical px), so the downsample stays crisp and a
-/// scaled-up present still resolves real detail instead of blur.
-const FACE_SIZE: u32 = 64;
+/// (faces show at <= 32 logical px, so 96 stays crisp through render scales
+/// up to 3x), so the downsample always resolves real detail instead of blur.
+const FACE_SIZE: u32 = 96;
 
 /// Square edge length of procedural fallback frames.
 pub const FALLBACK_FRAME_SIZE: u32 = 360;
@@ -237,16 +239,30 @@ impl Spring1 {
 /// liquid bridge.
 const BLOB_GAP_PX: f32 = 9.0;
 
-/// Cache key for the frosted-glass layer: geometry, material, and blob layout.
-type GlassCacheKey = (u32, u32, u32, bool, bool, u32, i32, u32);
+/// Procedural-motion repaint cadence in ms (~20 fps): thinking bounce,
+/// worker orbit, input pulse, celebration/shake one-shots, and the media
+/// equalizer all ride this clock so they move even with no other deadline
+/// pending. Cheap (cached glass, one present) and idle-silent.
+const MOTION_TICK_MS: u64 = 50;
+
+/// Cache key for the frosted-glass layer: geometry, material, blob layout,
+/// and the authoring scale — a DPI or zoom change misses and rebuilds
+/// instead of presenting stale-resolution glass.
+type GlassCacheKey = (u32, u32, u32, bool, bool, u32, i32, u32, u32);
+
+/// How many notification banners queue behind the showing one; arrivals
+/// beyond that drop the longest-waiting unseen banner, never the showing one.
+const MAX_QUEUED_ALERTS: usize = 3;
 
 /// Transient alert banner displayed in the Dynamic Island on notifications.
+
 #[derive(Clone, Debug)]
 pub struct AlertBanner {
     pub title: String,
     pub subtitle: String,
     pub accent: [u8; 4],
     pub expires_at_ms: u64,
+    pub duration_ms: u64,
 }
 
 /// Ties the session reducer, the animation pipeline, and one deadline together.
@@ -264,6 +280,8 @@ pub struct Controller {
     current: FrameBuffer,
     /// When the next GIF frame is due; `None` for stills and reduced motion.
     frame_deadline: Option<u64>,
+    /// Next procedural-motion repaint; `None` when nothing moves.
+    motion_deadline: Option<u64>,
     /// Fixed interval between animation frames in milliseconds; when set, it
     /// overrides each frame's GIF delay so the animation plays at a constant
     /// frame rate (e.g. 60 fps) instead of the file's own timing.
@@ -319,8 +337,12 @@ pub struct Controller {
     media: Option<MediaInfo>,
     /// Open window task icons from the background worker.
     tasks: Vec<crate::tasks::TaskIcon>,
-    /// Transient notification alert banner.
-    alert: Option<AlertBanner>,
+    /// Queued notification alert banners; the front one shows.
+    alerts: VecDeque<AlertBanner>,
+    /// Last controller-clock time, for renders without their own timestamp.
+    clock_ms: u64,
+    /// When the current visual state began, for one-shot state effects.
+    state_since_ms: u64,
     /// Monitor DPI scale (physical px per logical px), refreshed from the
     /// window on every present. 1.0 until the first present.
     dpi_scale: f32,
@@ -358,9 +380,9 @@ impl Controller {
         island: IslandConfig,
     ) -> Self {
         let state = VisualState::Idle;
-        let face_frame = fallback_frame(state, FACE_SIZE);
+        let face_frame = fallback_frame(state, FACE_SIZE, 1.0);
         // Overwritten below for both island and classic modes.
-        let still = fallback_frame(state, FALLBACK_FRAME_SIZE);
+        let still = fallback_frame(state, FALLBACK_FRAME_SIZE, 1.0);
         let (current, animation, frame_deadline) =
             (still.clone(), AnimationSource::Still(still), None);
         let radius = island.height as f32 / 2.0;
@@ -372,6 +394,7 @@ impl Controller {
             animation,
             current,
             frame_deadline,
+            motion_deadline: None,
             frame_interval_ms,
             present_cost_ms: 0,
             island,
@@ -393,14 +416,16 @@ impl Controller {
             media: None,
             tasks: Vec::new(),
             glass_cache: None,
-            alert: None,
+            clock_ms: 0,
+            state_since_ms: 0,
+            alerts: VecDeque::new(),
             dpi_scale: 1.0,
             user_scale: 1.0,
         };
         if controller.island.is_enabled() {
             controller.refresh_face(state);
             let (w, h) = controller.target_size(state);
-            controller.current = controller.render_island(state, w, h);
+            controller.current = controller.render_island(state, w, h, 0);
             controller.arm_face_deadline(0);
         } else {
             let _ = controller.load_animation_classic(VisualState::Idle, 0);
@@ -419,7 +444,7 @@ impl Controller {
         self.face_idx = 0;
         self.face_deadline = None;
         self.face_decoder = None;
-        self.face_frame = fallback_frame(state, FACE_SIZE);
+        self.face_frame = fallback_frame(state, FACE_SIZE, 1.0);
         let Some(path) = self.assets.resolve(state) else {
             return;
         };
@@ -465,7 +490,12 @@ impl Controller {
     /// Advances the face animation one step and re-renders the current pill:
     /// decodes one more loop frame while filling, then cycles the cache.
     fn advance_face(&mut self, now_ms: u64) {
-        // Fill one more loop frame per tick (one WIC decode ≈ 1ms).
+        if self.presentation() == crate::animation::notch::Presentation::Hidden {
+            // Invisible top-edge sensor: keep the tick cadence (and the
+            // background loop fill above), skip the pixels nobody sees.
+            self.arm_face_deadline(now_ms);
+            return;
+        }
         if let Some(gif) = self.face_decoder.as_mut() {
             let done = match gif.next_frame() {
                 Ok(frame) if frame.loop_index == 0 && self.face_frames.len() < 120 => {
@@ -503,8 +533,8 @@ impl Controller {
             .unwrap_or(40)
             .max(20);
         self.face_deadline = Some(now_ms.saturating_add(delay as u64));
-        let (w, h) = (self.current.width, self.current.height);
-        self.current = self.render_island(self.state, w, h);
+        let (w, h) = self.current_logical_size();
+        self.current = self.render_island(self.state, w, h, now_ms);
         self.animation = AnimationSource::Still(self.current.clone());
     }
 
@@ -516,19 +546,19 @@ impl Controller {
     /// the presentation content composited over it so content rides the
     /// morph, then the accent strip. Icon hit-rects are recorded for click
     /// activation.
-    fn render_island(&mut self, state: VisualState, width: u32, height: u32) -> FrameBuffer {
+    fn render_island(
+        &mut self,
+        state: VisualState,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) -> FrameBuffer {
         use crate::animation::notch::Presentation;
 
         let presentation = self.presentation();
         if presentation == Presentation::Hidden || height <= 4 {
             self.icon_hits.clear();
-            return FrameBuffer {
-                width,
-                height,
-                pixels_pbgra: vec![0; (width * height * 4) as usize],
-                delay_ms: 0,
-                loop_index: 0,
-            };
+            return self.blank_frame(width, height);
         }
         if self.spring.is_none() {
             self.radius = self.target_radius();
@@ -544,13 +574,7 @@ impl Controller {
         // composited with an enter alpha (plus a slight rise for the
         // expanded card), so it fades and settles with the spring instead
         // of popping when the container lands.
-        let mut content = FrameBuffer {
-            width,
-            height,
-            pixels_pbgra: vec![0; (width * height * 4) as usize],
-            delay_ms: 0,
-            loop_index: 0,
-        };
+        let mut content = self.blank_frame(width, height);
         self.render_content(
             &mut content,
             state,
@@ -559,9 +583,12 @@ impl Controller {
             width,
             height,
             &blobs,
+            now_ms,
         );
-        let (alpha, dy) = Self::content_motion(self.spring.as_ref(), presentation);
-        crate::animation::notch::blend_frame_over(&mut frame, &content, dy, alpha);
+        let age_ms = now_ms.saturating_sub(self.state_since_ms);
+        let (alpha, dx, dy) =
+            Self::content_motion(self.spring.as_ref(), presentation, state, age_ms);
+        crate::animation::notch::blend_frame_over(&mut frame, &content, dx, dy, alpha);
 
         // Accent strip: agent state color; accent color while media plays.
         // Part of the silhouette, so it never fades with the content.
@@ -572,6 +599,17 @@ impl Controller {
             crate::system::accent_color_bgra()
         } else {
             return frame;
+        };
+        // Awaiting input breathes: the strip pulses slowly so "waiting"
+        // never reads as dead.
+        let strip = if state == VisualState::NeedsInput {
+            let pulse =
+                (0.5 + 0.5 * (now_ms as f32 / 450.0 * std::f32::consts::TAU).sin()).clamp(0.0, 1.0);
+            let mut lit = strip;
+            lit[3] = (140.0 + 115.0 * pulse).round() as u8;
+            lit
+        } else {
+            strip
         };
         crate::animation::notch::draw_accent_strip(&mut frame, attached, radius, strip);
         frame
@@ -584,10 +622,13 @@ impl Controller {
     fn content_motion(
         spring: Option<&Spring2D>,
         presentation: crate::animation::notch::Presentation,
-    ) -> (u8, i32) {
+        state: VisualState,
+        state_age_ms: u64,
+    ) -> (u8, i32, i32) {
         use crate::animation::notch::Presentation;
+        let dx = Self::shake_dx(state, state_age_ms);
         let Some(spring) = spring else {
-            return (255, 0);
+            return (255, dx, 0);
         };
         let p = spring.progress();
         let dip = (1.0 - 0.45 * (p * std::f32::consts::PI).sin()).clamp(0.0, 1.0);
@@ -596,7 +637,53 @@ impl Controller {
             Presentation::Expanded => ((1.0 - p) * 6.0).round() as i32,
             _ => 0,
         };
-        (alpha, dy)
+        (alpha, dx, dy)
+    }
+
+    /// Damped horizontal shake for failed turns: ±4 px decaying over 300 ms,
+    /// then exactly zero so settled frames stay pixel-stable.
+    fn shake_dx(state: VisualState, age_ms: u64) -> i32 {
+        if state != VisualState::Failed || age_ms >= 300 {
+            return 0;
+        }
+        let age = age_ms as f32;
+        (4.0 * (-age / 90.0).exp() * (age * 0.22).sin()).round() as i32
+    }
+
+    /// Vertical bounce for thinking dots: staggered sine, ±2 px. Zero for
+    /// every other state so settled frames stay pixel-stable.
+    fn think_bob(state: VisualState, index: usize, now_ms: u64) -> i32 {
+        if state != VisualState::Thinking {
+            return 0;
+        }
+        (2.0 * ((now_ms as f32 / 240.0) + index as f32 * 2.1).sin()).round() as i32
+    }
+
+    /// Worker orbit position: dots circle the face while tools run.
+    /// Positions only; the caller gates on Working and paints.
+    fn orbit_dot(cx: i32, cy: i32, radius: i32, index: u32, now_ms: u64) -> (i32, i32) {
+        let a = now_ms as f32 / 600.0 * std::f32::consts::TAU + index as f32 * 2.094;
+        (
+            cx + (radius as f32 * a.cos()).round() as i32,
+            cy + (radius as f32 * a.sin()).round() as i32,
+        )
+    }
+
+    /// Celebration sparkle after a turn completes: one of 8 dots flying out
+    /// from (`cx`, `cy`) over 600 ms with fading alpha, then `None` forever.
+    /// Deterministic in age: no particle state to keep.
+    fn sparkle_dot(cx: i32, cy: i32, index: u32, age_ms: u64) -> Option<(i32, i32, u8)> {
+        if age_ms >= 600 {
+            return None;
+        }
+        let t = age_ms as f32 / 600.0;
+        let a = index as f32 * std::f32::consts::TAU / 8.0;
+        let r = 6.0 + 20.0 * t;
+        Some((
+            cx + (r * a.cos()).round() as i32,
+            cy + (r * a.sin()).round() as i32,
+            ((1.0 - t) * 255.0).round() as u8,
+        ))
     }
 
     /// Draws the presentation content (alert card, face, session dots,
@@ -613,20 +700,20 @@ impl Controller {
         width: u32,
         height: u32,
         blobs: &[crate::animation::notch::BlobRect],
+        now_ms: u64,
     ) {
         use crate::animation::notch::Presentation;
         let cy = (height / 2) as i32;
         let accent = crate::system::accent_color_bgra();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        let now = now_ms;
+        // A paused equalizer holds its pose instead of performing playback.
+        let eq_now = if self.media_playing() { now } else { 0 };
 
         // Render according to the active iOS/macOS presentation class.
         self.icon_hits.clear();
 
         // 0. Active Notification Alert Banner
-        if let Some(alert) = &self.alert {
+        if let Some(alert) = self.alerts.front() {
             let pad = 18i32;
 
             if height >= 85 {
@@ -660,11 +747,11 @@ impl Controller {
                 };
                 crate::animation::notch::draw_text(
                     frame,
-                    "SYSTEM NOTIFICATION",
+                    "System Notification",
                     tag_x,
                     15,
                     width.saturating_sub((tag_x as u32) + 40),
-                    9,
+                    10,
                     true,
                     [alert.accent[0], alert.accent[1], alert.accent[2], 255],
                 );
@@ -699,7 +786,7 @@ impl Controller {
                     text_w,
                     15,
                     true,
-                    [255, 255, 255, 255],
+                    self.ink(),
                 );
                 crate::animation::notch::draw_text(
                     frame,
@@ -709,8 +796,29 @@ impl Controller {
                     text_w,
                     12,
                     false,
-                    [185, 190, 205, 220],
+                    self.ink_dim(),
                 );
+
+                // Timeout hairline: the banner's remaining life, so the
+                // auto-dismiss reads as intentional rather than a flicker.
+                let frac = if alert.duration_ms == 0 {
+                    0.0
+                } else {
+                    alert.expires_at_ms.saturating_sub(now) as f32 / alert.duration_ms as f32
+                }
+                .clamp(0.0, 1.0);
+                let hair_w =
+                    ((width.saturating_sub((pad as u32) * 2)) as f32 * frac).round() as u32;
+                if hair_w > 0 {
+                    crate::animation::notch::fill_rect_pub(
+                        frame,
+                        pad,
+                        height as i32 - 4,
+                        hair_w,
+                        2,
+                        [alert.accent[0], alert.accent[1], alert.accent[2], 200],
+                    );
+                }
 
                 // Bottom accent pill bar
                 if height >= 105 {
@@ -789,6 +897,7 @@ impl Controller {
                                 pixels_pbgra: thumb.pixels_pbgra.clone(),
                                 delay_ms: 0,
                                 loop_index: 0,
+                                scale: 1.0,
                             },
                             art_x,
                             cy - art_size / 2,
@@ -808,7 +917,7 @@ impl Controller {
                     // Mini equalizer bars
                     let eq_x = (width as i32 / 2) + 6;
                     for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                        let t = ((now.saturating_add(phase) % 800) as f32 / 800.0)
+                        let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
                             * std::f32::consts::TAU;
                         let h = (3.0 + 5.0 * (t + i as f32).sin().abs()).round() as i32;
                         crate::animation::notch::fill_rect_pub(
@@ -861,6 +970,17 @@ impl Controller {
                             face_size as u32,
                             face_size as u32,
                         );
+                        if state == VisualState::Working {
+                            // Worker orbit: three dots circle the face while
+                            // tools run.
+                            let (wc, _) = crate::animation::notch::accent_colors(state);
+                            let ocx = face_x + face_size / 2;
+                            for i in 0..3u32 {
+                                let (odx, ody) =
+                                    Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
+                                crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
+                            }
+                        }
                     }
                     if state != VisualState::Idle || self.reducer.session_count() > 0 {
                         let (dot, _) = crate::animation::notch::accent_colors(state);
@@ -870,8 +990,9 @@ impl Controller {
                             1
                         };
                         let mut dot_x = primary.x + primary.w as i32 - 16;
-                        for _ in 0..count {
-                            crate::animation::notch::draw_disc(frame, dot_x, cy, 3, dot);
+                        for i in 0..count {
+                            let dy = Self::think_bob(state, i, now);
+                            crate::animation::notch::draw_disc(frame, dot_x, cy + dy, 3, dot);
                             dot_x -= 10;
                         }
                     }
@@ -887,6 +1008,7 @@ impl Controller {
                                 pixels_pbgra: thumb.pixels_pbgra.clone(),
                                 delay_ms: 0,
                                 loop_index: 0,
+                                scale: 1.0,
                             },
                             art_x,
                             cy - art_size / 2,
@@ -905,7 +1027,7 @@ impl Controller {
                     }
                     let eq_x = art_x + art_size + 6;
                     for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                        let t = ((now.saturating_add(phase) % 800) as f32 / 800.0)
+                        let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
                             * std::f32::consts::TAU;
                         let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
                         crate::animation::notch::fill_rect_pub(
@@ -947,6 +1069,15 @@ impl Controller {
                             face_size as u32,
                             face_size as u32,
                         );
+                        if state == VisualState::Working {
+                            let (wc, _) = crate::animation::notch::accent_colors(state);
+                            let ocx = face_x + face_size / 2;
+                            for i in 0..3u32 {
+                                let (odx, ody) =
+                                    Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
+                                crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
+                            }
+                        }
                     }
 
                     let mut right_cursor = width as i32 - 14;
@@ -966,6 +1097,7 @@ impl Controller {
                                     pixels_pbgra: thumb.pixels_pbgra.clone(),
                                     delay_ms: 0,
                                     loop_index: 0,
+                                    scale: 1.0,
                                 },
                                 art_x,
                                 cy - art_size / 2,
@@ -984,7 +1116,7 @@ impl Controller {
                         }
                         let base = cy + 7;
                         for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                            let t = ((now.saturating_add(phase) % 800) as f32 / 800.0)
+                            let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
                                 * std::f32::consts::TAU;
                             let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
                             crate::animation::notch::fill_rect_pub(
@@ -1008,12 +1140,13 @@ impl Controller {
                         } else {
                             1
                         };
-                        for _ in 0..count {
+                        for i in 0..count {
                             right_cursor -= 10;
+                            let dy = Self::think_bob(state, i, now);
                             crate::animation::notch::draw_disc(
                                 frame,
                                 right_cursor + 4,
-                                cy,
+                                cy + dy,
                                 3,
                                 [dot[0], dot[1], dot[2], dot[3]],
                             );
@@ -1089,11 +1222,11 @@ impl Controller {
                         };
                         crate::animation::notch::draw_text(
                             frame,
-                            "NOW PLAYING",
+                            "Now Playing",
                             tag_x,
                             16,
                             width.saturating_sub((tag_x as u32) + 50),
-                            9,
+                            10,
                             true,
                             accent,
                         );
@@ -1101,7 +1234,7 @@ impl Controller {
                         // 4-bar mini equalizer in top right
                         let eq_x = width as i32 - pad - 20;
                         for (i, &phase) in [0u64, 180, 360, 540].iter().enumerate() {
-                            let t = ((now.saturating_add(phase) % 700) as f32 / 700.0)
+                            let t = ((eq_now.saturating_add(phase) % 700) as f32 / 700.0)
                                 * std::f32::consts::TAU;
                             let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
                             crate::animation::notch::fill_rect_pub(
@@ -1130,6 +1263,7 @@ impl Controller {
                                     pixels_pbgra: thumb.pixels_pbgra.clone(),
                                     delay_ms: 0,
                                     loop_index: 0,
+                                    scale: 1.0,
                                 },
                                 art_x,
                                 art_y,
@@ -1169,7 +1303,7 @@ impl Controller {
                             text_w,
                             14,
                             true,
-                            [255, 255, 255, 255],
+                            self.ink(),
                         );
                         crate::animation::notch::draw_text(
                             frame,
@@ -1179,7 +1313,7 @@ impl Controller {
                             text_w,
                             11,
                             false,
-                            [175, 180, 195, 220],
+                            self.ink_dim(),
                         );
 
                         let app_name = self.media.as_ref().map(|m| m.app.as_str()).unwrap_or("");
@@ -1190,7 +1324,7 @@ impl Controller {
                                 text_x,
                                 94,
                                 text_w,
-                                9,
+                                10,
                                 false,
                                 [accent[0], accent[1], accent[2], 210],
                             );
@@ -1272,14 +1406,14 @@ impl Controller {
                                     frame,
                                     center_x,
                                     ctrl_y,
-                                    [255, 255, 255, 255],
+                                    self.ink(),
                                 );
                             } else {
                                 crate::animation::notch::draw_glyph_play(
                                     frame,
                                     center_x,
                                     ctrl_y,
-                                    [255, 255, 255, 255],
+                                    self.ink(),
                                 );
                             }
                             self.icon_hits.push((
@@ -1334,14 +1468,14 @@ impl Controller {
                             pad
                         };
                         let header_title =
-                            format!("LIVE ACTIVITY • {}", agent_source.to_uppercase());
+                            format!("Live Activity • {}", agent_source);
                         crate::animation::notch::draw_text(
                             frame,
                             &header_title,
                             tag_x,
                             16,
                             width.saturating_sub((tag_x as u32) + 50),
-                            9,
+                            10,
                             true,
                             [sc[0], sc[1], sc[2], 255],
                         );
@@ -1392,6 +1526,26 @@ impl Controller {
                             8,
                             [sc[0], sc[1], sc[2], 255],
                         );
+                        // Celebration sparkles after a turn completes; silent
+                        // once the 600 ms flight ends.
+                        if state == VisualState::Ready {
+                            let age = now.saturating_sub(self.state_since_ms);
+                            for i in 0..8u32 {
+                                if let Some((sx, sy, sa)) =
+                                    Self::sparkle_dot(beacon_x, beacon_y, i, age)
+                                {
+                                    if sa > 0 {
+                                        crate::animation::notch::draw_disc(
+                                            frame,
+                                            sx,
+                                            sy,
+                                            1,
+                                            [sc[0], sc[1], sc[2], sa],
+                                        );
+                                    }
+                                }
+                            }
+                        }
 
                         let text_x = beacon_x + 24;
                         let text_w = width.saturating_sub((text_x as u32) + (pad as u32));
@@ -1403,7 +1557,7 @@ impl Controller {
                             text_w,
                             15,
                             true,
-                            [255, 255, 255, 255],
+                            self.ink(),
                         );
                         crate::animation::notch::draw_text(
                             frame,
@@ -1413,7 +1567,7 @@ impl Controller {
                             text_w,
                             11,
                             false,
-                            [175, 180, 195, 210],
+                            self.ink_dim(),
                         );
 
                         // Session ID badge pill
@@ -1435,9 +1589,9 @@ impl Controller {
                                 text_x + 6,
                                 101,
                                 bw - 10,
-                                9,
+                                10,
                                 false,
-                                [200, 215, 235, 220],
+                                self.ink_dim(),
                             );
                         }
 
@@ -1454,8 +1608,8 @@ impl Controller {
                                 [sc[0], sc[1], sc[2], 255],
                             );
                         }
-                    } else {
-                        // Idle Dashboard with Open Windows / Task Switcher
+                    } else if island.has_widget("tasks") && island.show_tasks && !self.tasks.is_empty() {
+                        // Optional / Opt-in Open Windows Switcher (when tasks widget is explicitly enabled)
                         let tag_x = if island.has_widget("face") {
                             pad + 30
                         } else {
@@ -1463,164 +1617,137 @@ impl Controller {
                         };
                         crate::animation::notch::draw_text(
                             frame,
-                            if !self.tasks.is_empty() {
-                                "ACTIVE TASKS & WINDOWS"
-                            } else {
-                                "TERMIELLE DASHBOARD"
-                            },
+                            "Active Tasks & Windows",
                             tag_x,
                             16,
                             width.saturating_sub((tag_x as u32) + 50),
-                            9,
+                            10,
                             true,
                             accent,
                         );
 
-                        if !self.tasks.is_empty() {
-                            let tile_w = 44i32;
-                            let tile_h = 44i32;
-                            let gap = 12i32;
-                            let count = self.tasks.len().min(5) as i32;
-                            let total_w = count * tile_w + (count - 1) * gap;
-                            let start_x = ((width as i32 - total_w) / 2).max(pad);
-                            let tile_y = 56i32;
+                        let tile_w = 44i32;
+                        let tile_h = 44i32;
+                        let gap = 12i32;
+                        let count = self.tasks.len().min(5) as i32;
+                        let total_w = count * tile_w + (count - 1) * gap;
+                        let start_x = ((width as i32 - total_w) / 2).max(pad);
+                        let tile_y = 56i32;
 
-                            for (i, task) in self.tasks.iter().take(5).enumerate() {
-                                let tx = start_x + i as i32 * (tile_w + gap);
-                                let is_hover = self.hover_point.is_some_and(|(px, py)| {
-                                    px >= tx
-                                        && px < tx + tile_w
-                                        && py >= tile_y
-                                        && py < tile_y + tile_h
-                                });
-                                let tile_bg = if is_hover {
-                                    [255, 255, 255, 40]
-                                } else {
-                                    [255, 255, 255, 18]
-                                };
-                                let tile_border = if is_hover {
-                                    [accent[0], accent[1], accent[2], 220]
-                                } else {
-                                    [255, 255, 255, 45]
-                                };
-
-                                // Tile glass background
-                                crate::animation::notch::fill_rect_pub(
-                                    frame,
-                                    tx,
-                                    tile_y,
-                                    tile_w as u32,
-                                    tile_h as u32,
-                                    tile_bg,
-                                );
-                                crate::animation::notch::fill_rect_pub(
-                                    frame,
-                                    tx,
-                                    tile_y,
-                                    tile_w as u32,
-                                    1,
-                                    tile_border,
-                                );
-                                crate::animation::notch::fill_rect_pub(
-                                    frame,
-                                    tx,
-                                    tile_y + tile_h - 1,
-                                    tile_w as u32,
-                                    1,
-                                    tile_border,
-                                );
-                                crate::animation::notch::fill_rect_pub(
-                                    frame,
-                                    tx,
-                                    tile_y,
-                                    1,
-                                    tile_h as u32,
-                                    tile_border,
-                                );
-                                crate::animation::notch::fill_rect_pub(
-                                    frame,
-                                    tx + tile_w - 1,
-                                    tile_y,
-                                    1,
-                                    tile_h as u32,
-                                    tile_border,
-                                );
-
-                                // Blit high-res window app icon inside tile
-                                crate::animation::notch::blit_rounded(
-                                    frame,
-                                    &crate::animation::FrameBuffer {
-                                        width: task.width,
-                                        height: task.height,
-                                        pixels_pbgra: task.pixels_pbgra.clone(),
-                                        delay_ms: 0,
-                                        loop_index: 0,
-                                    },
-                                    tx + 4,
-                                    tile_y + 4,
-                                    (tile_w - 8) as u32,
-                                    (tile_h - 8) as u32,
-                                    6,
-                                );
-
-                                // Hit target for window activation
-                                self.icon_hits.push((
-                                    task.hwnd,
-                                    tx,
-                                    tile_y,
-                                    tile_w as u32,
-                                    tile_h as u32,
-                                ));
-                            }
-
-                            // Window title tooltip / caption below tiles
-                            let hovered_task = self.tasks.iter().take(5).find(|t| {
-                                self.hover_point.is_some_and(|(px, py)| {
-                                    self.icon_hits.iter().any(|&(h, hx, hy, hw, hh)| {
-                                        h == t.hwnd
-                                            && px >= hx
-                                            && px < hx + hw as i32
-                                            && py >= hy
-                                            && py < hy + hh as i32
-                                    })
-                                })
+                        for (i, task) in self.tasks.iter().take(5).enumerate() {
+                            let tx = start_x + i as i32 * (tile_w + gap);
+                            let is_hover = self.hover_point.is_some_and(|(px, py)| {
+                                px >= tx
+                                    && px < tx + tile_w
+                                    && py >= tile_y
+                                    && py < tile_y + tile_h
                             });
-                            let display_title = hovered_task
-                                .map(|t| t.title.as_str())
-                                .unwrap_or("Click an app to switch to it");
-                            crate::animation::notch::draw_text(
+                            let tile_bg = if is_hover {
+                                [255, 255, 255, 40]
+                            } else {
+                                [255, 255, 255, 18]
+                            };
+                            let tile_border = if is_hover {
+                                [accent[0], accent[1], accent[2], 220]
+                            } else {
+                                [255, 255, 255, 45]
+                            };
+
+                            // Tile glass background
+                            crate::animation::notch::fill_rect_pub(
                                 frame,
-                                display_title,
-                                pad,
-                                116,
-                                width.saturating_sub((pad as u32) * 2),
-                                11,
-                                false,
-                                [210, 220, 235, 230],
+                                tx,
+                                tile_y,
+                                tile_w as u32,
+                                tile_h as u32,
+                                tile_bg,
                             );
-                        } else {
-                            // Standard idle message
-                            crate::animation::notch::draw_text(
+                            crate::animation::notch::fill_rect_pub(
                                 frame,
-                                "Termielle is Idle",
-                                pad,
-                                56,
-                                width.saturating_sub((pad as u32) * 2),
-                                15,
-                                true,
-                                [255, 255, 255, 255],
+                                tx,
+                                tile_y,
+                                tile_w as u32,
+                                1,
+                                tile_border,
                             );
-                            crate::animation::notch::draw_text(
+                            crate::animation::notch::fill_rect_pub(
                                 frame,
-                                "Standing by for agent instructions or media playback",
-                                pad,
-                                82,
-                                width.saturating_sub((pad as u32) * 2),
-                                11,
-                                false,
-                                [175, 180, 195, 210],
+                                tx,
+                                tile_y + tile_h - 1,
+                                tile_w as u32,
+                                1,
+                                tile_border,
                             );
+                            crate::animation::notch::fill_rect_pub(
+                                frame,
+                                tx,
+                                tile_y,
+                                1,
+                                tile_h as u32,
+                                tile_border,
+                            );
+                            crate::animation::notch::fill_rect_pub(
+                                frame,
+                                tx + tile_w - 1,
+                                tile_y,
+                                1,
+                                tile_h as u32,
+                                tile_border,
+                            );
+
+                            // Blit high-res window app icon inside tile
+                            crate::animation::notch::blit_rounded(
+                                frame,
+                                &crate::animation::FrameBuffer {
+                                    width: task.width,
+                                    height: task.height,
+                                    pixels_pbgra: task.pixels_pbgra.clone(),
+                                    delay_ms: 0,
+                                    loop_index: 0,
+                                    scale: 1.0,
+                                },
+                                tx + 4,
+                                tile_y + 4,
+                                (tile_w - 8) as u32,
+                                (tile_h - 8) as u32,
+                                6,
+                            );
+
+                            // Hit target for window activation
+                            self.icon_hits.push((
+                                task.hwnd,
+                                tx,
+                                tile_y,
+                                tile_w as u32,
+                                tile_h as u32,
+                            ));
                         }
+
+                        // Window title tooltip / caption below tiles
+                        let hovered_task = self.tasks.iter().take(5).find(|t| {
+                            self.hover_point.is_some_and(|(px, py)| {
+                                self.icon_hits.iter().any(|&(h, hx, hy, hw, hh)| {
+                                    h == t.hwnd
+                                        && px >= hx
+                                        && px < hx + hw as i32
+                                        && py >= hy
+                                        && py < hy + hh as i32
+                                })
+                            })
+                        });
+                        let display_title = hovered_task
+                            .map(|t| t.title.as_str())
+                            .unwrap_or("Click an app to switch to it");
+                        crate::animation::notch::draw_text(
+                            frame,
+                            display_title,
+                            pad,
+                            116,
+                            width.saturating_sub((pad as u32) * 2),
+                            11,
+                            false,
+                            self.ink_dim(),
+                        );
 
                         // Bottom accent pill bar
                         if height >= 145 {
@@ -1630,6 +1757,258 @@ impl Controller {
                                 frame,
                                 bar_x,
                                 height as i32 - 12,
+                                bar_w,
+                                3,
+                                [accent[0], accent[1], accent[2], 200],
+                            );
+                        }
+                    } else {
+                        // Default Clean Standby & Glanceables Dashboard
+                        let tag_x = if island.has_widget("face") {
+                            pad + 30
+                        } else {
+                            pad
+                        };
+                        crate::animation::notch::draw_text(
+                            frame,
+                            "Standby • Ready",
+                            tag_x,
+                            16,
+                            width.saturating_sub((tag_x as u32) + 70),
+                            10,
+                            true,
+                            accent,
+                        );
+
+                        let stats = crate::system::collect();
+
+                        // Live time in top-right header
+                        crate::animation::notch::draw_text(
+                            frame,
+                            &stats.time,
+                            width as i32 - pad - 42,
+                            15,
+                            42,
+                            11,
+                            true,
+                            self.ink(),
+                        );
+
+                        // Trailing live beacon with halo next to time
+                        let beacon_x = width as i32 - pad - 52;
+                        crate::animation::notch::draw_disc(
+                            frame,
+                            beacon_x,
+                            22,
+                            5,
+                            [accent[0], accent[1], accent[2], 45],
+                        );
+                        crate::animation::notch::draw_disc(
+                            frame,
+                            beacon_x,
+                            22,
+                            2,
+                            [accent[0], accent[1], accent[2], 255],
+                        );
+
+                        // Headline & Subtitle
+                        let text_w = width.saturating_sub((pad as u32) * 2);
+                        crate::animation::notch::draw_text(
+                            frame,
+                            "Termielle is Ready",
+                            pad,
+                            42,
+                            text_w,
+                            13,
+                            true,
+                            self.ink(),
+                        );
+                        crate::animation::notch::draw_text(
+                            frame,
+                            "Standing by for agent instructions or media playback",
+                            pad,
+                            60,
+                            text_w,
+                            10,
+                            false,
+                            self.ink_dim(),
+                        );
+
+                        // System Telemetry Cards (CPU, RAM, Power/System)
+                        if height >= 125 {
+                            // 3 rich telemetry modules
+                            struct CardInfo {
+                                label: &'static str,
+                                dot_color: [u8; 4],
+                                value: String,
+                                pct: u8,
+                                fill_color: [u8; 4],
+                                caption: String,
+                            }
+
+                            // CPU card setup
+                            let cpu_heavy = stats.cpu_percent >= 75;
+                            let (cpu_dot, cpu_fill) = if cpu_heavy {
+                                ([30, 90, 245, 255], [30, 90, 245, 255])
+                            } else {
+                                ([accent[0], accent[1], accent[2], 255], [accent[0], accent[1], accent[2], 255])
+                            };
+                            let cpu_caption = if stats.cpu_percent < 25 {
+                                "Calm".to_string()
+                            } else if stats.cpu_percent < 65 {
+                                "Active".to_string()
+                            } else {
+                                "High Load".to_string()
+                            };
+
+                            // RAM card setup
+                            let ram_dot = [225, 175, 20, 255]; // cyan/teal
+                            let ram_fill = [225, 175, 20, 255];
+                            let ram_caption = if stats.mem_total_gb > 0.0 {
+                                format!("{:.0}/{:.0} GB", stats.mem_used_gb, stats.mem_total_gb)
+                            } else {
+                                "System RAM".to_string()
+                            };
+
+                            // Power/Battery card setup
+                            let (bat_dot, bat_val, bat_fill, bat_pct, bat_caption) = if let Some(bat) = stats.battery {
+                                let charging = stats.battery_charging;
+                                let dot = if charging {
+                                    [60, 205, 80, 255]
+                                } else if bat < 20 {
+                                    [20, 160, 245, 255]
+                                } else {
+                                    [60, 205, 80, 255]
+                                };
+                                let val = if charging { format!("{}% +", bat) } else { format!("{}%", bat) };
+                                let cap = if charging { "Charging".to_string() } else { "On Battery".to_string() };
+                                (dot, val, dot, bat, cap)
+                            } else {
+                                ([60, 205, 80, 255], "Online".to_string(), [60, 205, 80, 255], 100, "Desktop".to_string())
+                            };
+
+                            let cards = [
+                                CardInfo {
+                                    label: "CPU",
+                                    dot_color: cpu_dot,
+                                    value: format!("{}%", stats.cpu_percent),
+                                    pct: stats.cpu_percent,
+                                    fill_color: cpu_fill,
+                                    caption: cpu_caption,
+                                },
+                                CardInfo {
+                                    label: "RAM",
+                                    dot_color: ram_dot,
+                                    value: format!("{}%", stats.mem_percent),
+                                    pct: stats.mem_percent,
+                                    fill_color: ram_fill,
+                                    caption: ram_caption,
+                                },
+                                CardInfo {
+                                    label: if stats.battery.is_some() { "BATTERY" } else { "SYSTEM" },
+                                    dot_color: bat_dot,
+                                    value: bat_val,
+                                    pct: bat_pct,
+                                    fill_color: bat_fill,
+                                    caption: bat_caption,
+                                },
+                            ];
+
+                            let card_count = cards.len() as i32;
+                            let gap = 8i32;
+                            let total_gap = (card_count - 1) * gap;
+                            let card_w = ((text_w as i32 - total_gap) / card_count).max(60);
+                            let card_y = 80i32;
+                            let card_h = 50u32;
+
+                            let card_bg = [
+                                (accent[0] as u32 * 20 / 255) as u8,
+                                (accent[1] as u32 * 20 / 255) as u8,
+                                (accent[2] as u32 * 20 / 255) as u8,
+                                26,
+                            ];
+                            let card_border = [255, 255, 255, 34];
+                            let track_color = [255, 255, 255, 20];
+
+                            for (i, card) in cards.iter().enumerate() {
+                                let cx = pad + i as i32 * (card_w + gap);
+
+                                // Smooth rounded frosted card
+                                crate::animation::notch::draw_rounded_rect(
+                                    frame,
+                                    cx,
+                                    card_y,
+                                    card_w as u32,
+                                    card_h,
+                                    7,
+                                    card_bg,
+                                    card_border,
+                                );
+
+                                // Top row: indicator dot + label + value
+                                crate::animation::notch::draw_disc(
+                                    frame,
+                                    cx + 9,
+                                    card_y + 11,
+                                    3,
+                                    card.dot_color,
+                                );
+                                crate::animation::notch::draw_text(
+                                    frame,
+                                    card.label,
+                                    cx + 16,
+                                    card_y + 6,
+                                    (card_w - 48).max(20) as u32,
+                                    9,
+                                    true,
+                                    self.ink_dim(),
+                                );
+                                crate::animation::notch::draw_text(
+                                    frame,
+                                    &card.value,
+                                    cx + card_w - 38,
+                                    card_y + 6,
+                                    34,
+                                    9,
+                                    true,
+                                    self.ink(),
+                                );
+
+                                // Mini progress bar
+                                let bar_w = (card_w - 18).max(10) as u32;
+                                crate::animation::notch::draw_progress_bar(
+                                    frame,
+                                    cx + 9,
+                                    card_y + 23,
+                                    bar_w,
+                                    4,
+                                    card.pct,
+                                    track_color,
+                                    card.fill_color,
+                                );
+
+                                // Detail caption under progress bar
+                                crate::animation::notch::draw_text(
+                                    frame,
+                                    &card.caption,
+                                    cx + 9,
+                                    card_y + 32,
+                                    bar_w,
+                                    9,
+                                    false,
+                                    self.ink_dim(),
+                                );
+                            }
+                        }
+
+                        // Bottom accent pill bar
+                        if height >= 145 {
+                            let bar_w = 48u32;
+                            let bar_x = (width as i32 - bar_w as i32) / 2;
+                            crate::animation::notch::fill_rect_pub(
+                                frame,
+                                bar_x,
+                                height as i32 - 10,
                                 bar_w,
                                 3,
                                 [accent[0], accent[1], accent[2], 200],
@@ -1675,6 +2054,7 @@ impl Controller {
                                     pixels_pbgra: thumb.pixels_pbgra.clone(),
                                     delay_ms: 0,
                                     loop_index: 0,
+                                    scale: 1.0,
                                 },
                                 media_start_x,
                                 art_y,
@@ -1748,7 +2128,17 @@ impl Controller {
         let blob_count = blobs.len() as u32;
         let right_x = blobs.get(1).map_or(0, |b| b.x);
         let right_w = blobs.get(1).map_or(0, |b| b.w);
-        let key = (w, h, r, attached, black, blob_count, right_x, right_w);
+        let key = (
+            w,
+            h,
+            r,
+            attached,
+            black,
+            blob_count,
+            right_x,
+            right_w,
+            self.render_scale().to_bits(),
+        );
         if let Some((cached_key, buf)) = &self.glass_cache {
             if *cached_key == key {
                 return buf.clone();
@@ -1765,6 +2155,7 @@ impl Controller {
             &self.island.glass,
             black,
             bridge_k,
+            self.render_scale(),
         );
         self.glass_cache = Some((key, buf.clone()));
         buf
@@ -1786,7 +2177,7 @@ impl Controller {
     /// - Idle & unhovered: Hidden (top-edge hover sensor) if auto_hide is on, else Minimal dot
     pub fn presentation(&self) -> crate::animation::notch::Presentation {
         use crate::animation::notch::Presentation;
-        if self.alert.is_some() {
+        if !self.alerts.is_empty() {
             return Presentation::Expanded;
         }
         if self.manually_expanded {
@@ -1855,13 +2246,15 @@ impl Controller {
         if !media_changed && !tasks_changed && !self.is_expanded_idle() && !self.media_playing() {
             return false;
         }
-        let (w, h) = (self.current.width, self.current.height);
-        self.current = self.render_island(self.state, w, h);
+        let (w, h) = self.current_logical_size();
+        self.current = self.render_island(self.state, w, h, self.clock_ms);
         self.animation = AnimationSource::Still(self.current.clone());
         true
     }
 
-    /// Triggers a transient alert notification banner.
+    /// Queues a transient alert notification banner behind the showing one
+    /// (capped at [`MAX_QUEUED_ALERTS`]); the front banner shows until it
+    /// expires or is dismissed, then the next takes its place.
     pub fn trigger_alert(
         &mut self,
         title: impl Into<String>,
@@ -1873,12 +2266,21 @@ impl Controller {
         if !self.island.is_enabled() {
             return false;
         }
-        self.alert = Some(AlertBanner {
+        self.alerts.push_back(AlertBanner {
             title: title.into(),
             subtitle: subtitle.into(),
             accent,
             expires_at_ms: now_ms.saturating_add(duration_ms),
+            duration_ms,
         });
+        while self.alerts.len() > MAX_QUEUED_ALERTS {
+            // Drop the longest-waiting unseen banner, never the showing one.
+            if self.alerts.len() > 1 {
+                self.alerts.remove(1);
+            } else {
+                self.alerts.pop_front();
+            }
+        }
         self.morph_to_target(now_ms)
     }
 
@@ -1896,7 +2298,7 @@ impl Controller {
             self.spring = None;
             if is_enabled {
                 let (w, h) = self.target_size(self.state);
-                self.current = self.render_island(self.state, w, h);
+                self.current = self.render_island(self.state, w, h, now_ms);
                 self.animation = AnimationSource::Still(self.current.clone());
                 self.frame_deadline = None;
                 self.arm_face_deadline(now_ms);
@@ -1905,7 +2307,7 @@ impl Controller {
             }
         } else if is_enabled {
             let (w, h) = self.target_size(self.state);
-            self.current = self.render_island(self.state, w, h);
+            self.current = self.render_island(self.state, w, h, now_ms);
             self.animation = AnimationSource::Still(self.current.clone());
             self.arm_face_deadline(now_ms);
         }
@@ -1913,16 +2315,21 @@ impl Controller {
 
     /// Target (width, height) for the current visual and presentation state.
     pub fn target_size(&self, _state: VisualState) -> (u32, u32) {
-        if self.alert.is_some() {
+        if !self.alerts.is_empty() {
             let w = self.island.expanded_width.max(320);
             return (w, 124u32.max(self.island.height));
         }
         match self.presentation() {
             crate::animation::notch::Presentation::Expanded => {
                 let exp_w = self.island.expanded_width;
-                let exp_h = if self.media_playing() && !self.tasks.is_empty() {
+                let tasks_active = self.island.has_widget("tasks")
+                    && self.island.show_tasks
+                    && !self.tasks.is_empty();
+                let exp_h = if self.media_playing() && tasks_active {
                     210u32
-                } else if self.media_playing() || !self.tasks.is_empty() {
+                } else if self.media_playing() {
+                    175u32
+                } else if tasks_active {
                     180u32
                 } else {
                     154u32
@@ -2126,7 +2533,8 @@ impl Controller {
 
     /// Physical pixels per logical pixel for the next present: monitor DPI
     /// (unless the island opts out via `scale_with_dpi`) times the user
-    /// zoom. The frame stays logical; `window.rs` resamples to physical.
+    /// zoom. Frames are authored at this scale, so the window presents
+    /// them 1:1 with no filtering.
     pub fn render_scale(&self) -> f32 {
         let dpi = if self.island.scale_with_dpi {
             self.dpi_scale
@@ -2136,10 +2544,90 @@ impl Controller {
         (dpi * self.user_scale).clamp(0.5, 4.0)
     }
 
+    /// Allocates a transparent frame for a logical (`width`, `height`) at
+    /// the current render scale: layout reads logical, the raster is device
+    /// pixels, and paint operations scale their inputs by [`FrameBuffer::scale`].
+    fn blank_frame(&self, width: u32, height: u32) -> FrameBuffer {
+        let scale = self.render_scale();
+        let (width, height) = scaled_size((width.max(1), height.max(1)), scale);
+        FrameBuffer {
+            width,
+            height,
+            pixels_pbgra: vec![0; (width * height * 4) as usize],
+            delay_ms: 0,
+            loop_index: 0,
+            scale,
+        }
+    }
+
     /// Maps one physical client pixel back to frame (logical) space for
     /// hit-testing against `icon_hits` and `hover_point`.
     fn to_logical(&self, v: i32) -> i32 {
         (v as f32 / self.render_scale()).round() as i32
+    }
+
+    /// The current frame's size in logical units: the window and the spring
+    /// both reason in logical pixels while [`FrameBuffer`] holds device pixels.
+    /// Derived from the frame's own authoring scale, never the live render
+    /// scale — right after a DPI change the two differ, and the live scale
+    /// would unpick the wrong logical size.
+    fn current_logical_size(&self) -> (u32, u32) {
+        let authored = self.current.scale;
+        let authored = if authored.is_finite() && authored > 0.0 {
+            authored
+        } else {
+            self.render_scale()
+        };
+        (
+            (self.current.width as f32 / authored).round().max(1.0) as u32,
+            (self.current.height as f32 / authored).round().max(1.0) as u32,
+        )
+    }
+
+    /// Re-renders the current frame when its pixels no longer match the
+    /// render scale (the pill crossed monitors with different DPIs, or the
+    /// zoom changed under a settled pill). Returns true when a repaint is
+    /// needed. Self-healing: scale is part of the glass cache key, so a
+    /// stale frame simply misses and rebuilds here.
+    pub fn refresh_scale(&mut self, now_ms: u64) -> bool {
+        let (logical_w, logical_h) = self.current_logical_size();
+        let (want_w, want_h) = scaled_size((logical_w, logical_h), self.render_scale());
+        if (want_w, want_h) == (self.current.width, self.current.height) {
+            return false;
+        }
+        if self.island.is_enabled() {
+            self.current = self.render_island(self.state, logical_w, logical_h, now_ms);
+        } else {
+            let _ = self.load_animation_classic(self.state, now_ms);
+            return true;
+        }
+        self.animation = AnimationSource::Still(self.current.clone());
+        true
+    }
+
+    /// Resamples a device-pixel asset frame (classic-mode GIF art, authored
+    /// at 1.0) up to `scale`, preserving the old present-time upscale
+    /// exactly: same bilinear math, same window size, one step earlier so
+    /// the present path stays 1:1.
+    fn to_render_size(scale: f32, frame: FrameBuffer) -> FrameBuffer {
+        let (want_w, want_h) = scaled_size((frame.width, frame.height), scale);
+        if (want_w, want_h) == (frame.width, frame.height) {
+            return frame;
+        }
+        let mut out = crate::animation::resample_bilinear(&frame, want_w, want_h);
+        out.scale = scale;
+        out
+    }
+
+    /// Theme-aware ink for neutral copy; see
+    /// [`crate::animation::notch::ink_pair`].
+    fn ink(&self) -> [u8; 4] {
+        crate::animation::notch::ink_pair(&self.island.glass).0
+    }
+
+    /// Dim companion ink for secondary copy.
+    fn ink_dim(&self) -> [u8; 4] {
+        crate::animation::notch::ink_pair(&self.island.glass).1
     }
 
     /// Routes a click at physical client (`x`, `y`): coordinates are mapped
@@ -2155,7 +2643,7 @@ impl Controller {
                     HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
                     HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
                     HIT_ALERT_DISMISS => {
-                        self.alert = None;
+                        self.alerts.pop_front();
                         let _ = self.morph_to_target(now_ms);
                         return ClickOutcome::AlertDismiss;
                     }
@@ -2204,6 +2692,20 @@ impl Controller {
         self.morph_to_target(now_ms)
     }
 
+    /// Whether the island is currently manually expanded into the full card.
+    pub fn is_manually_expanded(&self) -> bool {
+        self.manually_expanded
+    }
+
+    /// Collapses the island if it was manually expanded (e.g. click outside or Escape).
+    pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
+        if !self.island.is_enabled() || !self.manually_expanded {
+            return false;
+        }
+        self.manually_expanded = false;
+        self.morph_to_target(now_ms)
+    }
+
     /// Tracks the cursor entering (`inside = true`) or leaving the pill.
     /// Hover expands the idle pill when `expand_on_hover` is set; leaving
     /// collapses it again unless it was manually toggled open.
@@ -2235,6 +2737,26 @@ impl Controller {
         self.morph_to_target(now_ms)
     }
 
+    /// Spring for one morph: growing surfaces open with the configured
+    /// bounce, shrinking ones settle critically damped, and alert drop-ins
+    /// get their own fast snap. Areas decide — no per-caller wiring.
+    fn morph_params(
+        &self,
+        from_w: u32,
+        from_h: u32,
+        to_w: u32,
+        to_h: u32,
+    ) -> termielle_core::SpringParams {
+        let growing = to_w as u64 * to_h as u64 >= from_w as u64 * from_h as u64;
+        if !self.alerts.is_empty() && growing {
+            spring_params(self.island.alert_ms, self.island.spring_bounce)
+        } else if growing {
+            spring_params(self.island.animation_ms, self.island.spring_bounce)
+        } else {
+            spring_params(self.island.collapse_ms, 0.0)
+        }
+    }
+
     /// Morphs (or snaps, under reduced motion) to the current target size
     /// using the iOS spring model. Interrupted morphs inherit the current
     /// velocity, exactly like the Dynamic Island. The corner radius and
@@ -2248,27 +2770,31 @@ impl Controller {
             target_h = ((target_h as f32 * 1.03).round() as u32).max(target_h + 2);
             target_r *= 1.03;
         }
-        let params = spring_params(self.island.animation_ms, self.island.spring_bounce);
+        let (from_w, from_h) = self.current_logical_size();
+        let params = self.morph_params(from_w, from_h, target_w, target_h);
         self.retarget_separation(params);
 
         if self.reduced_motion {
             self.spring = None;
             self.radius = target_r;
-            self.current = self.render_island(self.state, target_w, target_h);
+            self.current = self.render_island(self.state, target_w, target_h, now_ms);
             self.animation = AnimationSource::Still(self.current.clone());
             self.frame_deadline = None;
             return true;
         }
         let (from_w, from_h, from_r, vel_x, vel_y, vel_z) = match self.spring.take() {
             Some(s) => (s.x, s.y, s.z, s.vx, s.vy, s.vz),
-            None => (
-                self.current.width as f32,
-                self.current.height as f32,
-                self.radius,
-                0.0,
-                0.0,
-                0.0,
-            ),
+            None => {
+                let (logical_w, logical_h) = self.current_logical_size();
+                (
+                    logical_w as f32,
+                    logical_h as f32,
+                    self.radius,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
+            }
         };
         if (from_w - target_w as f32).abs() < 1.0
             && (from_h - target_h as f32).abs() < 1.0
@@ -2279,7 +2805,7 @@ impl Controller {
         {
             self.spring = None;
             self.radius = target_r;
-            self.current = self.render_island(self.state, target_w, target_h);
+            self.current = self.render_island(self.state, target_w, target_h, now_ms);
             self.animation = AnimationSource::Still(self.current.clone());
             self.frame_deadline = None;
             return true;
@@ -2313,6 +2839,7 @@ impl Controller {
 
     /// Folds one pipe event in and returns what the window must do.
     pub fn handle_event(&mut self, event: EventMessage, now_ms: u64) -> ControllerActions {
+        self.clock_ms = now_ms;
         let kind = event.event;
         let session = event.session_id.clone();
         let fresh = now_ms.saturating_sub(event.timestamp_ms) <= ALERT_FRESHNESS_MS;
@@ -2352,6 +2879,7 @@ impl Controller {
 
     /// Fires every reducer and animation deadline due at `now_ms`.
     pub fn on_timer(&mut self, now_ms: u64) -> ControllerActions {
+        self.clock_ms = now_ms;
         self.reducer.advance(now_ms);
         let mut actions = self.sync_state(now_ms);
 
@@ -2359,13 +2887,16 @@ impl Controller {
         // `set_task_update`; nothing here may block on window capture or
         // media queries, otherwise hovering and morphing visibly stall.
 
-        // Check if transient notification alert expired
-        if let Some(alert) = &self.alert {
-            if now_ms >= alert.expires_at_ms {
-                self.alert = None;
-                self.morph_to_target(now_ms);
-                actions.present_frame = true;
-            }
+        // Check if the showing transient notification alert expired; the
+        // next queued banner (if any) takes its place via the re-morph.
+        let expired = self
+            .alerts
+            .front()
+            .is_some_and(|alert| now_ms >= alert.expires_at_ms);
+        if expired {
+            self.alerts.pop_front();
+            self.morph_to_target(now_ms);
+            actions.present_frame = true;
         }
 
         // Spring morph tick: integrate (width, height, radius) toward the
@@ -2404,13 +2935,13 @@ impl Controller {
                         sep.x = sep.target;
                         sep.v = 0.0;
                     }
-                    self.current = self.render_island(self.state, target_w, target_h);
+                    self.current = self.render_island(self.state, target_w, target_h, now_ms);
                     self.animation = AnimationSource::Still(self.current.clone());
                     self.frame_deadline = None;
                     self.arm_face_deadline(now_ms);
                 } else {
                     let (w, h) = current_size;
-                    self.current = self.render_island(self.state, w, h);
+                    self.current = self.render_island(self.state, w, h, now_ms);
                     self.animation = AnimationSource::Still(self.current.clone());
                     let interval = self.frame_interval_ms.unwrap_or(16);
                     let next = now_ms
@@ -2433,7 +2964,7 @@ impl Controller {
                 }
                 if !settled || self.split_active() {
                     let (w, h) = self.target_size(self.state);
-                    self.current = self.render_island(self.state, w, h);
+                    self.current = self.render_island(self.state, w, h, now_ms);
                     actions.present_frame = true;
                 }
                 if !settled {
@@ -2455,6 +2986,30 @@ impl Controller {
             }
         }
 
+        // Procedural-motion tick: repaints the pill so bounce, orbit, pulse,
+        // sparkles, shake, and the equalizer move even with no other
+        // deadline pending. Skipped while a morph tick already repainted
+        // this call — the poses ride the morph renders instead.
+        if self.motion_deadline.is_some_and(|d| now_ms >= d)
+            && self.spring.is_none()
+            && self.separation.is_none()
+        {
+            self.motion_deadline = None;
+            let (w, h) = self.current_logical_size();
+            self.current = self.render_island(self.state, w, h, now_ms);
+            self.animation = AnimationSource::Still(self.current.clone());
+            actions.present_frame = true;
+        }
+        if self.motion_active(now_ms) {
+            let due = now_ms.saturating_add(MOTION_TICK_MS);
+            self.motion_deadline = Some(match self.motion_deadline {
+                Some(d) => d.min(due),
+                None => due,
+            });
+        } else {
+            self.motion_deadline = None;
+        }
+
         if let Some(deadline) = self.frame_deadline {
             if self.spring.is_none() && now_ms >= deadline {
                 actions.present_frame = true;
@@ -2468,6 +3023,26 @@ impl Controller {
         actions
     }
 
+    /// Whether any procedural motion is live: thinking bounce, worker orbit,
+    /// input pulse, celebration/shake one-shots, or a playing equalizer.
+    /// Gated on island mode and full motion — reduced motion stills
+    /// everything procedural (the face keeps its own deadline). The media
+    /// equalizer only moves while actually playing; a paused pose is static.
+    fn motion_active(&self, now_ms: u64) -> bool {
+        if !self.island.is_enabled() || self.reduced_motion {
+            return false;
+        }
+        if self.media_playing() {
+            return true;
+        }
+        match self.state {
+            VisualState::Thinking | VisualState::Working | VisualState::NeedsInput => true,
+            VisualState::Ready => now_ms.saturating_sub(self.state_since_ms) < 600,
+            VisualState::Failed => now_ms.saturating_sub(self.state_since_ms) < 300,
+            VisualState::Idle => false,
+        }
+    }
+
     /// The earliest moment [`Controller::handle_event`] or [`Controller::on_timer`]
     /// can change anything, or `None` when no deadline is pending.
     pub fn next_deadline_ms(&self) -> Option<u64> {
@@ -2479,12 +3054,16 @@ impl Controller {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        if let Some(alert) = &self.alert {
+        if let Some(alert) = self.alerts.front() {
             deadline = match deadline {
                 Some(d) => Some(d.min(alert.expires_at_ms)),
                 None => Some(alert.expires_at_ms),
             };
         }
+        deadline = match (deadline, self.motion_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         deadline
     }
 
@@ -2508,12 +3087,12 @@ impl Controller {
         if self.island.is_enabled() {
             let (w, h) = self.target_size(self.state);
             self.spring = None;
-            self.current = self.render_island(self.state, w, h);
+            self.current = self.render_island(self.state, w, h, self.clock_ms);
             self.animation = AnimationSource::Still(self.current.clone());
             self.frame_deadline = None;
             self.arm_face_deadline(0);
         } else {
-            let still = fallback_frame(self.state, FALLBACK_FRAME_SIZE);
+            let still = fallback_frame(self.state, FALLBACK_FRAME_SIZE, self.render_scale());
             self.frame_deadline = None;
             self.current = still.clone();
             self.animation = AnimationSource::Still(still);
@@ -2526,6 +3105,7 @@ impl Controller {
         let state = self.reducer.visible_state();
         if state != self.state {
             self.state = state;
+            self.state_since_ms = now_ms;
             actions.visible_state = Some(state);
             actions.present_frame = true;
             // A manual expansion is the user's explicit open: mid-turn flips
@@ -2537,15 +3117,15 @@ impl Controller {
             if self.island.is_enabled() {
                 self.refresh_face(state);
                 let (target_w, target_h) = self.target_size(state);
-                let (current_w, current_h) = (self.current.width, self.current.height);
+                let (current_w, current_h) = self.current_logical_size();
                 if (current_w == target_w && current_h == target_h) || self.reduced_motion {
-                    self.current = self.render_island(state, target_w, target_h);
+                    self.current = self.render_island(state, target_w, target_h, now_ms);
                     self.animation = AnimationSource::Still(self.current.clone());
                     self.spring = None;
                     self.frame_deadline = None;
                     self.arm_face_deadline(now_ms);
                 } else {
-                    let params = spring_params(self.island.animation_ms, self.island.spring_bounce);
+                    let params = self.morph_params(current_w, current_h, target_w, target_h);
                     self.retarget_separation(params);
                     self.spring = Some(Spring2D::new(
                         current_w,
@@ -2570,14 +3150,14 @@ impl Controller {
             // Visual state didn't move, but active content (e.g. sessions or media) may
             // dynamically change the target pill size.
             let (target_w, target_h) = self.target_size(self.state);
-            let (current_w, current_h) = (self.current.width, self.current.height);
+            let (current_w, current_h) = self.current_logical_size();
             if (current_w, current_h) != (target_w, target_h) && self.spring.is_none() {
                 if self.reduced_motion {
-                    self.current = self.render_island(self.state, target_w, target_h);
+                    self.current = self.render_island(self.state, target_w, target_h, now_ms);
                     self.animation = AnimationSource::Still(self.current.clone());
                     actions.present_frame = true;
                 } else {
-                    let params = spring_params(self.island.animation_ms, self.island.spring_bounce);
+                    let params = self.morph_params(current_w, current_h, target_w, target_h);
                     self.retarget_separation(params);
                     self.spring = Some(Spring2D::new(
                         current_w,
@@ -2604,22 +3184,28 @@ impl Controller {
     /// Loads the animation for `state` (classic pet path only).
     fn load_animation_classic(&mut self, state: VisualState, now_ms: u64) -> Option<i32> {
         self.frame_deadline = None;
-        self.current = fallback_frame(state, FALLBACK_FRAME_SIZE);
+        self.current = Self::to_render_size(
+            self.render_scale(),
+            fallback_frame(state, FALLBACK_FRAME_SIZE, 1.0),
+        );
 
         let path = self.assets.resolve(state)?;
         let mut gif = match GifAnimation::open(&path) {
             Ok(gif) => gif,
             Err(error) => {
-                self.animation = AnimationSource::Still(fallback_frame(state, FALLBACK_FRAME_SIZE));
+                self.animation = AnimationSource::Still(Self::to_render_size(
+                    self.render_scale(),
+                    fallback_frame(state, FALLBACK_FRAME_SIZE, 1.0),
+                ));
                 return Some(error_code(&error));
             }
         };
 
         match gif.next_frame() {
             Ok(frame) => {
-                self.current = frame.clone();
+                self.current = Self::to_render_size(self.render_scale(), frame.clone());
                 if self.reduced_motion {
-                    self.animation = AnimationSource::Still(frame.clone());
+                    self.animation = AnimationSource::Still(self.current.clone());
                 } else {
                     let interval = self.frame_interval_ms;
                     let present_cost = self.present_cost_ms;
@@ -2630,7 +3216,10 @@ impl Controller {
                 None
             }
             Err(error) => {
-                self.animation = AnimationSource::Still(fallback_frame(state, FALLBACK_FRAME_SIZE));
+                self.animation = AnimationSource::Still(Self::to_render_size(
+                    self.render_scale(),
+                    fallback_frame(state, FALLBACK_FRAME_SIZE, 1.0),
+                ));
                 Some(error_code(&error))
             }
         }
@@ -2643,6 +3232,7 @@ impl Controller {
         }
         let interval = self.frame_interval_ms;
         let present_cost = self.present_cost_ms;
+        let render_scale = self.render_scale();
         let gif = match &mut self.animation {
             AnimationSource::Gif(gif) => gif,
             AnimationSource::Still(_) => {
@@ -2653,7 +3243,7 @@ impl Controller {
 
         match gif.next_frame() {
             Ok(frame) => {
-                self.current = frame.clone();
+                self.current = Self::to_render_size(render_scale, frame.clone());
                 self.frame_deadline =
                     Some(deadline_for(interval, present_cost, now_ms, frame.delay_ms));
                 None
@@ -2677,6 +3267,7 @@ fn downscale_frame(src: &FrameBuffer, size: u32) -> FrameBuffer {
             pixels_pbgra: out,
             delay_ms: 0,
             loop_index: 0,
+            scale: 1.0,
         };
     }
     for ty in 0..size {
@@ -2709,6 +3300,7 @@ fn downscale_frame(src: &FrameBuffer, size: u32) -> FrameBuffer {
         pixels_pbgra: out,
         delay_ms: 0,
         loop_index: 0,
+        scale: 1.0,
     }
 }
 
@@ -2798,5 +3390,49 @@ mod spring_tests {
             (coasted - from_rest.x).abs() > 0.01,
             "inherited velocity must carry the morph forward"
         );
+    }
+}
+
+#[test]
+fn think_bob_bounces_only_while_thinking() {
+    use termielle_core::VisualState;
+    assert_eq!(Controller::think_bob(VisualState::Thinking, 0, 0), 0);
+    assert_ne!(
+        Controller::think_bob(VisualState::Thinking, 0, 0),
+        Controller::think_bob(VisualState::Thinking, 0, 120)
+    );
+    assert_eq!(Controller::think_bob(VisualState::Working, 0, 120), 0);
+    assert_eq!(Controller::think_bob(VisualState::Idle, 2, 5000), 0);
+}
+
+#[test]
+fn shake_fires_briefly_then_locks_to_zero() {
+    use termielle_core::VisualState;
+    assert_eq!(Controller::shake_dx(VisualState::Failed, 0), 0);
+    assert_ne!(Controller::shake_dx(VisualState::Failed, 50), 0);
+    assert_eq!(Controller::shake_dx(VisualState::Failed, 300), 0);
+    assert_eq!(Controller::shake_dx(VisualState::Failed, 5000), 0);
+    assert_eq!(Controller::shake_dx(VisualState::Working, 50), 0);
+}
+
+#[test]
+fn sparkle_flies_out_then_vanishes() {
+    let start = Controller::sparkle_dot(100, 100, 0, 0).unwrap();
+    let mid = Controller::sparkle_dot(100, 100, 0, 300).unwrap();
+    assert!(mid.0 - 100 > start.0 - 100, "radius must grow with age");
+    assert!(mid.2 < start.2, "alpha must fade with age");
+    assert_eq!(Controller::sparkle_dot(100, 100, 0, 600), None);
+    assert_eq!(Controller::sparkle_dot(100, 100, 0, 5000), None);
+}
+
+#[test]
+fn orbit_circles_with_time() {
+    let a = Controller::orbit_dot(50, 50, 10, 0, 0);
+    let b = Controller::orbit_dot(50, 50, 10, 0, 150);
+    assert_ne!(a, b);
+    for t in [0, 100, 250, 599] {
+        let (x, y) = Controller::orbit_dot(50, 50, 10, 1, t);
+        let d = (((x - 50) * (x - 50) + (y - 50) * (y - 50)) as f32).sqrt();
+        assert!((d - 10.0).abs() <= 1.5, "off circle: {d}");
     }
 }

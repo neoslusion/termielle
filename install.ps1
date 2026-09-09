@@ -258,20 +258,33 @@ try {
 
     if (-not $NoTask) {
         Write-Step 'Registering the crash-watchdog task'
+        $action = New-ScheduledTaskAction -Execute (Join-Path $bin 'termielle-app.exe')
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        # Boot-race guard: the session is still initializing when AtLogOn
+        # fires (launching then fails and exhausts the retries), so wait a
+        # minute. The 3x1min restarts cover residual flakiness after that.
+        $trigger.Delay = 'PT1M'
+        $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
+            -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
+            -MultipleInstances IgnoreNew -StartWhenAvailable
         $task = Get-ScheduledTask -TaskName 'Termielle' -ErrorAction SilentlyContinue
         if (-not $task) {
-            $action = New-ScheduledTaskAction -Execute (Join-Path $bin 'termielle-app.exe')
-            $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-            $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
-                -RestartInterval (New-TimeSpan -Minutes 1) `
-                -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
-                -MultipleInstances IgnoreNew -StartWhenAvailable
             Register-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
                 -Settings $settings -Description 'Termielle overlay companion' -Force | Out-Null
             Write-Good 'Task registered'
             $record.task = $true
+        } elseif ($task.State -eq 'Disabled') {
+            Write-Good 'Task left disabled (deliberate opt-out untouched)'
         } else {
-            Write-Good 'Task already registered'
+            $logon = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -match 'Logon' })
+            if ($logon.Count -eq 0 -or $logon[0].Delay -notmatch '^PT1M') {
+                Set-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
+                    -Settings $settings | Out-Null
+                Write-Good 'Task upgraded with logon delay'
+            } else {
+                Write-Good 'Task already registered'
+            }
         }
     }
 

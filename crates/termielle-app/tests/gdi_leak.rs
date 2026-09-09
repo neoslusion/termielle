@@ -19,6 +19,7 @@ fn red_frame(width: u32, height: u32) -> FrameBuffer {
         pixels_pbgra,
         delay_ms: 0,
         loop_index: 0,
+        scale: 1.0,
     }
 }
 
@@ -37,7 +38,7 @@ fn window_present_does_not_leak_gdi_objects() {
     let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
     let frame = red_frame(2, 2);
     for _ in 0..240 {
-        window.present(&frame, 1.0).expect("present frame");
+        window.present(&frame).expect("present frame");
     }
     window.destroy();
 

@@ -60,13 +60,21 @@ pub enum AnimationError {
 }
 
 /// One composited frame in premultiplied BGRA, ready for the overlay.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// `scale` is the physical pixels per logical pixel the frame was authored
+/// at: paint operations interpret their coordinates as logical units and
+/// scale them by this factor, so layout code always reads in design units
+/// while the raster lands at device resolution. Decoded asset pixels and
+/// icon caches are device data used only as blit *sources*, so they carry
+/// the neutral `1.0`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct FrameBuffer {
     pub width: u32,
     pub height: u32,
     pub pixels_pbgra: Vec<u8>,
     pub delay_ms: u32,
     pub loop_index: u64,
+    pub scale: f32,
 }
 
 impl FrameBuffer {
@@ -150,6 +158,7 @@ impl GifAnimation {
             pixels_pbgra: vec![0u8; (width * height * 4) as usize],
             delay_ms,
             loop_index: 0,
+            scale: 1.0,
         };
 
         Ok(Self {
@@ -269,6 +278,7 @@ impl GifAnimation {
             pixels_pbgra: pixels,
             delay_ms: 0,
             loop_index: 0,
+            scale: 1.0,
         })
     }
 }

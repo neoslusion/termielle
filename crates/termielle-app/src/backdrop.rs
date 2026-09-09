@@ -220,6 +220,24 @@ pub fn blur_soft(backdrop: &mut Backdrop, radius: u32) {
     }
 }
 
+/// Pulls backdrop saturation toward gray, like acrylic's luminosity layer:
+/// a saturated wallpaper tints the whole pill (brown mud over orange), so
+/// the veil keeps hue influence without letting any channel dominate.
+/// `amount` 0.0 keeps full color, 1.0 is grayscale. Alpha untouched.
+pub fn desaturate(backdrop: &mut Backdrop, amount: f32) {
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.0 || backdrop.width == 0 || backdrop.height == 0 {
+        return;
+    }
+    for px in backdrop.pixels.chunks_exact_mut(4) {
+        let gray =
+            (u32::from(px[0]) * 29 + u32::from(px[1]) * 150 + u32::from(px[2]) * 77 + 128) / 256;
+        for slot in px.iter_mut().take(3) {
+            let v = gray as f32 + (f32::from(*slot) - gray as f32) * (1.0 - amount);
+            *slot = v.round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +329,35 @@ mod tests {
         assert_eq!(bg.pixels[far], 255);
         let dark = (((h / 2) * w) * 4) as usize;
         assert_eq!(bg.pixels[dark], 0);
+    }
+
+    #[test]
+    fn desaturate_pulls_hue_without_touching_alpha_or_gray() {
+        // Pure orange pixel: channels must converge, alpha stays.
+        let mut bg = Backdrop {
+            width: 2,
+            height: 1,
+            pixels: vec![0, 120, 212, 255, 128, 128, 128, 255],
+        };
+        desaturate(&mut bg, 0.5);
+        let spread_before = 212u32.abs_diff(0);
+        let spread_after =
+            bg.pixels[2].max(bg.pixels[0]) as u32 - bg.pixels[2].min(bg.pixels[0]) as u32;
+        assert!(
+            spread_after < spread_before,
+            "channels must converge: {:?} spread {spread_after}",
+            &bg.pixels[..4]
+        );
+        assert_eq!(bg.pixels[3], 255);
+        // Gray pixel is already neutral: untouched.
+        assert_eq!(&bg.pixels[4..8], &[128, 128, 128, 255]);
+        // Zero amount is a no-op.
+        let mut flat = Backdrop {
+            width: 1,
+            height: 1,
+            pixels: vec![10, 200, 30, 255],
+        };
+        desaturate(&mut flat, 0.0);
+        assert_eq!(flat.pixels, vec![10, 200, 30, 255]);
     }
 }

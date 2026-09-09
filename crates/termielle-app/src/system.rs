@@ -9,6 +9,8 @@ pub struct SystemStats {
     pub battery: Option<u8>, // 0-100
     pub battery_charging: bool,
     pub mem_percent: u8, // 0-100
+    pub mem_used_gb: f32,
+    pub mem_total_gb: f32,
     pub cpu_percent: u8, // 0-100 (smoothed)
 }
 
@@ -44,7 +46,8 @@ pub fn battery_status() -> (Option<u8>, bool) {
     }
 }
 
-pub fn mem_percent() -> u8 {
+/// Returns `(load_percent, used_gb, total_gb)`.
+pub fn memory_info() -> (u8, f32, f32) {
     unsafe {
         let mut info = windows::Win32::System::SystemInformation::MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<windows::Win32::System::SystemInformation::MEMORYSTATUSEX>(
@@ -52,11 +55,18 @@ pub fn mem_percent() -> u8 {
             ..Default::default()
         };
         if windows::Win32::System::SystemInformation::GlobalMemoryStatusEx(&mut info).is_ok() {
-            info.dwMemoryLoad as u8
+            let total_gb = (info.ullTotalPhys as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
+            let avail_gb = (info.ullAvailPhys as f64 / (1024.0 * 1024.0 * 1024.0)) as f32;
+            let used_gb = (total_gb - avail_gb).max(0.0);
+            (info.dwMemoryLoad as u8, used_gb, total_gb)
         } else {
-            0
+            (0, 0.0, 0.0)
         }
     }
+}
+
+pub fn mem_percent() -> u8 {
+    memory_info().0
 }
 
 pub fn cpu_percent() -> u8 {
@@ -157,8 +167,36 @@ pub fn apps_use_light_theme() -> Option<bool> {
     }
 }
 
+/// Whether the Windows shell / system is set to the light theme (registry-backed).
+/// `None` when the value cannot be read.
+pub fn system_uses_light_theme() -> Option<bool> {
+    use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+    use windows::core::w;
+    let mut value: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("SystemUsesLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&raw mut value).cast()),
+            Some(&mut size),
+        )
+    };
+    if status.is_err() {
+        None
+    } else {
+        Some(value == 1)
+    }
+}
+
 /// The user's accent color as BGRA, from the Windows personalization
 /// registry (AccentColorMenu). Falls back to the default Windows blue.
+///
+/// The registry stores DWORD 0xAABBGGRR (little-endian bytes: [R, G, B, A]).
+/// We unpack into PBGRA [B, G, R, A] so Blue is index 0 and Red is index 2.
 pub fn accent_color_bgra() -> [u8; 4] {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
     use windows::core::w;
@@ -178,13 +216,18 @@ pub fn accent_color_bgra() -> [u8; 4] {
     if status.is_err() {
         [215, 120, 0, 255] // default Windows accent #0078D7 in BGRA
     } else {
-        [
-            (value & 0xff) as u8,
-            ((value >> 8) & 0xff) as u8,
-            ((value >> 16) & 0xff) as u8,
-            255,
-        ]
+        unpack_accent_dword(value)
     }
+}
+
+/// Unpacks a Windows AccentColorMenu DWORD (0xAABBGGRR) into BGRA [B, G, R, A].
+pub fn unpack_accent_dword(value: u32) -> [u8; 4] {
+    [
+        ((value >> 16) & 0xff) as u8, // Blue (high byte 16..23) -> index 0
+        ((value >> 8) & 0xff) as u8,  // Green (mid byte 8..15)  -> index 1
+        (value & 0xff) as u8,         // Red (low byte 0..7)     -> index 2
+        255,
+    ]
 }
 
 /// Whether Windows "transparency effects" are enabled. When off, the
@@ -233,8 +276,9 @@ pub fn taskbar_shows_accent() -> bool {
 }
 
 /// Resolves the `auto` theme name from the system light/dark setting.
+/// Prefers the system/shell theme (matching the taskbar), falling back to apps.
 pub fn auto_theme_name() -> &'static str {
-    match apps_use_light_theme() {
+    match system_uses_light_theme().or_else(apps_use_light_theme) {
         Some(true) => "light",
         _ => "liquid-dark",
     }
@@ -242,11 +286,31 @@ pub fn auto_theme_name() -> &'static str {
 
 pub fn collect() -> SystemStats {
     let (bat, charging) = battery_status();
+    let (mem_pct, mem_used, mem_total) = memory_info();
     SystemStats {
         time: current_time_text(),
         battery: bat,
         battery_charging: charging,
-        mem_percent: mem_percent(),
+        mem_percent: mem_pct,
+        mem_used_gb: mem_used,
+        mem_total_gb: mem_total,
         cpu_percent: cpu_percent(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpack_accent_dword_maps_to_bgra() {
+        // Windows default blue #0078D4 is stored in AccentColorMenu as 0xFFD47800
+        // (A=0xFF, B=0xD4=212, G=0x78=120, R=0x00=0).
+        let dword: u32 = 0xFFD47800;
+        let bgra = unpack_accent_dword(dword);
+        assert_eq!(bgra[0], 212, "Blue channel mismatch");
+        assert_eq!(bgra[1], 120, "Green channel mismatch");
+        assert_eq!(bgra[2], 0, "Red channel mismatch");
+        assert_eq!(bgra[3], 255, "Alpha channel mismatch");
     }
 }

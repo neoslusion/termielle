@@ -27,8 +27,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Edge length of a decoded media artwork thumbnail, in pixels (high-resolution).
 pub const ICON_PX: u32 = 64;
 
-/// Edge length of a decoded window task icon, in pixels.
-pub const TASK_ICON_PX: u32 = 36;
+/// Edge length of a decoded window task icon, in pixels. Larger than any
+/// display size (tiles show at <= 24 logical px), so dashboard icons stay
+/// crisp through render scales up to 2x.
+pub const TASK_ICON_PX: u32 = 48;
 
 /// How often the worker repolls running tasks while enabled, in milliseconds.
 pub const TASKS_REFRESH_MS: u64 = 1500;
@@ -148,12 +150,15 @@ pub struct BackdropRequest {
 pub struct WorkerConfig {
     /// When false the worker sleeps instead of polling.
     pub enabled: AtomicBool,
+    /// When true, window tasks are enumerated for task switcher.
+    pub poll_tasks: AtomicBool,
 }
 
 impl WorkerConfig {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool, poll_tasks: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
+            poll_tasks: AtomicBool::new(poll_tasks),
         }
     }
 }
@@ -220,6 +225,9 @@ pub fn spawn_worker(
                         );
                         if let Some(bg) = bg.as_mut() {
                             crate::backdrop::blur_soft(bg, req.radius);
+                            // Acrylic desaturates what it blurs: keeps the
+                            // wallpaper's light without its hue taking over.
+                            crate::backdrop::desaturate(bg, 0.15);
                         }
                         backdrop = bg;
                         last_sig = Some(sig);
@@ -227,19 +235,28 @@ pub fn spawn_worker(
                     }
                 }
 
+                // Keep CPU sampler primed and smooth in the background.
+                let _ = crate::system::cpu_percent();
+
                 // Expensive polls stay on their own cadences.
                 let media_due = now_ms.saturating_sub(last_media_ms) >= MEDIA_REFRESH_MS;
                 if media_due {
                     last_media_ms = now_ms;
                     last_media = current_media();
                 }
-                let tasks_due = now_ms.saturating_sub(last_tasks_ms) >= TASKS_REFRESH_MS;
+                let should_poll_tasks = config.poll_tasks.load(Ordering::Relaxed);
+                let tasks_due = should_poll_tasks
+                    && now_ms.saturating_sub(last_tasks_ms) >= TASKS_REFRESH_MS;
+                let mut tasks_cleared = false;
                 if tasks_due {
                     last_tasks_ms = now_ms;
                     last_tasks = enumerate_tasks(6);
+                } else if !should_poll_tasks && !last_tasks.is_empty() {
+                    last_tasks.clear();
+                    tasks_cleared = true;
                 }
 
-                if backdrop.is_some() || media_due || tasks_due {
+                if backdrop.is_some() || media_due || tasks_due || tasks_cleared {
                     let update = WorkerUpdate {
                         media: last_media.clone(),
                         tasks: last_tasks.clone(),
@@ -548,6 +565,7 @@ pub fn window_icon(hwnd: isize, title: &str) -> Option<TaskIcon> {
         pixels_pbgra: native,
         delay_ms: 0,
         loop_index: 0,
+        scale: 1.0,
     };
     let scaled = if w == TASK_ICON_PX && h == TASK_ICON_PX {
         frame

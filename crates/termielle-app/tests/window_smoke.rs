@@ -18,15 +18,14 @@ fn red_frame(width: u32, height: u32) -> FrameBuffer {
         pixels_pbgra,
         delay_ms: 0,
         loop_index: 0,
+        scale: 1.0,
     }
 }
 
 #[test]
 fn window_smoke_present_and_destroy() {
     let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
-    window
-        .present(&red_frame(2, 2), 1.0)
-        .expect("present frame");
+    window.present(&red_frame(2, 2)).expect("present frame");
     thread::sleep(Duration::from_millis(1));
     let (rect, monitor) = window.position();
     assert!(rect.right > rect.left);
@@ -38,9 +37,7 @@ fn window_smoke_present_and_destroy() {
 #[test]
 fn window_position_roundtrip_restores_placement() {
     let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
-    window
-        .present(&red_frame(360, 360), 1.0)
-        .expect("present frame");
+    window.present(&red_frame(360, 360)).expect("present frame");
     let (rect, monitor) = window.position();
     drop(window);
 
@@ -54,7 +51,7 @@ fn window_position_roundtrip_restores_placement() {
     };
     let mut restored = OverlayWindow::create(&config, true).expect("restore window");
     restored
-        .present(&red_frame(360, 360), 1.0)
+        .present(&red_frame(360, 360))
         .expect("present frame");
     let (rect2, _) = restored.position();
     assert_eq!(rect, rect2);
@@ -64,9 +61,7 @@ fn window_position_roundtrip_restores_placement() {
 #[test]
 fn window_invalid_persisted_position_clamps_to_default() {
     let mut fresh = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
-    fresh
-        .present(&red_frame(360, 360), 1.0)
-        .expect("present frame");
+    fresh.present(&red_frame(360, 360)).expect("present frame");
     let (fresh_rect, monitor) = fresh.position();
     fresh.destroy();
 
@@ -79,9 +74,7 @@ fn window_invalid_persisted_position_clamps_to_default() {
         ..AppConfig::default()
     };
     let mut bogus = OverlayWindow::create(&config, true).expect("create window");
-    bogus
-        .present(&red_frame(360, 360), 1.0)
-        .expect("present frame");
+    bogus.present(&red_frame(360, 360)).expect("present frame");
     let (bogus_rect, _) = bogus.position();
     bogus.destroy();
 
@@ -89,11 +82,11 @@ fn window_invalid_persisted_position_clamps_to_default() {
 }
 
 #[test]
-fn window_presented_rect_uses_scaled_size() {
+fn window_presented_rect_matches_frame_size() {
+    // Frames arrive authored at device pixels: the window takes their size
+    // as-is instead of scaling them.
     let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
-    window
-        .present(&red_frame(360, 360), 2.0)
-        .expect("present frame");
+    window.present(&red_frame(720, 720)).expect("present frame");
     let (rect, _) = window.position();
     assert_eq!(rect.width(), 720);
     assert_eq!(rect.height(), 720);

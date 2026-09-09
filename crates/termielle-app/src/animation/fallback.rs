@@ -9,6 +9,7 @@
 use termielle_core::VisualState;
 
 use crate::animation::FrameBuffer;
+use crate::window::scaled_size;
 
 /// The two body colors for a state: the outer ring and the inner fill, as
 /// BGRA bytes (blue, green, red, alpha).
@@ -29,28 +30,33 @@ fn body_colors(state: VisualState) -> ([u8; 4], [u8; 4]) {
     }
 }
 
-/// Builds the procedural still frame for one state.
-pub fn fallback_frame(state: VisualState, size: u32) -> FrameBuffer {
+/// Builds the procedural still frame for one state. `size` reads logical;
+/// the frame is authored at `scale` device pixels per logical pixel.
+pub fn fallback_frame(state: VisualState, size: u32, scale: f32) -> FrameBuffer {
+    let (width, height) = scaled_size((size.max(1), size.max(1)), scale);
     let mut frame = FrameBuffer {
-        width: size,
-        height: size,
-        pixels_pbgra: vec![0u8; (size * size * 4) as usize],
+        width,
+        height,
+        pixels_pbgra: vec![0u8; (width * height * 4) as usize],
         delay_ms: 0,
         loop_index: 0,
+        scale,
     };
 
     let (ring, fill) = body_colors(state);
-    let margin = size / 8;
-    let thickness = size / 8;
+    // Device-space body metrics: the ring keeps its designed proportions at
+    // any authoring scale.
+    let margin = (((size / 8) as f32 * scale).round() as i64).clamp(0, i64::from(u32::MAX)) as u32;
+    let thickness = margin;
 
     // Rounded body: a ring around a fill, with transparent corners outside the
     // margin, so the pet's corners never block clicks into the application.
-    for y in margin..size - margin {
-        for x in margin..size - margin {
+    for y in margin..width.saturating_sub(margin) {
+        for x in margin..width.saturating_sub(margin) {
             let on_ring = x - margin < thickness
-                || size - margin - x <= thickness
+                || width - margin - x <= thickness
                 || y - margin < thickness
-                || size - margin - y <= thickness;
+                || width - margin - y <= thickness;
             let color = if on_ring { ring } else { fill };
             set_pixel(&mut frame, x as i32, y as i32, color);
         }
@@ -129,7 +135,11 @@ fn draw_glyph(frame: &mut FrameBuffer, state: VisualState, size: u32) {
 
 /// Draws a square annulus approximating a circle at `(center_x, center_y)`.
 fn draw_circle(frame: &mut FrameBuffer, center_x: i32, center_y: i32, radius: u32, color: [u8; 4]) {
-    let radius = radius as i32;
+    let (center_x, center_y) = (
+        (center_x as f32 * frame.scale).round() as i32,
+        (center_y as f32 * frame.scale).round() as i32,
+    );
+    let radius = (radius as f32 * frame.scale).round() as i32;
     for y in -radius..=radius {
         for x in -radius..=radius {
             let distance_sq = x * x + y * y;
@@ -150,10 +160,10 @@ fn fill_rect(
     height: u32,
     color: [u8; 4],
 ) {
-    let left = left.clamp(0, frame.width as i32 - 1);
-    let top = top.clamp(0, frame.height as i32 - 1);
-    let right = (left + width as i32).min(frame.width as i32);
-    let bottom = (top + height as i32).min(frame.height as i32);
+    let left = ((left as f32 * frame.scale).round() as i32).clamp(0, frame.width as i32 - 1);
+    let top = ((top as f32 * frame.scale).round() as i32).clamp(0, frame.height as i32 - 1);
+    let right = (left + ((width as f32 * frame.scale).round() as i32)).min(frame.width as i32);
+    let bottom = (top + ((height as f32 * frame.scale).round() as i32)).min(frame.height as i32);
     for y in top..bottom {
         for x in left..right {
             set_pixel(frame, x, y, color);

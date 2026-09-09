@@ -18,8 +18,9 @@ scaffold in `integrations/_template/`.
 
 One-shot installer — downloads the latest release, verifies the checksum,
 installs the binaries to `%LOCALAPPDATA%\Termielle\bin`, registers the
-crash-watchdog startup task, and wires up whichever agent integrations are
-present:
+crash-watchdog startup task (logon trigger with a one-minute delay past
+boot races, plus restarts on failure), and wires up whichever agent
+integrations are present:
 
 ```powershell
 irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex

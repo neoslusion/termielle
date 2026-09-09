@@ -220,6 +220,10 @@ fn main() {
     );
     // User zoom rides on top of monitor DPI inside `render_scale`.
     controller.set_user_scale(config.scale);
+    // Author the first frame at the live scale: the journal replay below
+    // renders immediately, before any present refreshes the DPI.
+    controller.set_dpi_scale(window.dpi_scale());
+    controller.refresh_scale(now_ms());
 
     // Only the production overlay journals and replays: diagnostics runs on
     // custom pipes must neither inherit nor pollute the live state.
@@ -273,6 +277,7 @@ fn main() {
     // exits when its receiver is dropped at shutdown.
     let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
         config.island.is_enabled(),
+        config.island.has_widget("tasks") && config.island.show_tasks,
     ));
     let (thumb_sender, thumb_receiver) = channel();
     let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
@@ -685,12 +690,11 @@ fn present_current(
     // different DPIs tracks without an invalidation path (the DisplayChanged
     // repaint covers the transition frame).
     controller.set_dpi_scale(window.dpi_scale());
-    let scale = controller.render_scale();
     let anchor = controller.island_anchor();
     let attempt = if let Some((attached, y_off)) = anchor {
-        window.present_with_anchor(controller.current_frame(), scale, Some((attached, y_off)))
+        window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
     } else {
-        window.present(controller.current_frame(), scale)
+        window.present(controller.current_frame())
     };
     // Publish the glass capture request: the rect the pill was just drawn
     // at. The worker owns the (potentially slow) capture and blur.
@@ -723,13 +727,9 @@ fn present_current(
             );
             let retry_anchor = controller.island_anchor();
             let retry = if let Some((attached, y_off)) = retry_anchor {
-                window.present_with_anchor(
-                    controller.current_frame(),
-                    scale,
-                    Some((attached, y_off)),
-                )
+                window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
             } else {
-                window.present(controller.current_frame(), scale)
+                window.present(controller.current_frame())
             };
             match retry {
                 Ok(()) => {
@@ -749,11 +749,10 @@ fn present_current(
                     let _ = if let Some((attached, y_off)) = fallback_anchor {
                         window.present_with_anchor(
                             controller.current_frame(),
-                            scale,
                             Some((attached, y_off)),
                         )
                     } else {
-                        window.present(controller.current_frame(), scale)
+                        window.present(controller.current_frame())
                     };
                 }
             }
@@ -763,15 +762,32 @@ fn present_current(
 
 /// Polls hover from the real cursor position and folds any transition into
 /// `actions`. Backstop for spurious `WM_MOUSELEAVE`s across ULW resizes.
+/// Also auto-dismisses the manually expanded card if the user clicks outside or presses Escape.
 fn poll_hover(
     window: &OverlayWindow,
     controller: &mut Controller,
     actions: &mut ControllerActions,
 ) {
+    let now = now_ms();
     controller.set_hover_point(window.cursor_client_pos());
-    if controller.set_hover(window.cursor_over_pill(), now_ms()) {
+    let over = window.cursor_over_pill();
+    if controller.set_hover(over, now) {
         actions.present_frame = true;
         actions.next_deadline_ms = controller.next_deadline_ms();
+    }
+    if controller.is_manually_expanded() {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
+        };
+        let l_click = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
+        let r_click = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0;
+        let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } < 0;
+        if (!over && (l_click || r_click)) || esc {
+            if controller.collapse_if_expanded(now) {
+                actions.present_frame = true;
+                actions.next_deadline_ms = controller.next_deadline_ms();
+            }
+        }
     }
 }
 
@@ -1012,6 +1028,10 @@ fn run_gui(
                 // tracked monitor so the repaint re-picks the display the
                 // cursor is on, then SetWindowPos re-anchors top-center there.
                 window.reset_anchor_monitor();
+                // A monitor change can move the pill across DPIs: re-author
+                // the frame at the new scale before presenting it.
+                controller.set_dpi_scale(window.dpi_scale());
+                controller.refresh_scale(now_ms());
                 ControllerActions {
                     present_frame: true,
                     ..Default::default()
@@ -1040,6 +1060,10 @@ fn run_gui(
                 window.set_glass(&config.island.glass);
                 thumb_cfg.enabled.store(
                     config.island.is_enabled(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                thumb_cfg.poll_tasks.store(
+                    config.island.has_widget("tasks") && config.island.show_tasks,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 ControllerActions {
@@ -1238,9 +1262,11 @@ fn run_smoke(
     log: &Arc<Mutex<BoundedLog>>,
     builtin_event: bool,
 ) -> i32 {
+    controller.set_dpi_scale(window.dpi_scale());
+    let scale = controller.render_scale();
     for state in ALL_STATES {
-        let frame = fallback_frame(state, FALLBACK_FRAME_SIZE);
-        if let Err(error) = window.present(&frame, 1.0) {
+        let frame = fallback_frame(state, FALLBACK_FRAME_SIZE, scale);
+        if let Err(error) = window.present(&frame) {
             log_error(
                 log,
                 LogComponent::Window,

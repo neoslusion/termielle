@@ -21,6 +21,12 @@ pub struct ThemeFile {
     pub highlight_alpha: Option<u8>,
     pub shadow_alpha: Option<u8>,
     pub corner_radius: Option<u32>,
+    /// Tint override when the layout is an attached notch (hardware-black
+    /// reads differently from floating glass, so one tint rarely suits
+    /// both). Wins over `tint`, loses to explicit user glass.
+    pub notch_tint: Option<[u8; 4]>,
+    /// Tint override when the layout is a floating island.
+    pub island_tint: Option<[u8; 4]>,
     pub description: String,
 }
 
@@ -35,6 +41,8 @@ impl Default for ThemeFile {
             highlight_alpha: None,
             shadow_alpha: None,
             corner_radius: None,
+            notch_tint: None,
+            island_tint: None,
             description: String::new(),
         }
     }
@@ -74,18 +82,28 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
                 if transparency { 60 } else { 0 },
             ),
         };
-    // System-following dark mode uses the measured taskbar acrylic instead
-    // of the generic preset: a cool luminous veil at ~73% (sampled from a
-    // transparency-on neutral taskbar — it reads blue-gray, never muddy).
-    // Opaque mode stays flat like the opaque taskbar.
-    if name == "auto" && resolved != "light" {
-        tint = [40, 50, 62, if transparency { 185 } else { 255 }];
-    }
-    // System-following mode tracks the taskbar: when Windows paints the
-    // accent onto the taskbar, the acrylic — and the island — tints toward
-    // it. Explicit named themes stay exact.
-    if name == "auto" && crate::system::taskbar_shows_accent() {
-        tint = blend_toward_accent(tint, crate::system::accent_color_bgra());
+    // System-following dark mode matches the Windows 11 taskbar acrylic:
+    // Windows 11 taskbar acrylic naturally infuses a subtle undertone (~16%)
+    // of the active accent / colorization color (e.g. Windows blue),
+    // giving that signature luminous slate-blue acrylic look.
+    // When "Show accent color on Start and taskbar" is enabled, it uses
+    // a richer 40% accent blend.
+    if name == "auto" {
+        config.glass.notch_black = false;
+        if resolved != "light" {
+            let base_tint = [30, 30, 30, if transparency { 180 } else { 255 }];
+            let accent = crate::system::accent_color_bgra();
+            let mix = if crate::system::taskbar_shows_accent() {
+                ACCENT_MIX_VIVID
+            } else if transparency {
+                ACCENT_MIX_SUBTLE
+            } else {
+                0.0
+            };
+            tint = blend_toward_accent(base_tint, accent, mix);
+        } else if crate::system::taskbar_shows_accent() {
+            tint = blend_toward_accent(tint, crate::system::accent_color_bgra(), ACCENT_MIX_VIVID);
+        }
     }
     config.glass.tint = tint;
     config.glass.blur_radius = blur;
@@ -96,17 +114,18 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
     config.clamp();
 }
 
-/// How far an `auto` glass tint leans toward the taskbar accent color.
-/// Approximates the DWM colorization balance of the taskbar acrylic, so the
-/// two read as one material.
-const ACCENT_MIX: f32 = 0.4;
+/// Vivid accent mix when "Show accent color on Start and taskbar" is enabled (40%).
+pub const ACCENT_MIX_VIVID: f32 = 0.40;
+/// Subtle accent infusion for Windows 11 acrylic (~16%), giving the dark acrylic
+/// its signature cool blue / accent luminous undertone.
+pub const ACCENT_MIX_SUBTLE: f32 = 0.16;
 
 /// Linear blend of a BGRA tint toward the accent color. Alpha is preserved:
 /// translucency stays the theme's decision, only the hue follows.
-fn blend_toward_accent(base: [u8; 4], accent: [u8; 4]) -> [u8; 4] {
+pub fn blend_toward_accent(base: [u8; 4], accent: [u8; 4], mix: f32) -> [u8; 4] {
     let mut out = base;
     for ch in 0..3 {
-        out[ch] = (f32::from(base[ch]) * (1.0 - ACCENT_MIX) + f32::from(accent[ch]) * ACCENT_MIX)
+        out[ch] = (f32::from(base[ch]) * (1.0 - mix) + f32::from(accent[ch]) * mix)
             .round()
             .clamp(0.0, 255.0) as u8;
     }
@@ -151,6 +170,12 @@ pub fn theme_roots() -> Vec<PathBuf> {
 /// wins — otherwise every non-`custom` theme would silently re-darken a
 /// user-chosen tint and the pill would vanish on dark wallpapers.
 pub fn resolve_theme(config: &mut IslandConfig) {
+    let roots = theme_roots();
+    resolve_theme_with_roots(config, &roots);
+}
+
+/// [`resolve_theme`] with explicit search roots, for hermetic tests.
+fn resolve_theme_with_roots(config: &mut IslandConfig, roots: &[PathBuf]) {
     // Snapshot explicit user overrides vs the glass default.
     let default = GlassConfig::default();
     let user = config.glass.clone();
@@ -165,8 +190,7 @@ pub fn resolve_theme(config: &mut IslandConfig) {
     // First apply builtin preset for theme name so missing fields get defaults
     apply_theme(config, &config.theme.clone());
     // Then overlay file if present
-    let roots = theme_roots();
-    if let Some(file) = load_theme_file(&config.theme.clone(), &roots) {
+    if let Some(file) = load_theme_file(&config.theme.clone(), roots) {
         if let Some(tint) = file.tint {
             config.glass.tint = tint;
         }
@@ -184,6 +208,16 @@ pub fn resolve_theme(config: &mut IslandConfig) {
         }
         if let Some(v) = file.corner_radius {
             config.corner_radius = v;
+        }
+        // Per-layout material: attached notches and floating islands catch
+        // light differently. Applies before explicit user glass below.
+        let layout_tint = if config.is_attached() {
+            file.notch_tint
+        } else {
+            file.island_tint
+        };
+        if let Some(tint) = layout_tint {
+            config.glass.tint = tint;
         }
     }
 
@@ -230,29 +264,44 @@ mod tests {
             ..Default::default()
         };
         apply_theme(&mut c, "auto");
-        let light = crate::system::apps_use_light_theme() == Some(true);
+        let light = crate::system::system_uses_light_theme()
+            .or_else(crate::system::apps_use_light_theme)
+            == Some(true);
         // Must mirror apply_theme: taskbar-matched dark veil, then the
         // accent lean when the taskbar shows it.
-        let mut expected: [u8; 4] = if light {
-            [243, 243, 243, 230]
-        } else if crate::system::transparency_enabled() {
-            [40, 50, 62, 185]
+        let expected: [u8; 4] = if light {
+            let base = [243, 243, 243, 230];
+            if crate::system::taskbar_shows_accent() {
+                blend_toward_accent(base, crate::system::accent_color_bgra(), ACCENT_MIX_VIVID)
+            } else {
+                base
+            }
         } else {
-            [40, 50, 62, 255]
+            let base = [30, 30, 30, if crate::system::transparency_enabled() { 180 } else { 255 }];
+            let mix = if crate::system::taskbar_shows_accent() {
+                ACCENT_MIX_VIVID
+            } else if crate::system::transparency_enabled() {
+                ACCENT_MIX_SUBTLE
+            } else {
+                0.0
+            };
+            blend_toward_accent(base, crate::system::accent_color_bgra(), mix)
         };
-        // An accent-painted taskbar tints the island too.
-        if crate::system::taskbar_shows_accent() {
-            expected = blend_toward_accent(expected, crate::system::accent_color_bgra());
-        }
         assert_eq!(c.glass.tint, expected);
+        assert!(!c.glass.notch_black);
     }
 
     #[test]
     fn blend_leans_toward_accent_and_keeps_alpha() {
         // 40% of the way from near-black to Windows blue, alpha untouched.
         assert_eq!(
-            blend_toward_accent([32, 32, 32, 205], [215, 120, 0, 255]),
+            blend_toward_accent([32, 32, 32, 205], [215, 120, 0, 255], 0.40),
             [105, 67, 19, 205]
+        );
+        // 16% subtle acrylic blend
+        assert_eq!(
+            blend_toward_accent([30, 30, 30, 180], [212, 120, 0, 255], 0.16),
+            [59, 44, 25, 180]
         );
     }
 
@@ -274,5 +323,44 @@ mod tests {
         // Unknown names resolve to the dark taskbar default.
         apply_theme(&mut c, "nope");
         assert_eq!(c.glass.tint, [32, 32, 32, 205]);
+    }
+
+    #[test]
+    fn file_tint_applies_per_layout_before_user_glass() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("split.json"),
+            r#"{"name":"split","tint":[10,10,10,200],"notch_tint":[0,0,0,255],"island_tint":[80,90,110,180]}"#,
+        )
+        .unwrap();
+        let roots = vec![dir.path().to_path_buf()];
+        // Notch takes the notch tint.
+        let mut notch = IslandConfig {
+            layout: termielle_core::IslandLayout::Notch,
+            theme: "split".into(),
+            ..Default::default()
+        };
+        resolve_theme_with_roots(&mut notch, &roots);
+        assert_eq!(notch.glass.tint, [0, 0, 0, 255]);
+        // Island takes the island tint.
+        let mut island = IslandConfig {
+            layout: termielle_core::IslandLayout::Island,
+            theme: "split".into(),
+            ..Default::default()
+        };
+        resolve_theme_with_roots(&mut island, &roots);
+        assert_eq!(island.glass.tint, [80, 90, 110, 180]);
+        // Explicit user glass still wins over both.
+        let mut custom = IslandConfig {
+            layout: termielle_core::IslandLayout::Island,
+            theme: "split".into(),
+            glass: termielle_core::GlassConfig {
+                tint: [1, 2, 3, 4],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        resolve_theme_with_roots(&mut custom, &roots);
+        assert_eq!(custom.glass.tint, [1, 2, 3, 4]);
     }
 }

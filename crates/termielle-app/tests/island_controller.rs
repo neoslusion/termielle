@@ -30,6 +30,8 @@ fn island_140_320() -> IslandConfig {
         height: 36,
         corner_radius: 18,
         animation_ms: 100,
+        collapse_ms: 100,
+        alert_ms: 100,
         auto_hide: true,
         ..Default::default()
     }
@@ -45,6 +47,8 @@ fn island_starts_hidden_and_promotes_to_compact_live_on_prompt() {
     island.height = 36;
     island.corner_radius = 18;
     island.animation_ms = 100; // fast for test
+    island.collapse_ms = 100;
+    island.alert_ms = 100;
     island.auto_hide = true;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     assert!(c.is_island());
@@ -69,7 +73,8 @@ fn island_starts_hidden_and_promotes_to_compact_live_on_prompt() {
     let _ = c.on_timer(10200);
     assert_eq!(c.current_frame().width, 72);
     assert_eq!(c.current_frame().height, 36);
-    assert_eq!(c.next_deadline_ms(), Some(11000)); // thinking hold
+    // Motion ticks pace the thinking bounce ahead of the hold.
+    assert_eq!(c.next_deadline_ms(), Some(10250)); // motion tick, then thinking hold at 11000
 }
 
 #[test]
@@ -94,6 +99,8 @@ fn island_reduced_motion_is_immediate() {
     island.collapsed_width = 100;
     island.expanded_width = 300;
     island.animation_ms = 500;
+    island.collapse_ms = 500;
+    island.alert_ms = 500;
     island.auto_hide = true;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island);
     // Idle with nothing live: hidden.
@@ -114,6 +121,8 @@ fn island_ready_holds_compact_then_idle_hides() {
     island.collapsed_width = 140;
     island.expanded_width = 300;
     island.animation_ms = 50;
+    island.collapse_ms = 50;
+    island.alert_ms = 50;
     island.auto_hide = true;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
@@ -471,6 +480,8 @@ fn split_island_two_blobs_when_agent_and_media_both_live() {
     use termielle_app::tasks::{MediaInfo, WorkerUpdate};
     let mut cfg = island_140_320();
     cfg.animation_ms = 50;
+    cfg.collapse_ms = 50;
+    cfg.alert_ms = 50;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
 
     // Agent goes live: compact live pill.
@@ -513,6 +524,8 @@ fn split_island_merges_back_when_media_stops() {
     use termielle_app::tasks::{MediaInfo, WorkerUpdate};
     let mut cfg = island_140_320();
     cfg.animation_ms = 50;
+    cfg.collapse_ms = 50;
+    cfg.alert_ms = 50;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
     c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
     c.set_task_update(WorkerUpdate {
@@ -748,4 +761,206 @@ fn alert_freshness_boundary_still_banners() {
     c.on_timer(70200);
     assert_eq!(c.current_frame().width, 320);
     assert_eq!(c.current_frame().height, 124);
+}
+
+#[test]
+fn alert_queue_plays_second_banner_after_first_expires() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    // Two sessions need input 400 ms apart: the first banner shows.
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 10000);
+    c.handle_event(event("s2", EventKind::NeedsInput, 10400), 10400);
+    c.on_timer(10600);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 124);
+    let first = c.current_frame().pixels_pbgra.clone();
+
+    // Past the first banner's 3.5 s life the second takes over instead of
+    // collapsing: same card, different session badge.
+    c.on_timer(13600);
+    c.on_timer(13700);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 124);
+    assert_ne!(
+        c.current_frame().pixels_pbgra,
+        first,
+        "second banner must replace the first"
+    );
+
+    // Both turns complete: after the holds the island hides with no banner.
+    c.handle_event(event("s1", EventKind::TurnCompleted, 14000), 14000);
+    c.handle_event(event("s2", EventKind::TurnCompleted, 14100), 14100);
+    c.on_timer(20000);
+    c.on_timer(20200);
+    assert_eq!(c.current_frame().width, 140);
+    assert_eq!(c.current_frame().height, 2);
+}
+#[test]
+fn collapse_settles_on_its_own_faster_timing() {
+    // Expand slowly (500 ms), collapse fast (50 ms): the collapse must be
+    // settled 200 ms later, which the shared slow spring could never do.
+    // No agent events: NeedsInput would raise its own alert card and hide
+    // the manual-expansion target this measures.
+    let mut cfg = island_140_320();
+    cfg.animation_ms = 500;
+    cfg.collapse_ms = 50;
+    cfg.alert_ms = 50;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+    c.set_hover(true, 10000);
+    for t in (10000..12000).step_by(50) {
+        c.on_timer(t);
+    }
+    assert_eq!(c.current_frame().width, 140);
+    assert_eq!(c.current_frame().height, 36);
+    assert_eq!(
+        c.handle_click(70, 18, 12100),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+    for t in (12100..13500).step_by(50) {
+        c.on_timer(t);
+    }
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 154);
+    c.set_hover(false, 13500);
+    assert_eq!(
+        c.handle_click(70, 18, 13600),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+    for t in (13600..13800).step_by(50) {
+        c.on_timer(t);
+    }
+    assert_eq!(c.current_frame().width, 140);
+    assert_eq!(c.current_frame().height, 2);
+}
+
+#[test]
+fn thinking_dots_bounce_between_motion_ticks() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    // Settle the morph with fine steps; still Thinking (hold fires at 11000).
+    for t in (10000..10400).step_by(50) {
+        c.on_timer(t);
+    }
+    let a = c.current_frame().pixels_pbgra.clone();
+    for t in (10400..10550).step_by(50) {
+        c.on_timer(t);
+    }
+    let b = c.current_frame().pixels_pbgra.clone();
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Thinking);
+    assert_ne!(a, b, "thinking bounce must repaint between motion ticks");
+}
+
+#[test]
+fn failed_shake_settles_pixel_stable() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    c.handle_event(event("s1", EventKind::TurnFailed, 10100), 10100);
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Failed);
+    // Past morph end and the 300 ms shake window: locked to zero.
+    for t in (10100..10600).step_by(50) {
+        c.on_timer(t);
+    }
+    let a = c.current_frame().pixels_pbgra.clone();
+    for t in (10600..10750).step_by(50) {
+        c.on_timer(t);
+    }
+    assert_eq!(
+        a,
+        c.current_frame().pixels_pbgra,
+        "settled failed frames must be identical"
+    );
+}
+
+#[test]
+fn ready_sparkle_appears_then_vanishes() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    c.set_hover(true, 10000);
+    c.on_timer(10160);
+    assert_eq!(
+        c.handle_click(70, 18, 10200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+    c.handle_event(event("s1", EventKind::TurnCompleted, 10300), 10300);
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Ready);
+    // Settled card, sparkles mid-flight (600 ms window from 10300).
+    for t in (10300..10600).step_by(50) {
+        c.on_timer(t);
+    }
+    let a = c.current_frame().pixels_pbgra.clone();
+    // Past the flight: gone, and the frames stop changing entirely.
+    for t in (10600..11200).step_by(50) {
+        c.on_timer(t);
+    }
+    let b = c.current_frame().pixels_pbgra.clone();
+    assert_ne!(a, b, "sparkles must show then leave");
+    for t in (11200..11350).step_by(50) {
+        c.on_timer(t);
+    }
+    assert_eq!(
+        b,
+        c.current_frame().pixels_pbgra,
+        "post-sparkle frames must be identical"
+    );
+}
+
+#[test]
+fn render_scale_authors_frames_at_device_pixels() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.set_dpi_scale(1.25);
+    // The construction frame was built at 1.0: refresh re-authors it.
+    assert!(c.refresh_scale(1000));
+    // Hidden sensor: 140x2 logical becomes 175x3 device pixels.
+    assert_eq!(c.current_frame().width, 175);
+    assert_eq!(c.current_frame().height, 3);
+    // Layout still reads logical: targets are untouched by the scale.
+    assert_eq!(c.target_size(termielle_core::VisualState::Idle), (140, 2));
+    // A second refresh is a no-op: dimensions already match.
+    assert!(!c.refresh_scale(1000));
+}
+
+#[test]
+fn render_scale_compact_pill_keeps_content_and_morphs_logical() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.set_dpi_scale(1.25);
+    let _ = c.refresh_scale(9000);
+    let _ = c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    let _ = c.on_timer(10050);
+    let _ = c.on_timer(10200);
+    // Settled compact pill: 72x36 logical authored at 90x45 device pixels.
+    let frame = c.current_frame();
+    assert_eq!(frame.width, 90);
+    assert_eq!(frame.height, 45);
+    let solid = frame
+        .pixels_pbgra
+        .chunks_exact(4)
+        .filter(|px| px[3] > 150)
+        .count();
+    assert!(solid > 500, "compact pill must render content at scale");
+}
+
+#[test]
+fn collapse_if_expanded_collapses_tall_card() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    // Initially hidden / idle
+    assert!(!c.is_manually_expanded());
+    assert!(!c.collapse_if_expanded(1000));
+
+    // Expand via click
+    assert!(c.toggle_expand(1000));
+    assert!(c.is_manually_expanded());
+
+    // Settle into expanded tall card
+    let _ = c.on_timer(1050);
+    let _ = c.on_timer(1200);
+    assert_eq!(c.current_frame().width, 320);
+
+    // Call collapse_if_expanded (simulating click outside / Esc)
+    assert!(c.collapse_if_expanded(1300));
+    assert!(!c.is_manually_expanded());
+
+    // Settle back to hidden (140x2)
+    let _ = c.on_timer(1350);
+    let _ = c.on_timer(1500);
+    assert_eq!(c.current_frame().height, 2);
 }

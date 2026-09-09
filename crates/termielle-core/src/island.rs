@@ -90,6 +90,8 @@ const DEFAULT_Y_OFFSET: i32 = 8;
 const MIN_ANIM_MS: u32 = 100;
 const MAX_ANIM_MS: u32 = 800;
 const DEFAULT_ANIM_MS: u32 = 350;
+const DEFAULT_COLLAPSE_MS: u32 = 300;
+const DEFAULT_ALERT_MS: u32 = 220;
 
 const MIN_MINIMAL_W: u32 = 48;
 const MAX_MINIMAL_W: u32 = 800;
@@ -123,8 +125,14 @@ pub struct IslandConfig {
     /// stiffness/damping with `spring_bounce` (Apple's spring model), so
     /// morphs overshoot slightly and settle naturally like iOS.
     pub animation_ms: u32,
+    /// Collapse duration in ms: retiring surfaces settle critically damped
+    /// (no overshoot), slightly quicker than they opened.
+    pub collapse_ms: u32,
+    /// Alert-banner drop-in duration in ms: notifications arrive fast with
+    /// the configured bounce.
+    pub alert_ms: u32,
     /// Spring bounce 0.0-0.5: 0 = critically damped (no overshoot), higher
-    /// = springier.
+    /// = springier. Applies to expanding morphs and alert drop-ins.
     pub spring_bounce: f32,
     /// Theme preset name — e.g. "liquid-dark", "light", "midnight".
     /// When present the loader looks up `themes/<name>.json` but `glass`
@@ -171,16 +179,18 @@ impl Default for IslandConfig {
             layout: IslandLayout::Classic,
             collapsed_width: DEFAULT_COLLAPSED_W,
             expanded_width: DEFAULT_EXPANDED_W,
+            animation_ms: DEFAULT_ANIM_MS,
+            collapse_ms: DEFAULT_COLLAPSE_MS,
+            alert_ms: DEFAULT_ALERT_MS,
             minimal_width: DEFAULT_MINIMAL_W,
             height: DEFAULT_HEIGHT,
             corner_radius: DEFAULT_RADIUS,
             y_offset: DEFAULT_Y_OFFSET,
-            animation_ms: DEFAULT_ANIM_MS,
             spring_bounce: DEFAULT_SPRING_BOUNCE,
             theme: "liquid-dark".to_string(),
             glass: GlassConfig::default(),
             scale_with_dpi: true,
-            show_tasks: true,
+            show_tasks: false,
             max_thumbnails: 4,
             face_animated: true,
             ring_metric: "battery".to_string(),
@@ -193,11 +203,11 @@ impl Default for IslandConfig {
 }
 
 impl IslandConfig {
-    /// The stock widget set: animated face, task icons, session dots,
+    /// The stock widget set: animated face, session dots,
     /// media indicator, and progress ring. Purely visual — the pill renders
     /// no text at all.
     pub fn default_widgets() -> Vec<String> {
-        ["face", "tasks", "agents", "music", "ring"]
+        ["face", "agents", "music", "ring"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -222,6 +232,8 @@ impl IslandConfig {
             .min(self.height / 2);
         self.y_offset = self.y_offset.clamp(MIN_Y_OFFSET, MAX_Y_OFFSET);
         self.animation_ms = self.animation_ms.clamp(MIN_ANIM_MS, MAX_ANIM_MS);
+        self.collapse_ms = self.collapse_ms.clamp(MIN_ANIM_MS, MAX_ANIM_MS);
+        self.alert_ms = self.alert_ms.clamp(MIN_ANIM_MS, MAX_ANIM_MS);
         self.spring_bounce = self
             .spring_bounce
             .clamp(MIN_SPRING_BOUNCE, MAX_SPRING_BOUNCE);
@@ -352,9 +364,10 @@ mod tests {
         let c = IslandConfig::default();
         assert!(c.expand_on_hover);
         assert!(c.face_animated);
-        for w in ["face", "tasks", "agents", "music", "ring"] {
+        for w in ["face", "agents", "music", "ring"] {
             assert!(c.has_widget(w), "missing widget {w}");
         }
+        assert!(!c.show_tasks);
         assert_eq!(c.glass.blur_radius, 12);
     }
 
@@ -439,5 +452,13 @@ mod tests {
         let (x2, y2) = island_anchored_position(140, 36, true, 8, (0, 0, 1920, 1080));
         assert_eq!(x2, 890);
         assert_eq!(y2, 0);
+    }
+
+    #[test]
+    fn missing_new_flags_inherit_struct_defaults() {
+        // Old config files predate `forward_toasts`: container-level
+        // `#[serde(default)]` must fill them from `Default`, not `false`.
+        let c: IslandConfig = serde_json::from_str(r#"{"layout":"island"}"#).unwrap();
+        assert!(c.forward_toasts);
     }
 }

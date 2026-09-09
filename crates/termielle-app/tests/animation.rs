@@ -193,7 +193,7 @@ fn rejects_corrupt_input() {
 
 #[test]
 fn failed_fallback_has_visible_red_edge_and_transparent_corners() {
-    let frame = fallback_frame(VisualState::Failed, 64);
+    let frame = fallback_frame(VisualState::Failed, 64, 1.0);
     assert_eq!(frame.alpha_at(0, 0), 0);
     assert!(frame.contains_pixel_bgra([0, 0, 255, 255]));
 }
@@ -210,7 +210,7 @@ fn every_state_has_a_distinct_fallback_shape() {
     ];
     let frames: Vec<_> = states
         .iter()
-        .map(|state| fallback_frame(*state, 64))
+        .map(|state| fallback_frame(*state, 64, 1.0))
         .collect();
 
     for (index, left) in frames.iter().enumerate() {
@@ -232,7 +232,7 @@ fn gif_source_and_still_source_both_carry_frames() {
     assert_eq!(frame.width, 2);
     assert_eq!(frame.delay_ms, 20);
 
-    let still = fallback_frame(VisualState::Idle, 32);
+    let still = fallback_frame(VisualState::Idle, 32, 1.0);
     let mut source = AnimationSource::Still(still);
     match &mut source {
         AnimationSource::Still(frame) => {
@@ -255,6 +255,7 @@ fn opaque_frame(width: u32, height: u32, pixels: &[[u8; 4]]) -> FrameBuffer {
         pixels_pbgra: bytes,
         delay_ms: 0,
         loop_index: 0,
+        scale: 1.0,
     }
 }
 

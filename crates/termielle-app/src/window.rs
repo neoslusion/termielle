@@ -728,23 +728,26 @@ impl OverlayWindow {
         Ok(window)
     }
 
-    /// Presents `frame` scaled by `scale`, resizing and re-clamping the window
-    /// on size or first-present, then blitting the frame onto the layered
-    /// surface with per-pixel alpha (or the configured fallback renderer).
-    pub fn present(&mut self, frame: &FrameBuffer, scale: f32) -> Result<(), WindowError> {
-        self.present_with_anchor(frame, scale, None)
+    /// Presents `frame`, resizing and re-clamping the window on size or
+    /// first-present, then blitting the frame onto the layered surface with
+    /// per-pixel alpha (or the configured fallback renderer).
+    pub fn present(&mut self, frame: &FrameBuffer) -> Result<(), WindowError> {
+        self.present_with_anchor(frame, None)
     }
 
     /// Present with optional island anchoring. When `island` is `Some` the
     /// window is centered at the top edge (notch) or just below it (island)
     /// instead of clamping to the work area.
+    ///
+    /// Frames arrive authored at device pixels (see
+    /// [`Controller::render_scale`]): the window takes their size as-is and
+    /// presents 1:1 — there is no filtering step anymore.
     pub fn present_with_anchor(
         &mut self,
         frame: &FrameBuffer,
-        scale: f32,
         island: Option<(bool, i32)>,
     ) -> Result<(), WindowError> {
-        let (scaled_w, scaled_h) = scaled_size((frame.width, frame.height), scale);
+        let (w, h) = (frame.width, frame.height);
         let mut rect = RECT::default();
         unsafe { GetWindowRect(self.hwnd, &mut rect) }?;
         let current = Rect {
@@ -753,17 +756,12 @@ impl OverlayWindow {
             right: rect.right,
             bottom: rect.bottom,
         };
-        let needs_move = current.width() != scaled_w as i32
-            || current.height() != scaled_h as i32
-            || !self.repositioned;
+        let needs_move =
+            current.width() != w as i32 || current.height() != h as i32 || !self.repositioned;
         let (x, y) = if let Some((attached, y_offset)) = island {
-            self.island_anchored_position(scaled_w as i32, scaled_h as i32, attached, y_offset)
+            self.island_anchored_position(w as i32, h as i32, attached, y_offset)
         } else {
-            self.clamped_position(
-                scaled_w as i32,
-                scaled_h as i32,
-                (current.left, current.top),
-            )
+            self.clamped_position(w as i32, h as i32, (current.left, current.top))
         };
         if self.render == RenderMode::PerPixel {
             // The per-pixel path updates position, size, and content in ONE
@@ -771,8 +769,8 @@ impl OverlayWindow {
             // psize NULL) is silently ignored by some DWM configurations,
             // which left the window composited empty.
             self.repositioned = true;
-            self.last_dest = (x, y, scaled_w, scaled_h);
-            return self.draw_at(frame, scaled_w, scaled_h, x, y);
+            self.last_dest = (x, y, w, h);
+            return self.draw_at(frame, x, y);
         }
         if needs_move {
             unsafe {
@@ -781,14 +779,14 @@ impl OverlayWindow {
                     None,
                     x,
                     y,
-                    scaled_w as i32,
-                    scaled_h as i32,
+                    w as i32,
+                    h as i32,
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
                 )
             }?;
             self.repositioned = true;
         }
-        self.draw_color_key(frame, scaled_w, scaled_h)
+        self.draw_color_key(frame)
     }
 
     /// Blocks until a window message arrives, dispatches it, and returns the
@@ -1006,15 +1004,11 @@ impl OverlayWindow {
         island_anchored_position(width, height, attached, y_offset, (0, 0, 1920, 1080))
     }
 
-    fn draw_at(
-        &self,
-        frame: &FrameBuffer,
-        scaled_w: u32,
-        scaled_h: u32,
-        x: i32,
-        y: i32,
-    ) -> Result<(), WindowError> {
-        let expected = frame.width as usize * frame.height as usize * 4;
+    fn draw_at(&self, frame: &FrameBuffer, x: i32, y: i32) -> Result<(), WindowError> {
+        // Frames arrive authored at device pixels: every blit below is 1:1,
+        // so the old bilinear upscale is gone and pixels land exactly.
+        let (w, h) = (frame.width, frame.height);
+        let expected = w as usize * h as usize * 4;
         if frame.pixels_pbgra.len() != expected {
             return Err(WindowError::FrameBuffer);
         }
@@ -1031,8 +1025,8 @@ impl OverlayWindow {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: scaled_w as i32,
-                biHeight: -(scaled_h as i32),
+                biWidth: w as i32,
+                biHeight: -(h as i32),
                 biPlanes: 1,
                 biBitCount: 32,
                 biCompression: BI_RGB.0,
@@ -1061,9 +1055,9 @@ impl OverlayWindow {
             None
         };
 
-        let is_hidden_sensor = scaled_h <= 4;
-        let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
-        let len = scaled_w as usize * scaled_h as usize * 4;
+        let is_hidden_sensor = h <= 4;
+        let mut alpha_map = Vec::with_capacity(w as usize * h as usize);
+        let len = w as usize * h as usize * 4;
         let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, len) };
         if is_hidden_sensor {
             // Assign alpha = 1 for the hidden sensor: 1/255 opacity is completely invisible
@@ -1075,26 +1069,16 @@ impl OverlayWindow {
                 px[2] = 0;
                 px[3] = 1;
             }
-            alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
+            alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         } else {
-            // Physical-pixel resample: the frame is authored in logical pixels
-            // and must be filtered up to the window size — but at 1.0 the
-            // bilinear taps land exactly on texel centers, so borrow the
-            // frame instead of paying a full float copy on every present.
-            let scaled;
-            let frame = if scaled_w == frame.width && scaled_h == frame.height {
-                frame
-            } else {
-                scaled = crate::animation::notch::resample_bilinear(frame, scaled_w, scaled_h);
-                &scaled
-            };
+            // 1:1 blit: the frame already matches the window surface.
             match backdrop.as_ref() {
                 Some(bg) => {
-                    for yy in 0..scaled_h {
-                        for xx in 0..scaled_w {
+                    for yy in 0..h {
+                        for xx in 0..w {
                             let source = &frame.pixels_pbgra
-                                [(yy as usize * scaled_w as usize + xx as usize) * 4..][..4];
-                            let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                                [(yy as usize * w as usize + xx as usize) * 4..][..4];
+                            let target = (yy as usize * w as usize + xx as usize) * 4;
                             if source[3] == 0 {
                                 // Outside the pill: stay fully transparent so clicks
                                 // pass through and the desktop shows untouched.
@@ -1104,27 +1088,35 @@ impl OverlayWindow {
                                 // during morphs the stored backdrop was captured
                                 // for the previous pill size, and blur hides the
                                 // stretch. Never panics on size mismatch.
-                                let bx = ((u64::from(xx) * u64::from(bg.width))
-                                    / u64::from(scaled_w))
-                                .min(u64::from(bg.width.saturating_sub(1)))
+                                let bx = ((u64::from(xx) * u64::from(bg.width)) / u64::from(w))
+                                    .min(u64::from(bg.width.saturating_sub(1)))
                                     as usize;
-                                let by = ((u64::from(yy) * u64::from(bg.height))
-                                    / u64::from(scaled_h))
-                                .min(u64::from(bg.height.saturating_sub(1)))
+                                let by = ((u64::from(yy) * u64::from(bg.height)) / u64::from(h))
+                                    .min(u64::from(bg.height.saturating_sub(1)))
                                     as usize;
                                 let bi = (by * bg.width as usize + bx) * 4;
                                 let ia = 255 - u32::from(source[3]);
                                 let bg_b = u32::from(bg.pixels.get(bi).copied().unwrap_or(0));
                                 let bg_g = u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0));
                                 let bg_r = u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0));
-                                dst[target] = (u32::from(source[0]) + bg_b * ia / 255) as u8;
-                                dst[target + 1] = (u32::from(source[1]) + bg_g * ia / 255) as u8;
-                                dst[target + 2] = (u32::from(source[2]) + bg_r * ia / 255) as u8;
-                                // Once the desktop backdrop is blended in, the pixel is fully composited.
-                                // Set opaque alpha (255) for interior pixels (source[3] >= 240) so DWM does
-                                // not double-blend the desktop underneath. Outer anti-aliased edge pixels
-                                // preserve source alpha for smooth edge blending into the screen.
-                                dst[target + 3] = if source[3] >= 240 { 255 } else { source[3] };
+                                let comp_b = (u32::from(source[0]) + bg_b * ia / 255).min(255);
+                                let comp_g = (u32::from(source[1]) + bg_g * ia / 255).min(255);
+                                let comp_r = (u32::from(source[2]) + bg_r * ia / 255).min(255);
+                                let tint_alpha = u32::from(self.glass.tint[3]).max(1);
+                                let is_interior = source[3] >= self.glass.tint[3].saturating_sub(15);
+                                if is_interior {
+                                    dst[target] = comp_b as u8;
+                                    dst[target + 1] = comp_g as u8;
+                                    dst[target + 2] = comp_r as u8;
+                                    dst[target + 3] = 255;
+                                } else {
+                                    // Anti-aliased outer edge: scale colors by coverage so PBGRA stays valid
+                                    let edge_cov = ((u32::from(source[3]) * 255) / tint_alpha).min(255);
+                                    dst[target] = (comp_b * edge_cov / 255) as u8;
+                                    dst[target + 1] = (comp_g * edge_cov / 255) as u8;
+                                    dst[target + 2] = (comp_r * edge_cov / 255) as u8;
+                                    dst[target + 3] = edge_cov as u8;
+                                }
                             }
                             // Hit-testing still follows the frame's own alpha, so the
                             // rounded corners stay click-through.
@@ -1133,11 +1125,11 @@ impl OverlayWindow {
                     }
                 }
                 None => {
-                    for yy in 0..scaled_h {
-                        for xx in 0..scaled_w {
+                    for yy in 0..h {
+                        for xx in 0..w {
                             let source = &frame.pixels_pbgra
-                                [(yy as usize * scaled_w as usize + xx as usize) * 4..][..4];
-                            let target = (yy as usize * scaled_w as usize + xx as usize) * 4;
+                                [(yy as usize * w as usize + xx as usize) * 4..][..4];
+                            let target = (yy as usize * w as usize + xx as usize) * 4;
                             dst[target..target + 4].copy_from_slice(source);
                             alpha_map.push(source[3]);
                         }
@@ -1169,8 +1161,8 @@ impl OverlayWindow {
         // window composited empty — invisible, despite "success".
         let dest = POINT { x, y };
         let size = SIZE {
-            cx: scaled_w as i32,
-            cy: scaled_h as i32,
+            cx: w as i32,
+            cy: h as i32,
         };
         let update = unsafe {
             UpdateLayeredWindow(
@@ -1196,7 +1188,7 @@ impl OverlayWindow {
 
         *self.state.alpha.borrow_mut() = AlphaMap {
             bytes: alpha_map,
-            width: scaled_w,
+            width: w,
         };
         Ok(())
     }
@@ -1206,46 +1198,35 @@ impl OverlayWindow {
     /// that `SetLayeredWindowAttributes(LWA_COLORKEY)` removes from the
     /// composite. The whole window is otherwise opaque; the per-pixel alpha
     /// map is still produced for click-through hit testing.
-    fn draw_color_key(
-        &self,
-        frame: &FrameBuffer,
-        scaled_w: u32,
-        scaled_h: u32,
-    ) -> Result<(), WindowError> {
-        let expected = frame.width as usize * frame.height as usize * 4;
+    fn draw_color_key(&self, frame: &FrameBuffer) -> Result<(), WindowError> {
+        let (w, h) = (frame.width, frame.height);
+        let expected = w as usize * h as usize * 4;
         if frame.pixels_pbgra.len() != expected {
             return Err(WindowError::FrameBuffer);
         }
-
         // 24-bit DIB rows are padded to a 4-byte boundary. The width times
         // three is not always divisible by four (329 px -> 987 bytes -> 988
         // padded), and `SetDIBitsToDevice` reads rows at the padded stride:
         // a buffer without the padding shifts every row by one byte and
         // renders diagonal garbage.
-        let is_hidden_sensor = scaled_h <= 4;
-        let stride = dib_stride(scaled_w);
-        let mut rgb = vec![0u8; stride * scaled_h as usize];
-        let mut alpha_map = Vec::with_capacity(scaled_w as usize * scaled_h as usize);
+        let is_hidden_sensor = h <= 4;
+        let stride = dib_stride(w);
+        let mut rgb = vec![0u8; stride * h as usize];
+        let mut alpha_map = Vec::with_capacity(w as usize * h as usize);
         if is_hidden_sensor {
-            for y in 0..scaled_h {
-                for x in 0..scaled_w {
+            for y in 0..h {
+                for x in 0..w {
                     let target = y as usize * stride + x as usize * 3;
                     rgb[target..target + 3].copy_from_slice(&COLOR_KEY_BGRA);
                 }
             }
-            alpha_map.resize(scaled_w as usize * scaled_h as usize, ALPHA_HIT_THRESHOLD);
+            alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         } else {
-            let resampled;
-            let frame = if scaled_w == frame.width && scaled_h == frame.height {
-                frame
-            } else {
-                resampled = crate::animation::notch::resample_bilinear(frame, scaled_w, scaled_h);
-                &resampled
-            };
-            for y in 0..scaled_h {
-                for x in 0..scaled_w {
-                    let source = &frame.pixels_pbgra
-                        [(y as usize * scaled_w as usize + x as usize) * 4..][..4];
+            // 1:1 blit: the frame already matches the window surface.
+            for y in 0..h {
+                for x in 0..w {
+                    let source =
+                        &frame.pixels_pbgra[(y as usize * w as usize + x as usize) * 4..][..4];
                     let target = y as usize * stride + x as usize * 3;
                     rgb[target..target + 3].copy_from_slice(&straight_or_key(
                         source[3], source[0], source[1], source[2],
@@ -1262,8 +1243,8 @@ impl OverlayWindow {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: scaled_w as i32,
-                biHeight: -(scaled_h as i32),
+                biWidth: w as i32,
+                biHeight: -(h as i32),
                 biPlanes: 1,
                 biBitCount: 24,
                 biCompression: BI_RGB.0,
@@ -1272,19 +1253,19 @@ impl OverlayWindow {
             },
             bmiColors: [RGBQUAD::default()],
         };
-        // SAFETY: `rgb` holds `scaled_h` top-down rows of `scaled_w` 24-bit
+        // SAFETY: `rgb` holds `h` top-down rows of `w` 24-bit
         // pixels and outlives the call; `dc` is the window's own DC.
         let lines = unsafe {
             SetDIBitsToDevice(
                 dc,
                 0,
                 0,
-                scaled_w,
-                scaled_h,
+                w,
+                h,
                 0,
                 0,
                 0,
-                scaled_h,
+                h,
                 rgb.as_ptr() as *const c_void,
                 &bmi,
                 DIB_RGB_COLORS,
@@ -1297,7 +1278,7 @@ impl OverlayWindow {
 
         *self.state.alpha.borrow_mut() = AlphaMap {
             bytes: alpha_map,
-            width: scaled_w,
+            width: w,
         };
         Ok(())
     }
@@ -1432,9 +1413,9 @@ mod tests {
             pixels_pbgra: vec![255; 140 * 36 * 4],
             delay_ms: 0,
             loop_index: 0,
+            scale: 1.0,
         };
-        win.present_with_anchor(&frame, 1.0, Some((false, 10)))
-            .unwrap();
+        win.present_with_anchor(&frame, Some((false, 10))).unwrap();
         let (rect, mon) = win.position();
         println!("Window pos: {:?}, monitor: {}", rect, mon);
         let vis = unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(win.hwnd) };
