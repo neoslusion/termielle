@@ -14,6 +14,55 @@ pub enum IslandLayout {
     Classic,
     Notch,
     Island,
+    Bar,
+}
+
+/// Bar screen position (Top or Bottom).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+/// Waybar-style status bar configuration.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BarConfig {
+    pub position: BarPosition,
+    pub height: u32,
+    pub edge_to_edge: bool,
+    pub margin: u32,
+    pub corner_radius: u32,
+    pub reserve_space: bool,
+    pub replace_taskbar: bool,
+    pub modules_left: Vec<String>,
+    pub modules_center: Vec<String>,
+    pub modules_right: Vec<String>,
+}
+
+impl Default for BarConfig {
+    fn default() -> Self {
+        Self {
+            position: BarPosition::Top,
+            height: 36,
+            edge_to_edge: true,
+            margin: 0,
+            corner_radius: 0,
+            reserve_space: true,
+            replace_taskbar: false,
+            modules_left: vec!["workspaces".to_string(), "window".to_string()],
+            modules_center: vec!["island".to_string()],
+            modules_right: vec![
+                "cpu".to_string(),
+                "memory".to_string(),
+                "volume".to_string(),
+                "battery".to_string(),
+                "clock".to_string(),
+            ],
+        }
+    }
 }
 
 // ---- Glass ----------------------------------------------------------------
@@ -168,9 +217,14 @@ pub struct IslandConfig {
     /// Forward Windows app toast notifications to the island as transient
     /// alert banners (app name plus the first text lines). Local-only:
     /// nothing leaves the machine. Needs notification-listener access
+    /// Forward Windows app toast notifications to the island as transient
+    /// alert banners (app name plus the first text lines). Local-only:
+    /// nothing leaves the machine. Needs notification-listener access
     /// (Settings > Privacy > Notifications); without it the watcher exits
     /// silently and the island is unaffected.
     pub forward_toasts: bool,
+    /// Waybar-style status bar configuration when `layout == IslandLayout::Bar`.
+    pub bar: BarConfig,
 }
 
 impl Default for IslandConfig {
@@ -198,6 +252,7 @@ impl Default for IslandConfig {
             expand_on_hover: true,
             auto_hide: false,
             forward_toasts: true,
+            bar: BarConfig::default(),
         }
     }
 }
@@ -266,6 +321,11 @@ impl IslandConfig {
     /// True when attached to top edge (flat top, rounded bottom).
     pub fn is_attached(&self) -> bool {
         matches!(self.layout, IslandLayout::Notch)
+    }
+
+    /// True when running as a Waybar-style status bar.
+    pub fn is_bar(&self) -> bool {
+        matches!(self.layout, IslandLayout::Bar)
     }
 
     /// Current geometry for a given expansion progress 0.0-1.0.
@@ -352,6 +412,21 @@ pub fn island_anchored_position(
         top + y_offset
     };
     let _ = height;
+    (x, y)
+}
+
+/// Anchor a full-width status bar inside `work` (logical pixels).
+pub fn bar_anchored_position(
+    height: i32,
+    position: BarPosition,
+    work: (i32, i32, i32, i32),
+) -> (i32, i32) {
+    let (left, top, _right, bottom) = work;
+    let x = left;
+    let y = match position {
+        BarPosition::Top => top,
+        BarPosition::Bottom => bottom - height,
+    };
     (x, y)
 }
 
@@ -460,5 +535,38 @@ mod tests {
         // `#[serde(default)]` must fill them from `Default`, not `false`.
         let c: IslandConfig = serde_json::from_str(r#"{"layout":"island"}"#).unwrap();
         assert!(c.forward_toasts);
+        assert!(!c.is_bar());
+    }
+
+    #[test]
+    fn bar_layout_and_config_serde() {
+        let json = r#"{
+            "layout": "bar",
+            "bar": {
+                "position": "bottom",
+                "height": 40,
+                "replace_taskbar": true,
+                "reserve_space": true
+            }
+        }"#;
+        let c: IslandConfig = serde_json::from_str(json).unwrap();
+        assert!(c.is_bar());
+        assert!(c.is_enabled());
+        assert_eq!(c.bar.position, BarPosition::Bottom);
+        assert_eq!(c.bar.height, 40);
+        assert!(c.bar.replace_taskbar);
+        assert!(c.bar.reserve_space);
+    }
+
+    #[test]
+    fn bar_anchored_position_computes_correctly() {
+        let work = (0, 0, 1920, 1080);
+        let (top_x, top_y) = bar_anchored_position(36, BarPosition::Top, work);
+        assert_eq!(top_x, 0);
+        assert_eq!(top_y, 0);
+
+        let (bot_x, bot_y) = bar_anchored_position(36, BarPosition::Bottom, work);
+        assert_eq!(bot_x, 0);
+        assert_eq!(bot_y, 1080 - 36);
     }
 }

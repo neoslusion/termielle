@@ -45,6 +45,7 @@ pub const TRAY_RESTART: u32 = 101;
 pub const TRAY_LAYOUT_CLASSIC: u32 = 102;
 pub const TRAY_LAYOUT_NOTCH: u32 = 103;
 pub const TRAY_LAYOUT_ISLAND: u32 = 104;
+pub const TRAY_LAYOUT_BAR: u32 = 105;
 
 /// Theme switches
 pub const TRAY_THEME_LIQUID_DARK: u32 = 110;
@@ -164,6 +165,7 @@ pub fn show_menu(hwnd: HWND) -> u32 {
         (TRAY_LAYOUT_CLASSIC, "Layout: Classic (pet)"),
         (TRAY_LAYOUT_NOTCH, "Layout: Notch (macOS)"),
         (TRAY_LAYOUT_ISLAND, "Layout: Island (floating)"),
+        (TRAY_LAYOUT_BAR, "Layout: Bar (Waybar)"),
     ] {
         let w = crate::window::encode_wide(label);
         let _ = unsafe { AppendMenuW(layout_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };

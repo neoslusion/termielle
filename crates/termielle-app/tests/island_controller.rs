@@ -964,3 +964,76 @@ fn collapse_if_expanded_collapses_tall_card() {
     let _ = c.on_timer(1500);
     assert_eq!(c.current_frame().height, 2);
 }
+
+#[test]
+fn bar_layout_sizing_and_interaction() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        collapsed_width: 140,
+        expanded_width: 360,
+        height: 36,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    assert!(c.is_island());
+    c.set_bar_width(1920);
+
+    // In compact bar layout, target size is full width (1920) by bar height (36)
+    let (w, h) = c.target_size(termielle_core::VisualState::Idle);
+    assert_eq!(w, 1920);
+    assert_eq!(h, 36);
+
+    // Frame rendered at 1920x36
+    let frame = c.current_frame();
+    assert_eq!(frame.width, 1920);
+    assert_eq!(frame.height, 36);
+
+    // Toggle expand: morphs downward
+    assert!(c.toggle_expand(1000));
+    assert!(c.is_manually_expanded());
+
+    let (exp_w, exp_h) = c.target_size(termielle_core::VisualState::Idle);
+    assert_eq!(exp_w, 1920);
+    assert!(exp_h > 36);
+
+    // Settle spring
+    for t in 1..20 {
+        let _ = c.on_timer(1000 + t * 50);
+    }
+    assert_eq!(c.current_frame().width, 1920);
+    assert_eq!(c.current_frame().height, exp_h);
+
+    // Collapse
+    assert!(c.collapse_if_expanded(2500));
+    for t in 1..20 {
+        let _ = c.on_timer(2500 + t * 50);
+    }
+    assert_eq!(c.current_frame().width, 1920);
+    assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn bar_layout_click_dispatch() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+
+    // Clicking center island pill toggles expansion
+    let pill_cx = 1920 / 2;
+    let outcome = c.handle_click(pill_cx, 18, 1000);
+    assert_eq!(outcome, termielle_app::app::ClickOutcome::Expanded);
+
+    // Clicking again collapses
+    let outcome = c.handle_click(pill_cx, 18, 1100);
+    assert_eq!(outcome, termielle_app::app::ClickOutcome::Collapsed);
+
+    // Click on workspace 1 (near left margin)
+    // First workspace pill is at x=12, y=6..30, w=26
+    let outcome = c.handle_click(20, 18, 1200);
+    assert_eq!(outcome, termielle_app::app::ClickOutcome::WorkspaceSwitch(1));
+}

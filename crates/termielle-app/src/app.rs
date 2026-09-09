@@ -61,6 +61,10 @@ pub enum ClickOutcome {
     AlertDismiss,
     /// Activate a specific window (HWND).
     ActivateWindow(isize),
+    /// Switch to a virtual desktop workspace by index.
+    WorkspaceSwitch(u32),
+    /// Toggle system audio mute.
+    VolumeToggle,
     /// The dashboard opened.
     Expanded,
     /// The dashboard closed.
@@ -348,6 +352,8 @@ pub struct Controller {
     dpi_scale: f32,
     /// User zoom from `AppConfig.scale`, applied on top of DPI.
     user_scale: f32,
+    /// Monitor logical width for Waybar layout.
+    bar_width: u32,
 }
 
 impl Controller {
@@ -421,6 +427,7 @@ impl Controller {
             alerts: VecDeque::new(),
             dpi_scale: 1.0,
             user_scale: 1.0,
+            bar_width: 1920,
         };
         if controller.island.is_enabled() {
             controller.refresh_face(state);
@@ -553,6 +560,10 @@ impl Controller {
         height: u32,
         now_ms: u64,
     ) -> FrameBuffer {
+        if self.island.is_bar() {
+            return self.render_bar(state, width, height, now_ms);
+        }
+
         use crate::animation::notch::Presentation;
 
         let presentation = self.presentation();
@@ -612,6 +623,442 @@ impl Controller {
             strip
         };
         crate::animation::notch::draw_accent_strip(&mut frame, attached, radius, strip);
+        frame
+    }
+
+    /// Renders a Waybar-style full-width acrylic status bar with an embedded Dynamic Island.
+    fn render_bar(
+        &mut self,
+        state: VisualState,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) -> FrameBuffer {
+        self.icon_hits.clear();
+
+        let bar_h = self.island.bar.height;
+        let is_top = self.island.bar.position == termielle_core::BarPosition::Top;
+        let bar_y = if is_top { 0 } else { (height.saturating_sub(bar_h)) as i32 };
+        let expanded = height > bar_h;
+        let exp_h = height.saturating_sub(bar_h);
+
+        // 1. Compute glass blobs: the horizontal bar + optional downward (or upward) expanded island card
+        let island_w = self.island.expanded_width.min(width.saturating_sub(40)).max(300);
+        let island_x = ((width.saturating_sub(island_w)) / 2) as i32;
+        let island_y = if is_top { bar_h as i32 } else { 0 };
+
+        let mut blobs = vec![
+            crate::animation::notch::BlobRect {
+                x: 0,
+                y: bar_y,
+                w: width,
+                h: bar_h,
+                r: 0,
+                attached: true,
+            },
+        ];
+
+        if expanded && exp_h > 4 {
+            blobs.push(crate::animation::notch::BlobRect {
+                x: island_x,
+                y: island_y,
+                w: island_w,
+                h: exp_h,
+                r: 20,
+                attached: true,
+            });
+        }
+
+        // Draw acrylic glass layer for the composite bar silhouette
+        let black = self.island.glass.notch_black;
+        let mut frame = self.glass_layer_blobs(width, height, 0, true, &blobs, black);
+
+        // Accent strip on the bar edge
+        let (state_color, _) = crate::animation::notch::accent_colors(state);
+        let accent = crate::system::accent_color_bgra();
+        let strip = if state != VisualState::Idle {
+            state_color
+        } else if self.media_playing() && self.island.has_widget("music") {
+            accent
+        } else {
+            [accent[0], accent[1], accent[2], 80]
+        };
+        let strip_y = if is_top { (bar_h - 2) as i32 } else { bar_y };
+        crate::animation::notch::draw_rounded_rect(&mut frame, 0, strip_y, width, 2, 0, strip, [0, 0, 0, 0]);
+
+        let pill_h = (bar_h - 10).max(18);
+        let pill_y = bar_y + ((bar_h - pill_h) / 2) as i32;
+
+        let mut bar_hits = Vec::new();
+
+        // 2. Modules Left: Workspaces + Window Title
+        let mut cur_x = 12i32;
+
+        // Workspaces
+        let ws = crate::bar::workspaces::query_workspaces();
+        let ws_w = 26u32;
+        for i in 1..=ws.total.min(10) {
+            let active = i == ws.active;
+            let (bg, border, text_col) = if active {
+                ([accent[0], accent[1], accent[2], 190], [255, 255, 255, 140], [255, 255, 255, 255])
+            } else {
+                ([255, 255, 255, 24], [255, 255, 255, 36], [190, 190, 190, 220])
+            };
+            crate::animation::notch::draw_rounded_rect(&mut frame, cur_x, pill_y, ws_w, pill_h, pill_h / 2, bg, border);
+            let num_str = format!("{}", i);
+            let text_x = cur_x + ((ws_w - 7) / 2) as i32;
+            let text_y = pill_y + ((pill_h - 12) / 2) as i32;
+            crate::animation::notch::draw_text(&mut frame, &num_str, text_x, text_y, 16, 11, true, text_col);
+
+            // Register hit target for workspace switching
+            bar_hits.push((
+                crate::bar::HIT_BAR_WORKSPACE_BASE - i as isize,
+                cur_x,
+                pill_y,
+                ws_w,
+                pill_h,
+            ));
+
+            cur_x += ws_w as i32 + 6;
+        }
+
+        // Window Title
+        let win_title = crate::media::foreground_title();
+        if !win_title.is_empty() {
+            cur_x += 6;
+            let app_name = crate::media::app_name_from_title(&win_title);
+            let display_text = if app_name.len() < win_title.len() {
+                format!("{} — {}", app_name, win_title)
+            } else {
+                win_title
+            };
+            let max_chars = 40;
+            let truncated: String = display_text.chars().take(max_chars).collect();
+            let title_w = (truncated.chars().count() as u32 * 7 + 20).clamp(60, 260);
+
+            crate::animation::notch::draw_rounded_rect(
+                &mut frame,
+                cur_x,
+                pill_y,
+                title_w,
+                pill_h,
+                pill_h / 2,
+                [255, 255, 255, 18],
+                [255, 255, 255, 30],
+            );
+            crate::animation::notch::draw_text(
+                &mut frame,
+                &truncated,
+                cur_x + 10,
+                pill_y + ((pill_h - 12) / 2) as i32,
+                title_w - 16,
+                11,
+                false,
+                [230, 230, 230, 230],
+            );
+        }
+
+        // 3. Modules Right: Clock, Battery, Volume, RAM, CPU
+        let mut cur_right = (width as i32) - 12;
+
+        // Clock
+        let time_str = crate::system::current_time_text();
+        let clock_w = 64u32;
+        cur_right -= clock_w as i32;
+        crate::animation::notch::draw_rounded_rect(
+            &mut frame,
+            cur_right,
+            pill_y,
+            clock_w,
+            pill_h,
+            pill_h / 2,
+            [255, 255, 255, 24],
+            [255, 255, 255, 36],
+        );
+        crate::animation::notch::draw_text(
+            &mut frame,
+            &time_str,
+            cur_right + 12,
+            pill_y + ((pill_h - 12) / 2) as i32,
+            clock_w - 16,
+            11,
+            true,
+            [240, 240, 240, 255],
+        );
+
+        // Battery
+        let (bat_opt, is_charging) = crate::system::battery_status();
+        if let Some(bat_pct) = bat_opt {
+            cur_right -= 8;
+            let bat_w = 66u32;
+            cur_right -= bat_w as i32;
+            let bat_text = if is_charging {
+                format!("⚡ {}%", bat_pct)
+            } else {
+                format!("BAT {}%", bat_pct)
+            };
+            crate::animation::notch::draw_rounded_rect(
+                &mut frame,
+                cur_right,
+                pill_y,
+                bat_w,
+                pill_h,
+                pill_h / 2,
+                [255, 255, 255, 20],
+                [255, 255, 255, 32],
+            );
+            crate::animation::notch::draw_text(
+                &mut frame,
+                &bat_text,
+                cur_right + 8,
+                pill_y + ((pill_h - 12) / 2) as i32,
+                bat_w - 12,
+                11,
+                false,
+                [220, 220, 220, 230],
+            );
+        }
+
+        // Volume
+        cur_right -= 8;
+        let vol = crate::bar::volume::query_volume();
+        let vol_w = 70u32;
+        cur_right -= vol_w as i32;
+        let vol_text = if vol.muted {
+            "MUTED".to_string()
+        } else {
+            format!("VOL {}%", vol.level)
+        };
+        let vol_bg = if vol.muted {
+            [160, 40, 40, 60]
+        } else {
+            [255, 255, 255, 20]
+        };
+        crate::animation::notch::draw_rounded_rect(
+            &mut frame,
+            cur_right,
+            pill_y,
+            vol_w,
+            pill_h,
+            pill_h / 2,
+            vol_bg,
+            [255, 255, 255, 32],
+        );
+        crate::animation::notch::draw_text(
+            &mut frame,
+            &vol_text,
+            cur_right + 8,
+            pill_y + ((pill_h - 12) / 2) as i32,
+            vol_w - 12,
+            11,
+            false,
+            [220, 220, 220, 230],
+        );
+        bar_hits.push((
+            crate::bar::HIT_BAR_VOLUME_TOGGLE,
+            cur_right,
+            pill_y,
+            vol_w,
+            pill_h,
+        ));
+
+        // RAM
+        cur_right -= 8;
+        let (mem_pct, _, _) = crate::system::memory_info();
+        let mem_w = 68u32;
+        cur_right -= mem_w as i32;
+        let mem_text = format!("RAM {}%", mem_pct);
+        crate::animation::notch::draw_rounded_rect(
+            &mut frame,
+            cur_right,
+            pill_y,
+            mem_w,
+            pill_h,
+            pill_h / 2,
+            [255, 255, 255, 20],
+            [255, 255, 255, 32],
+        );
+        crate::animation::notch::draw_text(
+            &mut frame,
+            &mem_text,
+            cur_right + 8,
+            pill_y + ((pill_h - 12) / 2) as i32,
+            mem_w - 12,
+            11,
+            false,
+            [220, 220, 220, 230],
+        );
+
+        // CPU
+        cur_right -= 8;
+        let cpu_pct = crate::system::cpu_percent();
+        let cpu_w = 68u32;
+        cur_right -= cpu_w as i32;
+        let cpu_text = format!("CPU {}%", cpu_pct);
+        crate::animation::notch::draw_rounded_rect(
+            &mut frame,
+            cur_right,
+            pill_y,
+            cpu_w,
+            pill_h,
+            pill_h / 2,
+            [255, 255, 255, 20],
+            [255, 255, 255, 32],
+        );
+        crate::animation::notch::draw_text(
+            &mut frame,
+            &cpu_text,
+            cur_right + 8,
+            pill_y + ((pill_h - 12) / 2) as i32,
+            cpu_w - 12,
+            11,
+            false,
+            [220, 220, 220, 230],
+        );
+
+        // 4. Center Module: Dynamic Island
+        if !expanded {
+            // Resting Dynamic Island pill flush in the center of the bar
+            let pill_w = 160u32.min(width / 3).max(100);
+            let pill_cx = ((width - pill_w) / 2) as i32;
+
+            crate::animation::notch::draw_rounded_rect(
+                &mut frame,
+                pill_cx,
+                pill_y,
+                pill_w,
+                pill_h,
+                pill_h / 2,
+                [10, 10, 10, 190],
+                [255, 255, 255, 45],
+            );
+
+            // Mini face on the left of the pill
+            let face_sz = (pill_h - 4).min(22);
+            let face_x = pill_cx + 4;
+            let face_y = pill_y + ((pill_h - face_sz) / 2) as i32;
+            crate::animation::notch::blit_rounded(
+                &mut frame,
+                &self.face_frame,
+                face_x,
+                face_y,
+                face_sz,
+                face_sz,
+                face_sz / 2,
+            );
+
+            // Status label or media wave inside the pill
+            let label_x = face_x + face_sz as i32 + 6;
+            let label_max_w = pill_w.saturating_sub((label_x - pill_cx) as u32 + 6);
+            if self.media_playing() && self.island.has_widget("music") {
+                if let Some(media) = &self.media {
+                    let track = format!("{} — {}", media.title, media.artist);
+                    crate::animation::notch::draw_text(
+                        &mut frame,
+                        &track,
+                        label_x,
+                        pill_y + ((pill_h - 12) / 2) as i32,
+                        label_max_w,
+                        11,
+                        false,
+                        [220, 220, 220, 240],
+                    );
+                } else {
+                    crate::animation::notch::draw_text(
+                        &mut frame,
+                        "Now Playing",
+                        label_x,
+                        pill_y + ((pill_h - 12) / 2) as i32,
+                        label_max_w,
+                        11,
+                        false,
+                        [220, 220, 220, 240],
+                    );
+                }
+            } else if state != VisualState::Idle {
+                let (sc, _) = crate::animation::notch::accent_colors(state);
+                let dot_r = 3u32;
+                crate::animation::notch::draw_disc(&mut frame, label_x + 4, pill_y + (pill_h / 2) as i32, dot_r, sc);
+                let state_name = format!("{:?}", state);
+                crate::animation::notch::draw_text(
+                    &mut frame,
+                    &state_name,
+                    label_x + 12,
+                    pill_y + ((pill_h - 12) / 2) as i32,
+                    label_max_w.saturating_sub(14),
+                    11,
+                    false,
+                    [220, 220, 220, 240],
+                );
+            } else {
+                crate::animation::notch::draw_text(
+                    &mut frame,
+                    "Termielle",
+                    label_x,
+                    pill_y + ((pill_h - 12) / 2) as i32,
+                    label_max_w,
+                    11,
+                    true,
+                    [220, 220, 220, 220],
+                );
+            }
+
+            // Register hit target for clicking the Dynamic Island pill
+            bar_hits.push((
+                crate::bar::HIT_BAR_ISLAND_PILL,
+                pill_cx,
+                pill_y,
+                pill_w,
+                pill_h,
+            ));
+            self.icon_hits = bar_hits;
+        } else {
+            // Expanded Dynamic Island card dropping organically below the bar!
+            let mut content = self.blank_frame(island_w, exp_h);
+            let sub_blobs = [crate::animation::notch::BlobRect {
+                x: 0,
+                y: 0,
+                w: island_w,
+                h: exp_h,
+                r: 18,
+                attached: true,
+            }];
+
+            let island_cfg = self.island.clone();
+            self.render_content(
+                &mut content,
+                state,
+                &island_cfg,
+                crate::animation::notch::Presentation::Expanded,
+                island_w,
+                exp_h,
+                &sub_blobs,
+                now_ms,
+            );
+
+            // Offset hit targets recorded in sub-frame by (island_x, island_y)
+            for hit in &mut self.icon_hits {
+                hit.1 += island_x;
+                hit.2 += island_y;
+            }
+            self.icon_hits.extend(bar_hits);
+
+            let age_ms = now_ms.saturating_sub(self.state_since_ms);
+            let (alpha, dx, dy) = Self::content_motion(
+                self.spring.as_ref(),
+                crate::animation::notch::Presentation::Expanded,
+                state,
+                age_ms,
+            );
+            crate::animation::notch::blend_frame_over(
+                &mut frame,
+                &content,
+                island_x + dx,
+                island_y + dy,
+                alpha,
+            );
+        }
+
         frame
     }
 
@@ -2315,6 +2762,31 @@ impl Controller {
 
     /// Target (width, height) for the current visual and presentation state.
     pub fn target_size(&self, _state: VisualState) -> (u32, u32) {
+        if self.island.is_bar() {
+            let w = self.bar_width;
+            let base_h = self.island.bar.height;
+            if !self.alerts.is_empty() {
+                return (w, base_h + 124);
+            }
+            return match self.presentation() {
+                crate::animation::notch::Presentation::Expanded => {
+                    let tasks_active = self.island.has_widget("tasks")
+                        && self.island.show_tasks
+                        && !self.tasks.is_empty();
+                    let exp_h = if self.media_playing() && tasks_active {
+                        210u32
+                    } else if self.media_playing() {
+                        175u32
+                    } else if tasks_active {
+                        180u32
+                    } else {
+                        154u32
+                    };
+                    (w, base_h + exp_h)
+                }
+                _ => (w, base_h),
+            };
+        }
         if !self.alerts.is_empty() {
             let w = self.island.expanded_width.max(320);
             return (w, 124u32.max(self.island.height));
@@ -2506,6 +2978,9 @@ impl Controller {
         if !self.is_island() {
             return None;
         }
+        if self.island.is_bar() {
+            return Some((true, 0));
+        }
         let attached = self.island.is_attached();
         let y_offset = if attached {
             0
@@ -2528,6 +3003,18 @@ impl Controller {
     pub fn set_user_scale(&mut self, scale: f32) {
         if scale.is_finite() && scale > 0.0 {
             self.user_scale = scale.clamp(0.5, 2.0);
+        }
+    }
+
+    /// Sets the logical monitor width for Waybar layout.
+    pub fn set_bar_width(&mut self, width_logical: u32) {
+        if width_logical > 0 && self.bar_width != width_logical {
+            self.bar_width = width_logical;
+            if self.island.is_bar() && self.spring.is_none() {
+                let (w, h) = self.target_size(self.state);
+                self.current = self.render_island(self.state, w, h, self.clock_ms);
+                self.animation = AnimationSource::Still(self.current.clone());
+            }
         }
     }
 
@@ -2636,20 +3123,42 @@ impl Controller {
     /// - over the pill otherwise: toggles expansion and returns the outcome.
     pub fn handle_click(&mut self, x: i32, y: i32, now_ms: u64) -> ClickOutcome {
         let (x, y) = (self.to_logical(x), self.to_logical(y));
-        for &(id, hx, hy, hw, hh) in &self.icon_hits {
-            if x >= hx && x < hx + hw as i32 && y >= hy && y < hy + hh as i32 {
-                match id {
-                    HIT_MEDIA_PLAY_PAUSE => return ClickOutcome::MediaToggle,
-                    HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
-                    HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
-                    HIT_ALERT_DISMISS => {
-                        self.alerts.pop_front();
-                        let _ = self.morph_to_target(now_ms);
-                        return ClickOutcome::AlertDismiss;
-                    }
-                    hwnd if hwnd > 0 => return ClickOutcome::ActivateWindow(hwnd),
-                    _ => {}
+        let hit_id = self
+            .icon_hits
+            .iter()
+            .find(|&&(_, hx, hy, hw, hh)| {
+                x >= hx && x < hx + hw as i32 && y >= hy && y < hy + hh as i32
+            })
+            .map(|&(id, ..)| id);
+
+        if let Some(id) = hit_id {
+            match id {
+                HIT_MEDIA_PLAY_PAUSE => return ClickOutcome::MediaToggle,
+                HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
+                HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
+                HIT_ALERT_DISMISS => {
+                    self.alerts.pop_front();
+                    let _ = self.morph_to_target(now_ms);
+                    return ClickOutcome::AlertDismiss;
                 }
+                crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
+                crate::bar::HIT_BAR_ISLAND_PILL => {
+                    if self.manually_expanded {
+                        self.manually_expanded = false;
+                        let _ = self.morph_to_target(now_ms);
+                        return ClickOutcome::Collapsed;
+                    } else if self.toggle_expand(now_ms) {
+                        return ClickOutcome::Expanded;
+                    }
+                }
+                id if id <= crate::bar::HIT_BAR_WORKSPACE_BASE
+                    && id > crate::bar::HIT_BAR_WORKSPACE_BASE - 50 =>
+                {
+                    let ws_num = (crate::bar::HIT_BAR_WORKSPACE_BASE - id) as usize;
+                    return ClickOutcome::WorkspaceSwitch(ws_num as u32);
+                }
+                hwnd if hwnd > 0 => return ClickOutcome::ActivateWindow(hwnd),
+                _ => {}
             }
         }
         if self.manually_expanded {
@@ -2713,6 +3222,28 @@ impl Controller {
         if !self.island.is_enabled() || !self.island.expand_on_hover {
             return false;
         }
+        let inside = if self.island.is_bar() {
+            if let Some((hx, hy)) = self.hover_point {
+                let bar_h = self.island.bar.height as i32;
+                let is_top = self.island.bar.position == termielle_core::BarPosition::Top;
+                let island_w = self.island.expanded_width.min(self.bar_width.saturating_sub(40)) as i32;
+                let island_x = ((self.bar_width as i32 - island_w) / 2).max(0);
+                let (ix, iy, iw, ih) = if self.is_expanded_idle() {
+                    let y = if is_top { bar_h } else { 0 };
+                    (island_x, y, island_w, 210)
+                } else {
+                    let pill_w = 160i32.min(self.bar_width as i32 / 3);
+                    let px = ((self.bar_width as i32 - pill_w) / 2).max(0);
+                    let py = if is_top { 0 } else { (self.target_size(self.state).1 as i32).saturating_sub(bar_h) };
+                    (px, py, pill_w, bar_h)
+                };
+                hx >= ix && hx < ix + iw && hy >= iy && hy < iy + ih
+            } else {
+                false
+            }
+        } else {
+            inside
+        };
         if self.state != VisualState::Idle || self.manually_expanded {
             // Still track the flag so a leave during an agent turn can't
             // collapse anything afterwards.

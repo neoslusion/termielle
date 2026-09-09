@@ -542,6 +542,13 @@ unsafe extern "system" fn window_proc(
                                 ))
                             };
                         }
+                        tray::TRAY_LAYOUT_BAR => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::LayoutChanged(
+                                    termielle_core::IslandLayout::Bar,
+                                ))
+                            };
+                        }
                         tray::TRAY_THEME_LIQUID_DARK => {
                             let _ = unsafe {
                                 (*state)
@@ -789,6 +796,47 @@ impl OverlayWindow {
         self.draw_color_key(frame)
     }
 
+    /// Presents a status bar frame, anchored to the top or bottom of the monitor work area.
+    pub fn present_with_bar(
+        &mut self,
+        frame: &FrameBuffer,
+        position: termielle_core::BarPosition,
+    ) -> Result<(), WindowError> {
+        let (w, h) = (frame.width, frame.height);
+        let work = self.monitor_work_area();
+        let (x, y) = termielle_core::bar_anchored_position(h as i32, position, work);
+        if self.render == RenderMode::PerPixel {
+            self.repositioned = true;
+            self.last_dest = (x, y, w, h);
+            return self.draw_at(frame, x, y);
+        }
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.hwnd, &mut rect) }?;
+        let current = Rect {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        let needs_move =
+            current.width() != w as i32 || current.height() != h as i32 || !self.repositioned;
+        if needs_move {
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    None,
+                    x,
+                    y,
+                    w as i32,
+                    h as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING,
+                )
+            }?;
+            self.repositioned = true;
+        }
+        self.draw_color_key(frame)
+    }
+
     /// Blocks until a window message arrives, dispatches it, and returns the
     /// event it produced, if any.
     pub fn next_event(&mut self) -> Result<Option<WindowEvent>, WindowError> {
@@ -1002,6 +1050,71 @@ impl OverlayWindow {
         }
         // Fallback: center on 1920 if no monitor info
         island_anchored_position(width, height, attached, y_offset, (0, 0, 1920, 1080))
+    }
+
+    /// Monitor work area (left, top, right, bottom) for the tracked monitor in physical pixels.
+    pub fn monitor_work_area(&mut self) -> (i32, i32, i32, i32) {
+        if self.anchor_monitor.is_none() {
+            let mut point = POINT { x: 0, y: 0 };
+            let _ = unsafe { GetCursorPos(&mut point) };
+            self.anchor_monitor = Some(unsafe {
+                windows::Win32::Graphics::Gdi::MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+            });
+        }
+        if let Some(monitor) = self.anchor_monitor {
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                return (
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                );
+            }
+            self.anchor_monitor = None;
+        }
+        (0, 0, 1920, 1080)
+    }
+
+    /// Full monitor bounds for the tracked monitor in physical pixels.
+    pub fn monitor_bounds(&mut self) -> RECT {
+        if self.anchor_monitor.is_none() {
+            let mut point = POINT { x: 0, y: 0 };
+            let _ = unsafe { GetCursorPos(&mut point) };
+            self.anchor_monitor = Some(unsafe {
+                windows::Win32::Graphics::Gdi::MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST)
+            });
+        }
+        if let Some(monitor) = self.anchor_monitor {
+            let mut info = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                return info.rcMonitor;
+            }
+            self.anchor_monitor = None;
+        }
+        RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        }
+    }
+
+    /// Monitor width in physical pixels.
+    pub fn monitor_width(&mut self) -> u32 {
+        let work = self.monitor_work_area();
+        (work.2 - work.0).max(1) as u32
+    }
+
+    /// Raw Win32 HWND handle.
+    pub fn hwnd(&self) -> HWND {
+        self.hwnd
     }
 
     fn draw_at(&self, frame: &FrameBuffer, x: i32, y: i32) -> Result<(), WindowError> {

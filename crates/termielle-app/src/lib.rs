@@ -1,6 +1,7 @@
 pub mod animation;
 pub mod app;
 pub mod backdrop;
+pub mod bar;
 pub mod log;
 pub mod media;
 pub mod system;

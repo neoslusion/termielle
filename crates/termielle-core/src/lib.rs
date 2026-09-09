@@ -10,8 +10,8 @@ pub use config::{
 };
 pub use event_log::{DEFAULT_EVENT_LOG_MAX_BYTES, EventLog, EventLogError};
 pub use island::{
-    GlassConfig, IslandConfig, IslandGeometry, IslandLayout, SpringParams,
-    island_anchored_position, spring_params,
+    BarConfig, BarPosition, GlassConfig, IslandConfig, IslandGeometry, IslandLayout, SpringParams,
+    bar_anchored_position, island_anchored_position, spring_params,
 };
 pub use protocol::{
     EventKind, EventMessage, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, MAX_SOURCE_BYTES,

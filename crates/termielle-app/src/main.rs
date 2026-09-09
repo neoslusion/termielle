@@ -128,6 +128,7 @@ fn main() {
     // crash is diagnosable instead of looking like "it disappeared".
     let panic_path = data_dir().map(|d| d.join("panic.log"));
     std::panic::set_hook(Box::new(move |info| {
+        termielle_app::bar::appbar::restore_taskbar();
         if let Some(path) = panic_path.as_ref() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -223,6 +224,22 @@ fn main() {
     // Author the first frame at the live scale: the journal replay below
     // renders immediately, before any present refreshes the DPI.
     controller.set_dpi_scale(window.dpi_scale());
+    if config.island.is_bar() {
+        let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+        controller.set_bar_width(logical_w);
+        if config.island.bar.replace_taskbar {
+            termielle_app::bar::appbar::hide_taskbar();
+        }
+        if config.island.bar.reserve_space {
+            let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
+            termielle_app::bar::appbar::register_appbar(
+                window.hwnd(),
+                is_top,
+                config.island.bar.height,
+                Some(window.monitor_bounds()),
+            );
+        }
+    }
     controller.refresh_scale(now_ms());
 
     // Only the production overlay journals and replays: diagnostics runs on
@@ -690,8 +707,14 @@ fn present_current(
     // different DPIs tracks without an invalidation path (the DisplayChanged
     // repaint covers the transition frame).
     controller.set_dpi_scale(window.dpi_scale());
+    if controller.island_config().is_bar() {
+        let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+        controller.set_bar_width(logical_w);
+    }
     let anchor = controller.island_anchor();
-    let attempt = if let Some((attached, y_off)) = anchor {
+    let attempt = if controller.island_config().is_bar() {
+        window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+    } else if let Some((attached, y_off)) = anchor {
         window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
     } else {
         window.present(controller.current_frame())
@@ -726,7 +749,9 @@ fn present_current(
                 window_error_code(&error),
             );
             let retry_anchor = controller.island_anchor();
-            let retry = if let Some((attached, y_off)) = retry_anchor {
+            let retry = if controller.island_config().is_bar() {
+                window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+            } else if let Some((attached, y_off)) = retry_anchor {
                 window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
             } else {
                 window.present(controller.current_frame())
@@ -746,7 +771,9 @@ fn present_current(
                     );
                     controller.fallback_to_still();
                     let fallback_anchor = controller.island_anchor();
-                    let _ = if let Some((attached, y_off)) = fallback_anchor {
+                    let _ = if controller.island_config().is_bar() {
+                        window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+                    } else if let Some((attached, y_off)) = fallback_anchor {
                         window.present_with_anchor(
                             controller.current_frame(),
                             Some((attached, y_off)),
@@ -1038,16 +1065,40 @@ fn run_gui(
                 }
             }
             WindowEvent::Quit => {
+                termielle_app::bar::appbar::unregister_appbar(window.hwnd());
+                termielle_app::bar::appbar::restore_taskbar();
                 window.destroy();
                 return false;
             }
             WindowEvent::Restart => {
+                termielle_app::bar::appbar::unregister_appbar(window.hwnd());
+                termielle_app::bar::appbar::restore_taskbar();
                 window.destroy();
                 return true;
             }
             WindowEvent::LayoutChanged(layout) => {
+                let was_bar = config.island.is_bar();
                 config.island.layout = layout;
                 config.island.clamp();
+                if was_bar && !config.island.is_bar() {
+                    termielle_app::bar::appbar::unregister_appbar(window.hwnd());
+                    termielle_app::bar::appbar::restore_taskbar();
+                } else if !was_bar && config.island.is_bar() {
+                    let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+                    controller.set_bar_width(logical_w);
+                    if config.island.bar.replace_taskbar {
+                        termielle_app::bar::appbar::hide_taskbar();
+                    }
+                    if config.island.bar.reserve_space {
+                        let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
+                        termielle_app::bar::appbar::register_appbar(
+                            window.hwnd(),
+                            is_top,
+                            config.island.bar.height,
+                            Some(window.monitor_bounds()),
+                        );
+                    }
+                }
                 let _ = save_config_atomic(
                     &data_dir()
                         .map(|d| d.join("config.json"))
@@ -1126,6 +1177,20 @@ fn run_gui(
                 }
                 termielle_app::app::ClickOutcome::ActivateWindow(hwnd) => {
                     termielle_app::tasks::activate_window(hwnd);
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::WorkspaceSwitch(idx) => {
+                    termielle_app::bar::workspaces::switch_workspace(idx as usize);
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::VolumeToggle => {
+                    termielle_app::bar::volume::toggle_mute();
                     ControllerActions {
                         present_frame: true,
                         ..Default::default()
