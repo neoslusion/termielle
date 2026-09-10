@@ -799,12 +799,24 @@ impl Controller {
             r: bar_r,
             attached: true,
         }];
-        if expanded && exp_h > 4 {
+        // Grafted while expanded: overlap the card into the bar by its corner
+        // radius so the smooth-min union merges both blobs into one
+        // silhouette. The card grows out of the bar (island morphology)
+        // instead of floating over it as a separate object with a seam;
+        // content still composes at island_x/island_y below.
+        let grafted = expanded && exp_h > 4;
+        if grafted {
+            const GRAFT: i32 = 20;
+            let (cy, ch) = if is_top {
+                (island_y - GRAFT, exp_h + GRAFT as u32)
+            } else {
+                (island_y, exp_h + GRAFT as u32)
+            };
             blobs.push(crate::animation::notch::BlobRect {
                 x: island_x,
-                y: island_y,
+                y: cy,
                 w: island_w,
-                h: exp_h,
+                h: ch,
                 r: 20,
                 attached: true,
             });
@@ -828,17 +840,31 @@ impl Controller {
         } else {
             blob_y
         };
-        crate::animation::notch::draw_rounded_rect(
-            &mut frame,
-            bar_x,
-            strip_y,
-            bar_w,
-            2,
-            0,
-            strip,
-            [0, 0, 0, 0],
-        );
-
+        // Accent strip on the bar edge, split around the grafted card while
+        // expanded: a full-width line would stab through the card's buried
+        // corners and read as a seam between two objects.
+        let strip_segs = if grafted {
+            let card_l = island_x.max(bar_x);
+            let card_r = (island_x + island_w as i32).min(bar_x + bar_w as i32);
+            [
+                (bar_x, (card_l - bar_x).max(0) as u32),
+                (card_r, (bar_x + bar_w as i32 - card_r).max(0) as u32),
+            ]
+        } else {
+            [(bar_x, bar_w), (0, 0)]
+        };
+        for (seg_x, seg_w) in strip_segs {
+            crate::animation::notch::draw_rounded_rect(
+                &mut frame,
+                seg_x,
+                strip_y,
+                seg_w,
+                2,
+                0,
+                strip,
+                [0, 0, 0, 0],
+            );
+        }
         let mut bar_hits = Vec::new();
         // Module visibility from bar.modules_{left,center,right}. Order is
         // fixed; an emptied zone collapses (neighbors do not reflow).

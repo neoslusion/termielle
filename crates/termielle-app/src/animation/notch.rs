@@ -881,6 +881,9 @@ pub fn draw_button_circle(
 }
 
 /// Draws a smooth rounded rectangle / card with an anti-aliased fill and border.
+///
+/// `bg`/`border` are straight-alpha BGRA; they are premultiplied here for the
+/// PBGRA frame.
 #[allow(clippy::too_many_arguments)] // paint ops take explicit geometry; a struct would churn every call site.
 pub fn draw_rounded_rect(
     frame: &mut FrameBuffer,
@@ -918,20 +921,23 @@ pub fn draw_rounded_rect(
             if cov == 0 {
                 continue;
             }
+            // Paint colors are straight alpha; the PBGRA buffer needs them
+            // premultiplied. Skipping that turns every low-alpha bright fill
+            // (e.g. `[255,255,255,20]` module pills) opaque white: src-over
+            // adds the unscaled 255s straight into the frame.
+            let paint = |c: [u8; 4]| {
+                let a = c[3] as u32;
+                [
+                    (c[0] as u32 * a * cov / 65025) as u8,
+                    (c[1] as u32 * a * cov / 65025) as u8,
+                    (c[2] as u32 * a * cov / 65025) as u8,
+                    (a * cov / 255) as u8,
+                ]
+            };
             let color = if border[3] > 0 && sd >= -stroke {
-                [
-                    ((border[0] as u32 * cov) / 255) as u8,
-                    ((border[1] as u32 * cov) / 255) as u8,
-                    ((border[2] as u32 * cov) / 255) as u8,
-                    ((border[3] as u32 * cov) / 255) as u8,
-                ]
+                paint(border)
             } else if bg[3] > 0 {
-                [
-                    ((bg[0] as u32 * cov) / 255) as u8,
-                    ((bg[1] as u32 * cov) / 255) as u8,
-                    ((bg[2] as u32 * cov) / 255) as u8,
-                    ((bg[3] as u32 * cov) / 255) as u8,
-                ]
+                paint(bg)
             } else {
                 continue;
             };
@@ -1397,6 +1403,28 @@ mod tests {
         assert_eq!(f.alpha_at(20, 20), 255);
         assert_eq!(f.alpha_at(29, 29), 255);
         assert_eq!(f.alpha_at(30, 30), 0);
+    }
+
+    #[test]
+    fn rounded_rect_premultiplies_low_alpha_fills() {
+        // Straight-alpha `[255,255,255,20]` (bar module pills) must composite
+        // as a dim veil, not opaque white: the PBGRA blend adds src rgb raw.
+        let mut f = FrameBuffer {
+            width: 100,
+            height: 40,
+            pixels_pbgra: vec![0u8; 100 * 40 * 4],
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        };
+        draw_rounded_rect(&mut f, 10, 10, 60, 20, 9, [255, 255, 255, 20], [0, 0, 0, 0]);
+        let i = ((20 * 100 + 40) * 4) as usize;
+        let px = &f.pixels_pbgra[i..i + 4];
+        assert_eq!(px[3], 20);
+        assert!(
+            px[0] <= 20 && px[1] <= 20 && px[2] <= 20,
+            "fill not premultiplied: {px:?}"
+        );
     }
 
     #[test]

@@ -1014,6 +1014,46 @@ fn bar_layout_sizing_and_interaction() {
 }
 
 #[test]
+fn bar_expanded_card_splits_accent_strip() {
+    // While expanded, the accent strip must flank the grafted card, not
+    // stab through its buried corners: with a live (non-idle) state the
+    // strip is vivid, so a strip-row pixel inside the card's x-range must
+    // read as dark glass while one outside reads the state color.
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        collapsed_width: 140,
+        expanded_width: 360,
+        height: 36,
+        animation_ms: 50,
+        collapse_ms: 50,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    let _ = c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    assert!(c.toggle_expand(10000));
+    for t in 1..20 {
+        let _ = c.on_timer(10000 + t * 50);
+    }
+    let frame = c.current_frame();
+    assert_eq!(frame.width, 1920);
+    assert_eq!(frame.height, 36 + 154);
+    let avg = |x: u32, y: u32| {
+        let i = ((y * frame.width + x) * 4) as usize;
+        let px = &frame.pixels_pbgra[i..i + 4];
+        (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3
+    };
+    // Card spans x 780..1140; strip rows are 34..35.
+    assert!(avg(960, 34) < 60, "no strip over the grafted card");
+    assert!(avg(600, 34) > 90, "strip still flanks the card");
+    assert_eq!(
+        frame.pixels_pbgra[((100 * frame.width + 700) * 4 + 3) as usize],
+        0
+    );
+}
+
+#[test]
 fn bar_layout_click_dispatch() {
     let mut island = IslandConfig {
         layout: IslandLayout::Bar,
