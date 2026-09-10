@@ -1035,5 +1035,66 @@ fn bar_layout_click_dispatch() {
     // Click on workspace 1 (near left margin)
     // First workspace pill is at x=12, y=6..30, w=26
     let outcome = c.handle_click(20, 18, 1200);
-    assert_eq!(outcome, termielle_app::app::ClickOutcome::WorkspaceSwitch(1));
+    assert_eq!(
+        outcome,
+        termielle_app::app::ClickOutcome::WorkspaceSwitch(1)
+    );
+}
+
+#[test]
+fn bar_margin_insets_glass_and_keeps_gap_click_through() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.bar.edge_to_edge = false;
+    island.bar.margin = 8;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    // Window stays full-width; only the glass insets.
+    let frame = c.current_frame();
+    assert_eq!((frame.width, frame.height), (1920, 36));
+    let alpha_at = |x: u32, y: u32| frame.pixels_pbgra[((y * frame.width + x) * 4 + 3) as usize];
+    // Margin gap stays transparent (click-through)...
+    assert_eq!(alpha_at(2, 2), 0);
+    assert_eq!(alpha_at(2, 18), 0);
+    // ...while the inset bar body renders.
+    assert!(alpha_at(960, 18) > 150);
+    // A click in the gap hits nothing and takes the bar miss path.
+    assert_eq!(
+        c.handle_click(2, 18, 1000),
+        termielle_app::app::ClickOutcome::Expanded
+    );
+}
+
+#[test]
+fn bar_module_list_gates_volume_hit() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.bar.modules_right = vec!["volume".to_string()];
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    // Volume listed alone: pill at 1822..1900 toggles mute. Battery is gated
+    // by the list too, so this holds with or without hardware batteries.
+    assert_eq!(
+        c.handle_click(1861, 18, 1000),
+        termielle_app::app::ClickOutcome::VolumeToggle
+    );
+    // Volume unlisted: the same point is bare glass (clock carries no hit)
+    // and takes the bar miss path instead.
+    let mut island2 = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island2.bar.height = 36;
+    island2.bar.modules_right = vec!["clock".to_string()];
+    c.set_island_config(island2, 1100);
+    assert_eq!(
+        c.handle_click(1861, 18, 1200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
 }

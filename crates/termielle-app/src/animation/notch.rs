@@ -316,6 +316,37 @@ pub fn glass_layer_blobs(
     let bridge_k = (bridge_k * scale).max(0.0);
     let tint = glass.tint;
 
+    // Fast path: pure rectangular status bar (1 blob, radius 0). Fills the
+    // blob rect directly without per-pixel signed-distance fields — this is
+    // what keeps full-width bars cheap, including margin-inset ones.
+    if blobs.len() == 1 && blobs[0].r == 0 && !black {
+        let ba = tint[3] as u32;
+        let body = [
+            (tint[0] as u32 * ba / 255) as u8,
+            (tint[1] as u32 * ba / 255) as u8,
+            (tint[2] as u32 * ba / 255) as u8,
+            ba as u8,
+        ];
+        let by_start = blobs[0].y.max(0) as usize;
+        let by_end = (blobs[0].y + blobs[0].h as i32).max(0) as usize;
+        let by_end = by_end.min(height as usize);
+        let bx_start = blobs[0].x.max(0) as usize;
+        let bx_end = (blobs[0].x + blobs[0].w as i32).max(0) as usize;
+        let bx_end = bx_end.min(width as usize);
+        if bx_start >= bx_end {
+            return frame;
+        }
+        for y in by_start..by_end {
+            let row = y * width as usize * 4;
+            for chunk in
+                frame.pixels_pbgra[row + bx_start * 4..row + bx_end * 4].chunks_exact_mut(4)
+            {
+                chunk.copy_from_slice(&body);
+            }
+        }
+        return frame;
+    }
+
     for y in 0..height {
         let fy = y as f32 + 0.5;
         for x in 0..width {
@@ -850,6 +881,7 @@ pub fn draw_button_circle(
 }
 
 /// Draws a smooth rounded rectangle / card with an anti-aliased fill and border.
+#[allow(clippy::too_many_arguments)] // paint ops take explicit geometry; a struct would churn every call site.
 pub fn draw_rounded_rect(
     frame: &mut FrameBuffer,
     x: i32,
@@ -864,7 +896,9 @@ pub fn draw_rounded_rect(
         return;
     }
     let (sx_val, sy_val, sw_val, sh_val) = (sx(frame, x), sx(frame, y), su(frame, w), su(frame, h));
-    let r = (su(frame, radius) as f32).min(sw_val as f32 / 2.0).min(sh_val as f32 / 2.0);
+    let r = (su(frame, radius) as f32)
+        .min(sw_val as f32 / 2.0)
+        .min(sh_val as f32 / 2.0);
     let stroke = 1.0 * frame.scale;
 
     for ty in 0..sh_val as i32 {
@@ -907,6 +941,7 @@ pub fn draw_rounded_rect(
 }
 
 /// Draws a sleek horizontal mini progress bar with rounded ends.
+#[allow(clippy::too_many_arguments)] // same paint-op convention as draw_rounded_rect.
 pub fn draw_progress_bar(
     frame: &mut FrameBuffer,
     x: i32,

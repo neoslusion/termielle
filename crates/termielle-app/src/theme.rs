@@ -277,7 +277,16 @@ mod tests {
                 base
             }
         } else {
-            let base = [30, 30, 30, if crate::system::transparency_enabled() { 180 } else { 255 }];
+            let base = [
+                30,
+                30,
+                30,
+                if crate::system::transparency_enabled() {
+                    180
+                } else {
+                    255
+                },
+            ];
             let mix = if crate::system::taskbar_shows_accent() {
                 ACCENT_MIX_VIVID
             } else if crate::system::transparency_enabled() {

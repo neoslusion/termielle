@@ -27,6 +27,14 @@ pub enum BarPosition {
 }
 
 /// Waybar-style status bar configuration.
+///
+/// Layout contract (all sizes logical px): `edge_to_edge: true` (default)
+/// spans the full monitor width; `false` insets the bar by `margin` on the
+/// free sides for a floating look (the window stays full-width, the margin
+/// stays transparent and click-through). `corner_radius` rounds the bar
+/// blob (0 keeps the cheap flat fill). `modules_*` filter which modules
+/// render in each zone — order within a zone is fixed, unknown names are
+/// ignored, and an emptied zone collapses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BarConfig {
@@ -37,6 +45,10 @@ pub struct BarConfig {
     pub corner_radius: u32,
     pub reserve_space: bool,
     pub replace_taskbar: bool,
+    /// Follow the cursor across monitors (re-anchor, re-size, re-reserve on
+    /// every crossing). `false` pins the bar to the primary monitor.
+    /// Defaults true so existing setups keep their behavior.
+    pub follow_active_monitor: bool,
     pub modules_left: Vec<String>,
     pub modules_center: Vec<String>,
     pub modules_right: Vec<String>,
@@ -52,6 +64,7 @@ impl Default for BarConfig {
             corner_radius: 0,
             reserve_space: true,
             replace_taskbar: false,
+            follow_active_monitor: true,
             modules_left: vec!["workspaces".to_string(), "window".to_string()],
             modules_center: vec!["island".to_string()],
             modules_right: vec![
@@ -311,6 +324,13 @@ impl IslandConfig {
             .retain(|w| matches!(w.as_str(), "face" | "tasks" | "agents" | "music" | "ring"));
         self.widgets.truncate(16);
         self.glass.clamp();
+        // Bar geometry must stay renderable: pill rows need ~18px, and an
+        // unclamped height turns `(bar_h - 10)` into a u32 underflow (release
+        // wrap → gigantic pill → GUI-thread hang). Margin never eats more
+        // than half the bar, so the visual strip keeps positive height.
+        self.bar.height = self.bar.height.clamp(24, 64);
+        self.bar.margin = self.bar.margin.clamp(0, self.bar.height / 2);
+        self.bar.corner_radius = self.bar.corner_radius.clamp(0, self.bar.height / 2);
     }
 
     /// Whether island/notch rendering is enabled.
@@ -415,7 +435,9 @@ pub fn island_anchored_position(
     (x, y)
 }
 
-/// Anchor a full-width status bar inside `work` (logical pixels).
+/// Anchor a full-width status bar inside `work`. Unit-agnostic: callers pass
+/// device pixels (`present_with_bar` with physical monitor bounds) and get
+/// device pixels back — never mix logical here.
 pub fn bar_anchored_position(
     height: i32,
     position: BarPosition,
@@ -556,6 +578,8 @@ mod tests {
         assert_eq!(c.bar.height, 40);
         assert!(c.bar.replace_taskbar);
         assert!(c.bar.reserve_space);
+        // New flags default on for old configs (container #[serde(default)]).
+        assert!(c.bar.follow_active_monitor);
     }
 
     #[test]

@@ -20,8 +20,8 @@ use termielle_app::tray;
 use termielle_app::window::{AnimationClock, OverlayWindow, WakeHandle, WindowError, WindowEvent};
 use termielle_core::{
     AppConfig, AssetCatalog, BarPosition, DEFAULT_EVENT_LOG_MAX_BYTES, EventKind, EventLog,
-    EventMessage, IslandLayout, PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode,
-    Source, VisualState, decode_event_line, encode_event_line, load_config, save_config_atomic,
+    EventMessage, IslandLayout, PROTOCOL_VERSION, ProtocolError, ReducedMotion, RenderMode, Source,
+    VisualState, decode_event_line, encode_event_line, load_config, save_config_atomic,
 };
 use termielle_ipc::{DEFAULT_PIPE_NAME, EventClient, EventServer, IpcError};
 use windows::Win32::Foundation::{
@@ -161,7 +161,8 @@ fn main() {
     // crash is diagnosable instead of looking like "it disappeared".
     let panic_path = data_dir().map(|d| d.join("panic.log"));
     std::panic::set_hook(Box::new(move |info| {
-        termielle_app::bar::appbar::restore_taskbar();
+        // No HWND here; leave_bar_shell routes ABM_REMOVE via the stored handle.
+        termielle_app::bar::appbar::leave_bar_shell();
         if let Some(path) = panic_path.as_ref() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
@@ -200,7 +201,9 @@ fn main() {
                 }
                 let _ = AttachConsole(u32::MAX);
             }
-            eprintln!("Another Termielle instance is already running. Close it before launching, or switch layout via the system tray icon.");
+            eprintln!(
+                "Another Termielle instance is already running. Close it before launching, or switch layout via the system tray icon."
+            );
             return;
         }
     };
@@ -213,7 +216,8 @@ fn main() {
     if let Some(render) = cli.render {
         config.render = render;
     }
-    let layout_cli_override = cli.layout.is_some() || cli.bar_pos.is_some() || cli.replace_taskbar.is_some();
+    let layout_cli_override =
+        cli.layout.is_some() || cli.bar_pos.is_some() || cli.replace_taskbar.is_some();
     if let Some(layout) = cli.layout {
         config.island.layout = layout;
     }
@@ -281,6 +285,11 @@ fn main() {
     controller.set_user_scale(config.scale);
     // Author the first frame at the live scale: the journal replay below
     // renders immediately, before any present refreshes the DPI.
+    if config.island.is_bar() && !config.island.bar.follow_active_monitor {
+        window.pin_primary_monitor();
+    } else {
+        let _ = window.update_active_monitor();
+    }
     controller.set_dpi_scale(window.dpi_scale());
     if config.island.is_bar() {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
@@ -290,11 +299,14 @@ fn main() {
         }
         if config.island.bar.reserve_space {
             let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
-            termielle_app::bar::appbar::register_appbar(
+            // SHAppBarMessage takes device pixels; the config height is logical.
+            let height_px =
+                (config.island.bar.height as f32 * controller.render_scale()).round() as u32;
+            termielle_app::bar::appbar::ensure_appbar(
                 window.hwnd(),
                 is_top,
-                config.island.bar.height,
-                Some(window.monitor_bounds()),
+                height_px,
+                window.monitor_bounds(),
             );
         }
     }
@@ -324,6 +336,8 @@ fn main() {
         Ok(server) => server,
         Err(IpcError::PipeNameOwned) => {
             log_error(&log, LogComponent::Ipc, LogEvent::InvalidEvent, 3);
+            // Bar shell state was claimed before the pipe; leave it behind.
+            termielle_app::bar::appbar::leave_bar_shell();
             return;
         }
         Err(error) => {
@@ -333,6 +347,7 @@ fn main() {
                 LogEvent::InvalidEvent,
                 ipc_error_code(&error),
             );
+            termielle_app::bar::appbar::leave_bar_shell();
             return;
         }
     };
@@ -343,6 +358,7 @@ fn main() {
     if cli.smoke_test {
         let builtin_event = cli.pipe == DEFAULT_PIPE_NAME;
         let code = run_smoke(&mut window, &mut controller, &receiver, &log, builtin_event);
+        termielle_app::bar::appbar::leave_bar_shell();
         drop(instance);
         std::process::exit(code);
     }
@@ -768,10 +784,26 @@ fn present_current(
     if controller.island_config().is_bar() {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
         controller.set_bar_width(logical_w);
+        // Keep the shell reservation glued to the live geometry: DPI, zoom,
+        // or monitor can change without an anchor flip, and a stale
+        // reservation overlaps maximized windows. No-op when unchanged.
+        if controller.island_config().bar.reserve_space {
+            let bar = &controller.island_config().bar;
+            let height_px = (bar.height as f32 * controller.render_scale()).round() as u32;
+            termielle_app::bar::appbar::ensure_appbar(
+                window.hwnd(),
+                bar.position == termielle_core::BarPosition::Top,
+                height_px,
+                window.monitor_bounds(),
+            );
+        }
     }
     let anchor = controller.island_anchor();
     let attempt = if controller.island_config().is_bar() {
-        window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+        window.present_with_bar(
+            controller.current_frame(),
+            controller.island_config().bar.position,
+        )
     } else if let Some((attached, y_off)) = anchor {
         window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
     } else {
@@ -808,7 +840,10 @@ fn present_current(
             );
             let retry_anchor = controller.island_anchor();
             let retry = if controller.island_config().is_bar() {
-                window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+                window.present_with_bar(
+                    controller.current_frame(),
+                    controller.island_config().bar.position,
+                )
             } else if let Some((attached, y_off)) = retry_anchor {
                 window.present_with_anchor(controller.current_frame(), Some((attached, y_off)))
             } else {
@@ -830,7 +865,10 @@ fn present_current(
                     controller.fallback_to_still();
                     let fallback_anchor = controller.island_anchor();
                     let _ = if controller.island_config().is_bar() {
-                        window.present_with_bar(controller.current_frame(), controller.island_config().bar.position)
+                        window.present_with_bar(
+                            controller.current_frame(),
+                            controller.island_config().bar.position,
+                        )
                     } else if let Some((attached, y_off)) = fallback_anchor {
                         window.present_with_anchor(
                             controller.current_frame(),
@@ -849,11 +887,23 @@ fn present_current(
 /// `actions`. Backstop for spurious `WM_MOUSELEAVE`s across ULW resizes.
 /// Also auto-dismisses the manually expanded card if the user clicks outside or presses Escape.
 fn poll_hover(
-    window: &OverlayWindow,
+    window: &mut OverlayWindow,
     controller: &mut Controller,
     actions: &mut ControllerActions,
 ) {
     let now = now_ms();
+    if controller.island_config().is_bar()
+        && controller.island_config().bar.follow_active_monitor
+        && window.update_active_monitor()
+    {
+        let new_dpi = window.dpi_scale();
+        controller.set_dpi_scale(new_dpi);
+        let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+        controller.set_bar_width(logical_w);
+        // Reservation itself syncs in present_current (every present), which
+        // also covers DPI/zoom changes without an anchor flip.
+        actions.present_frame = true;
+    }
     controller.set_hover_point(window.cursor_client_pos());
     let over = window.cursor_over_pill();
     if controller.set_hover(over, now) {
@@ -867,11 +917,9 @@ fn poll_hover(
         let l_click = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
         let r_click = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0;
         let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } < 0;
-        if (!over && (l_click || r_click)) || esc {
-            if controller.collapse_if_expanded(now) {
-                actions.present_frame = true;
-                actions.next_deadline_ms = controller.next_deadline_ms();
-            }
+        if ((!over && (l_click || r_click)) || esc) && controller.collapse_if_expanded(now) {
+            actions.present_frame = true;
+            actions.next_deadline_ms = controller.next_deadline_ms();
         }
     }
 }
@@ -1109,10 +1157,18 @@ fn run_gui(
         let mut actions = match event {
             WindowEvent::Timer => controller.on_timer(now_ms()),
             WindowEvent::DisplayChanged => {
-                // The wndproc re-clamped classic rects; the island drops its
-                // tracked monitor so the repaint re-picks the display the
-                // cursor is on, then SetWindowPos re-anchors top-center there.
-                window.reset_anchor_monitor();
+                if controller.island_config().is_bar()
+                    && !controller.island_config().bar.follow_active_monitor
+                {
+                    // Pinned bar: re-resolve the primary (it may have moved)
+                    // instead of dropping the anchor to a cursor pick.
+                    window.pin_primary_monitor();
+                } else {
+                    // The wndproc re-clamped classic rects; the island drops its
+                    // tracked monitor so the repaint re-picks the display the
+                    // cursor is on, then SetWindowPos re-anchors top-center there.
+                    window.reset_anchor_monitor();
+                }
                 // A monitor change can move the pill across DPIs: re-author
                 // the frame at the new scale before presenting it.
                 controller.set_dpi_scale(window.dpi_scale());
@@ -1123,14 +1179,12 @@ fn run_gui(
                 }
             }
             WindowEvent::Quit => {
-                termielle_app::bar::appbar::unregister_appbar(window.hwnd());
-                termielle_app::bar::appbar::restore_taskbar();
+                termielle_app::bar::appbar::leave_bar_shell();
                 window.destroy();
                 return false;
             }
             WindowEvent::Restart => {
-                termielle_app::bar::appbar::unregister_appbar(window.hwnd());
-                termielle_app::bar::appbar::restore_taskbar();
+                termielle_app::bar::appbar::leave_bar_shell();
                 window.destroy();
                 return true;
             }
@@ -1139,21 +1193,28 @@ fn run_gui(
                 config.island.layout = layout;
                 config.island.clamp();
                 if was_bar && !config.island.is_bar() {
-                    termielle_app::bar::appbar::unregister_appbar(window.hwnd());
-                    termielle_app::bar::appbar::restore_taskbar();
+                    termielle_app::bar::appbar::leave_bar_shell();
                 } else if !was_bar && config.island.is_bar() {
-                    let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+                    if !config.island.bar.follow_active_monitor {
+                        window.pin_primary_monitor();
+                        controller.set_dpi_scale(window.dpi_scale());
+                    }
+                    let logical_w =
+                        (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
                     controller.set_bar_width(logical_w);
                     if config.island.bar.replace_taskbar {
                         termielle_app::bar::appbar::hide_taskbar();
                     }
                     if config.island.bar.reserve_space {
                         let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
-                        termielle_app::bar::appbar::register_appbar(
+                        let height_px = (config.island.bar.height as f32
+                            * controller.render_scale())
+                        .round() as u32;
+                        termielle_app::bar::appbar::ensure_appbar(
                             window.hwnd(),
                             is_top,
-                            config.island.bar.height,
-                            Some(window.monitor_bounds()),
+                            height_px,
+                            window.monitor_bounds(),
                         );
                     }
                 }

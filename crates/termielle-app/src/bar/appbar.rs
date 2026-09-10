@@ -5,11 +5,10 @@
 //! hides the native Windows 11 Taskbar (`Shell_TrayWnd`) during runtime,
 //! safely restoring it on exit.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::Shell::{
-    ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
-    SHAppBarMessage,
+    ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, SHAppBarMessage,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, ShowWindow,
@@ -18,9 +17,23 @@ use windows::core::w;
 
 static APPBAR_REGISTERED: AtomicBool = AtomicBool::new(false);
 static TASKBAR_HIDDEN: AtomicBool = AtomicBool::new(false);
+/// Raw HWND of the registered AppBar, so teardown paths without a window
+/// handle (panic hook, Drop) can still send ABM_REMOVE. 0 when unregistered.
+static APPBAR_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Last reserved geometry (top edge, height px, monitor rect). The shell
+/// reservation must track DPI/zoom/monitor changes not just anchor flips:
+/// a resized bar with a stale reservation overlaps maximized windows.
+static LAST_TOP: AtomicBool = AtomicBool::new(true);
+static LAST_HEIGHT: AtomicU32 = AtomicU32::new(0);
+static LAST_RECT: std::sync::Mutex<Option<RECT>> = std::sync::Mutex::new(None);
 
-/// Registers `hwnd` as an Application Desktop Toolbar on `edge` (top=1, bottom=3).
-pub fn register_appbar(hwnd: HWND, top: bool, height: u32, monitor_rect: Option<RECT>) -> bool {
+/// Registers `hwnd` as an Application Desktop Toolbar on the top or bottom
+/// edge. `height_px` is DEVICE pixels (the shell is per-monitor aware);
+/// callers must scale the logical bar height by the render scale first.
+/// `monitor_rect` is the full physical monitor bounds the reservation docks
+/// against. Stores the HWND so [`leave_bar_shell`] can tear down without one.
+pub fn register_appbar(hwnd: HWND, top: bool, height_px: u32, monitor_rect: Option<RECT>) -> bool {
+    APPBAR_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
     let mut data = APPBARDATA {
         cbSize: std::mem::size_of::<APPBARDATA>() as u32,
         hWnd: hwnd,
@@ -51,12 +64,12 @@ pub fn register_appbar(hwnd: HWND, top: bool, height: u32, monitor_rect: Option<
             left: rect.left,
             top: rect.top,
             right: rect.right,
-            bottom: rect.top + height as i32,
+            bottom: rect.top + height_px as i32,
         };
     } else {
         data.rc = RECT {
             left: rect.left,
-            top: rect.bottom - height as i32,
+            top: rect.bottom - height_px as i32,
             right: rect.right,
             bottom: rect.bottom,
         };
@@ -71,8 +84,66 @@ pub fn register_appbar(hwnd: HWND, top: bool, height: u32, monitor_rect: Option<
     true
 }
 
+/// Re-registers the AppBar (monitor follow): removes any prior registration
+/// first, so repeated calls never stack `ABM_NEW` on the same HWND.
+pub fn reregister_appbar(
+    hwnd: HWND,
+    top: bool,
+    height_px: u32,
+    monitor_rect: Option<RECT>,
+) -> bool {
+    unregister_appbar(hwnd);
+    register_appbar(hwnd, top, height_px, monitor_rect)
+}
+/// Ensures the shell reservation matches the live bar geometry: registers on
+/// first call, re-registers when edge, height, or monitor change, and no-ops
+/// otherwise. Call on every present; ABM traffic happens only on real change.
+/// `height_px` is device pixels, `monitor_rect` the full physical bounds.
+pub fn ensure_appbar(hwnd: HWND, top: bool, height_px: u32, monitor_rect: RECT) -> bool {
+    let same_rect = LAST_RECT
+        .lock()
+        .map(|guard| *guard == Some(monitor_rect))
+        .unwrap_or(false);
+    if APPBAR_REGISTERED.load(Ordering::SeqCst)
+        && LAST_TOP.load(Ordering::SeqCst) == top
+        && LAST_HEIGHT.load(Ordering::SeqCst) == height_px
+        && same_rect
+    {
+        return true;
+    }
+    if !reregister_appbar(hwnd, top, height_px, Some(monitor_rect)) {
+        return false;
+    }
+    LAST_TOP.store(top, Ordering::SeqCst);
+    LAST_HEIGHT.store(height_px, Ordering::SeqCst);
+    if let Ok(mut guard) = LAST_RECT.lock() {
+        *guard = Some(monitor_rect);
+    }
+    true
+}
+
+/// Leaves all bar shell state: unregisters the AppBar (via the stored HWND)
+/// and restores the taskbar. Idempotent; safe on every exit path including
+/// the panic hook and `Drop`, which have no window handle.
+pub fn leave_bar_shell() {
+    // The flag lives in unregister_appbar; the stored HWND is only routing.
+    // Swap first so a concurrent register cannot leak between the two calls.
+    let raw = APPBAR_HWND.swap(0, Ordering::SeqCst) as *mut std::ffi::c_void;
+    if !raw.is_null() {
+        unregister_appbar(HWND(raw));
+    }
+    restore_taskbar();
+}
+
 /// Unregisters `hwnd` as an AppBar and restores the desktop work area.
 pub fn unregister_appbar(hwnd: HWND) {
+    // Single window for the process lifetime, so an unconditional clear is safe.
+    APPBAR_HWND.store(0, Ordering::SeqCst);
+    // Forget the reservation geometry so a later ensure re-registers.
+    LAST_HEIGHT.store(u32::MAX, Ordering::SeqCst);
+    if let Ok(mut guard) = LAST_RECT.lock() {
+        *guard = None;
+    }
     if !APPBAR_REGISTERED.swap(false, Ordering::SeqCst) {
         return;
     }

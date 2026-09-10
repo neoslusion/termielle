@@ -245,8 +245,8 @@ pub fn spawn_worker(
                     last_media = current_media();
                 }
                 let should_poll_tasks = config.poll_tasks.load(Ordering::Relaxed);
-                let tasks_due = should_poll_tasks
-                    && now_ms.saturating_sub(last_tasks_ms) >= TASKS_REFRESH_MS;
+                let tasks_due =
+                    should_poll_tasks && now_ms.saturating_sub(last_tasks_ms) >= TASKS_REFRESH_MS;
                 let mut tasks_cleared = false;
                 if tasks_due {
                     last_tasks_ms = now_ms;

@@ -5,17 +5,20 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use termielle_core::{AppConfig, GlassConfig, IslandLayout, RenderMode, island_anchored_position};
 use windows::Win32::Foundation::{
-    COLORREF, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    COLORREF, FALSE, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, TRUE,
+    WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC,
-    GetMonitorInfoW, HGDIOBJ, MONITOR_DEFAULTTONEAREST, MONITORINFO, MONITORINFOEXW,
-    MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC, SelectObject, SetDIBitsToDevice,
+    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
+    EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    MONITORINFO, MONITORINFOEXW, MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC,
+    SelectObject, SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow,
+    MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
@@ -23,15 +26,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION,
-    HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer, LWA_COLORKEY, LoadCursorW, MSG,
-    PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOZORDER, SetCursor, SetLayeredWindowAttributes,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
-    UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer, LWA_COLORKEY, LoadCursorW,
+    MONITORINFOF_PRIMARY, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
+use windows::core::BOOL;
 use windows::core::PCWSTR;
 
 use crate::animation::FrameBuffer;
@@ -265,6 +269,28 @@ struct WindowState {
 fn lparam_point(lparam: LPARAM) -> (i32, i32) {
     let value = lparam.0;
     (value as i16 as i32, (value >> 16) as i16 as i32)
+}
+
+/// `EnumDisplayMonitors` callback: records the primary monitor in `data` and stops.
+/// `MONITORINFOF_PRIMARY` is a one-bit flag set; mask it rather than comparing.
+unsafe extern "system" fn find_primary_monitor(
+    monitor: HMONITOR,
+    _: HDC,
+    _: *mut RECT,
+    data: LPARAM,
+) -> BOOL {
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool()
+        && info.dwFlags & MONITORINFOF_PRIMARY != 0
+    {
+        unsafe { *(data.0 as *mut HMONITOR) = monitor };
+        FALSE
+    } else {
+        TRUE
+    }
 }
 
 pub(crate) fn encode_wide(value: &str) -> Vec<u16> {
@@ -971,11 +997,55 @@ impl OverlayWindow {
     }
 
     /// Monitor DPI scale for the window's current monitor: physical pixels
-    /// per logical pixel. Falls back to 1.0 when the query fails — the
-    /// overlay keeps presenting, just unscaled.
+    /// per logical pixel. Prefers the window's own DPI (authoritative for
+    /// where pixels actually land); falls back to the tracked anchor monitor
+    /// (pre-positioning, before the first move) and then to 1.0.
     pub fn dpi_scale(&self) -> f32 {
         let dpi = unsafe { GetDpiForWindow(self.hwnd) };
-        if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+        if dpi != 0 {
+            return (dpi as f32 / 96.0).clamp(0.5, 4.0);
+        }
+        if let Some(monitor) = self.anchor_monitor {
+            let mut dpi_x = 96u32;
+            let mut dpi_y = 96u32;
+            if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+                .is_ok()
+            {
+                return (dpi_x as f32 / 96.0).clamp(0.5, 4.0);
+            }
+        }
+        1.0
+    }
+
+    /// Checks if the cursor is currently on a different monitor than `anchor_monitor`.
+    /// When it is, updates `anchor_monitor` and returns true so the bar can follow the active screen.
+    pub fn update_active_monitor(&mut self) -> bool {
+        let mut point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) }.is_ok() {
+            let monitor = unsafe {
+                windows::Win32::Graphics::Gdi::MonitorFromPoint(
+                    point,
+                    windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+                )
+            };
+            if !monitor.is_invalid() && self.anchor_monitor != Some(monitor) {
+                self.anchor_monitor = Some(monitor);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Pins the anchor to the primary monitor (bar `follow_active_monitor: false`).
+    /// No-op when enumeration yields nothing; `monitor_bounds` then falls back
+    /// to a cursor pick, same as an un-anchored start.
+    pub fn pin_primary_monitor(&mut self) {
+        let mut primary = HMONITOR::default();
+        let data = LPARAM(&mut primary as *mut HMONITOR as isize);
+        let _ = unsafe { EnumDisplayMonitors(None, None, Some(find_primary_monitor), data) };
+        if !primary.is_invalid() {
+            self.anchor_monitor = Some(primary);
+        }
     }
 
     /// Whether the cursor is currently over an opaque pill pixel. Polled by
@@ -1217,7 +1287,8 @@ impl OverlayWindow {
                                 let comp_g = (u32::from(source[1]) + bg_g * ia / 255).min(255);
                                 let comp_r = (u32::from(source[2]) + bg_r * ia / 255).min(255);
                                 let tint_alpha = u32::from(self.glass.tint[3]).max(1);
-                                let is_interior = source[3] >= self.glass.tint[3].saturating_sub(15);
+                                let is_interior =
+                                    source[3] >= self.glass.tint[3].saturating_sub(15);
                                 if is_interior {
                                     dst[target] = comp_b as u8;
                                     dst[target + 1] = comp_g as u8;
@@ -1225,7 +1296,8 @@ impl OverlayWindow {
                                     dst[target + 3] = 255;
                                 } else {
                                     // Anti-aliased outer edge: scale colors by coverage so PBGRA stays valid
-                                    let edge_cov = ((u32::from(source[3]) * 255) / tint_alpha).min(255);
+                                    let edge_cov =
+                                        ((u32::from(source[3]) * 255) / tint_alpha).min(255);
                                     dst[target] = (comp_b * edge_cov / 255) as u8;
                                     dst[target + 1] = (comp_g * edge_cov / 255) as u8;
                                     dst[target + 2] = (comp_r * edge_cov / 255) as u8;
@@ -1299,6 +1371,24 @@ impl OverlayWindow {
         let _ = unsafe { DeleteDC(memory) };
         let _ = unsafe { ReleaseDC(None, screen) };
         update?;
+
+        if self.state.is_island {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(windows::Win32::UI::WindowsAndMessaging::HWND_TOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOACTIVATE
+                        | SWP_NOOWNERZORDER
+                        | SWP_NOSENDCHANGING,
+                );
+            }
+        }
 
         *self.state.alpha.borrow_mut() = AlphaMap {
             bytes: alpha_map,
@@ -1400,6 +1490,9 @@ impl OverlayWindow {
 
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
+        // Idempotent: Quit/Restart/LayoutChanged already left, but early
+        // returns and test teardowns reach Drop without them.
+        crate::bar::appbar::leave_bar_shell();
         self.destroy();
     }
 }
