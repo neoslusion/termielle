@@ -6,6 +6,7 @@
 //! log.
 
 use crate::animation::notch::BRIDGE_K_MAX;
+use crate::animation::spring::{BLOB_GAP_PX, Spring1, Spring2D};
 use crate::animation::{
     AnimationError, AnimationSource, FrameBuffer, GifAnimation, fallback_frame,
 };
@@ -73,176 +74,6 @@ pub enum ClickOutcome {
     None,
 }
 
-/// The iOS Dynamic Island morphs between presentations with a spring, not a
-/// timing curve — interrupted morphs keep their velocity and settle
-/// naturally. This integrator tracks pill width, height, and corner radius
-/// in px and velocity (px/s): the radius rides the same spring so the
-/// silhouette morphs continuously instead of snapping between the pill and
-/// the expanded card.
-#[derive(Clone, Copy, Debug)]
-struct Spring2D {
-    /// Current animated width.
-    x: f32,
-    /// Current animated height.
-    y: f32,
-    /// Current animated corner radius.
-    z: f32,
-    /// Current width velocity in px/s.
-    vx: f32,
-    /// Current height velocity in px/s.
-    vy: f32,
-    /// Current radius velocity in px/s.
-    vz: f32,
-    /// Target width.
-    target_x: f32,
-    /// Target height.
-    target_y: f32,
-    /// Target corner radius.
-    target_z: f32,
-    /// Where this morph started, so interrupted morphs still report progress.
-    start_x: f32,
-    start_y: f32,
-    start_z: f32,
-    /// Params from `spring_params(animation_ms, spring_bounce)`.
-    stiffness: f32,
-    damping: f32,
-}
-
-/// Below these the spring is considered settled and snaps to target.
-const SETTLE_PX: f32 = 0.5;
-const SETTLE_V: f32 = 2.0;
-
-impl Spring2D {
-    fn new(
-        from_w: u32,
-        from_h: u32,
-        from_r: f32,
-        target_w: u32,
-        target_h: u32,
-        target_r: f32,
-        params: termielle_core::SpringParams,
-    ) -> Self {
-        Self {
-            x: from_w as f32,
-            y: from_h as f32,
-            z: from_r,
-            vx: 0.0,
-            vy: 0.0,
-            vz: 0.0,
-            target_x: target_w as f32,
-            target_y: target_h as f32,
-            target_z: target_r,
-            start_x: from_w as f32,
-            start_y: from_h as f32,
-            start_z: from_r,
-            stiffness: params.stiffness,
-            damping: params.damping,
-        }
-    }
-
-    /// Morph progress toward the target, 0-1, from the remaining
-    /// displacement fraction. Content fade/slide derives from this.
-    fn progress(&self) -> f32 {
-        let total = (self.start_x - self.target_x)
-            .abs()
-            .max((self.start_y - self.target_y).abs())
-            .max((self.start_z - self.target_z).abs());
-        if total < 1.0 {
-            return 1.0;
-        }
-        let remaining = (self.x - self.target_x)
-            .abs()
-            .max((self.y - self.target_y).abs())
-            .max((self.z - self.target_z).abs());
-        (1.0 - remaining / total).clamp(0.0, 1.0)
-    }
-
-    /// Integrates one step of `dt` seconds. Returns ((width, height, radius), settled).
-    fn step(&mut self, dt: f32) -> ((u32, u32, u32), bool) {
-        let accel_x = -self.stiffness * (self.x - self.target_x) - self.damping * self.vx;
-        self.vx += accel_x * dt;
-        self.x += self.vx * dt;
-
-        let accel_y = -self.stiffness * (self.y - self.target_y) - self.damping * self.vy;
-        self.vy += accel_y * dt;
-        self.y += self.vy * dt;
-
-        let accel_z = -self.stiffness * (self.z - self.target_z) - self.damping * self.vz;
-        self.vz += accel_z * dt;
-        self.z += self.vz * dt;
-
-        let settled_x = (self.x - self.target_x).abs() < SETTLE_PX && self.vx.abs() < SETTLE_V;
-        let settled_y = (self.y - self.target_y).abs() < SETTLE_PX && self.vy.abs() < SETTLE_V;
-        let settled_z = (self.z - self.target_z).abs() < SETTLE_PX && self.vz.abs() < SETTLE_V;
-
-        if settled_x {
-            self.x = self.target_x;
-            self.vx = 0.0;
-        }
-        if settled_y {
-            self.y = self.target_y;
-            self.vy = 0.0;
-        }
-        if settled_z {
-            self.z = self.target_z;
-            self.vz = 0.0;
-        }
-
-        let settled = settled_x && settled_y && settled_z;
-        (
-            (
-                self.x.round().max(1.0) as u32,
-                self.y.round().max(1.0) as u32,
-                self.z.round().max(1.0) as u32,
-            ),
-            settled,
-        )
-    }
-}
-
-/// 1-D spring for the blob separation in pixels: 0 is the merged single
-/// pill, [`BLOB_GAP_PX`] is the fully split island. It runs alongside the
-/// size spring so the split and the stretch feel like one motion.
-#[derive(Clone, Copy, Debug, Default)]
-struct Spring1 {
-    x: f32,
-    v: f32,
-    target: f32,
-    stiffness: f32,
-    damping: f32,
-}
-
-impl Spring1 {
-    fn new(from: f32, target: f32, params: termielle_core::SpringParams) -> Self {
-        Self {
-            x: from,
-            v: 0.0,
-            target,
-            stiffness: params.stiffness,
-            damping: params.damping,
-        }
-    }
-
-    fn step(&mut self, dt: f32) {
-        let accel = -self.stiffness * (self.x - self.target) - self.damping * self.v;
-        self.v += accel * dt;
-        self.x += self.v * dt;
-        if (self.x - self.target).abs() < SETTLE_PX && self.v.abs() < SETTLE_V {
-            self.x = self.target;
-            self.v = 0.0;
-        }
-    }
-
-    fn settled(&self) -> bool {
-        (self.x - self.target).abs() < SETTLE_PX && self.v.abs() < SETTLE_V
-    }
-}
-
-/// Gap between the two blobs of a split island, in pixels — the Dynamic
-/// Island keeps its two live activities close, joined earlier by the
-/// liquid bridge.
-const BLOB_GAP_PX: f32 = 9.0;
-
 /// Procedural-motion repaint cadence in ms (~20 fps): thinking bounce,
 /// worker orbit, input pulse, celebration/shake one-shots, and the media
 /// equalizer all ride this clock so they move even with no other deadline
@@ -304,6 +135,20 @@ impl BarMetricsCache {
             cpu_pct: 0,
         }
     }
+}
+/// One bar-module hit target: (id, x, y, w, h) in frame coordinates.
+/// Collected per zone and installed as [`Controller::icon_hits`] by the
+/// center painter, which owns the island interaction state.
+type BarHit = (isize, i32, i32, u32, u32);
+
+/// Expanded-card geometry for the bar center painter: where the drop-down
+/// card lives plus whether this frame is expanded at all.
+struct BarCard {
+    island_x: i32,
+    island_y: i32,
+    island_w: u32,
+    exp_h: u32,
+    expanded: bool,
 }
 
 /// Ties the session reducer, the animation pipeline, and one deadline together.
@@ -865,25 +710,16 @@ impl Controller {
                 [0, 0, 0, 0],
             );
         }
-        let mut bar_hits = Vec::new();
         // Module visibility from bar.modules_{left,center,right}. Order is
-        // fixed; an emptied zone collapses (neighbors do not reflow).
-        let show_workspaces = self.bar_module("left", "workspaces");
-        let show_window = self.bar_module("left", "window");
-        let show_clock = self.bar_module("right", "clock");
-        let show_battery = self.bar_module("right", "battery");
-        let show_volume = self.bar_module("right", "volume");
-        let show_memory = self.bar_module("right", "memory");
-        let show_cpu = self.bar_module("right", "cpu");
-        let show_island = self.bar_module("center", "island");
-        let show_any = show_workspaces
-            || show_window
-            || show_clock
-            || show_battery
-            || show_volume
-            || show_memory
-            || show_cpu
-            || show_island;
+        // fixed; an emptied zone collapses (neighbors do not reflow). Zones
+        // re-check their own flags when painting.
+        let show_any = ["workspaces", "window"]
+            .iter()
+            .any(|m| self.bar_module("left", m))
+            || ["clock", "battery", "volume", "memory", "cpu"]
+                .iter()
+                .any(|m| self.bar_module("right", m))
+            || self.bar_module("center", "island");
 
         // Cached metrics: only query Windows Registry/COM/System once per ~second
         let metrics = if !show_any {
@@ -923,10 +759,36 @@ impl Controller {
             fresh
         };
 
+        let card = BarCard {
+            island_x,
+            island_y,
+            island_w,
+            exp_h,
+            expanded,
+        };
+        let mut bar_hits = self.paint_bar_left(&mut frame, &metrics, accent, bar_x, pill_y, pill_h);
+        bar_hits.extend(self.paint_bar_right(&mut frame, &metrics, width, bar_x, pill_y, pill_h));
+        self.paint_bar_center(&mut frame, state, now_ms, width, card, bar_hits);
+
+        frame
+    }
+    /// Bar zone 2 (left): workspace switcher plus the active-window title
+    /// pill. Pure painter: draws into `frame` and returns its hit targets
+    /// for the orchestrator to install.
+    fn paint_bar_left(
+        &self,
+        frame: &mut FrameBuffer,
+        metrics: &BarMetricsCache,
+        accent: [u8; 4],
+        bar_x: i32,
+        pill_y: i32,
+        pill_h: u32,
+    ) -> Vec<BarHit> {
+        let mut hits = Vec::new();
         // 2. Modules Left: Workspaces + Window Title
         let mut cur_x = bar_x + 12;
 
-        if show_workspaces {
+        if self.bar_module("left", "workspaces") {
             // Workspaces
             let ws = metrics.workspaces;
             let ws_w = 28u32;
@@ -946,7 +808,7 @@ impl Controller {
                     )
                 };
                 crate::animation::notch::draw_rounded_rect(
-                    &mut frame,
+                    frame,
                     cur_x,
                     pill_y,
                     ws_w,
@@ -959,11 +821,11 @@ impl Controller {
                 let text_x = cur_x + ((ws_w - 8) / 2) as i32;
                 let text_y = pill_y + ((pill_h - 12) / 2) as i32;
                 crate::animation::notch::draw_text(
-                    &mut frame, &num_str, text_x, text_y, 16, 11, true, text_col,
+                    frame, &num_str, text_x, text_y, 16, 11, true, text_col,
                 );
 
                 // Register hit target for workspace switching
-                bar_hits.push((
+                hits.push((
                     crate::bar::HIT_BAR_WORKSPACE_BASE - i as isize,
                     cur_x,
                     pill_y,
@@ -976,7 +838,7 @@ impl Controller {
         }
 
         // Window Title
-        if show_window && !metrics.window_title.is_empty() {
+        if self.bar_module("left", "window") && !metrics.window_title.is_empty() {
             cur_x += 6;
             let app_name = crate::media::app_name_from_title(&metrics.window_title);
             let display_text = if app_name.len() < metrics.window_title.len() {
@@ -989,7 +851,7 @@ impl Controller {
             let title_w = (truncated.chars().count() as u32 * 8 + 24).clamp(60, 260);
 
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 cur_x,
                 pill_y,
                 title_w,
@@ -999,7 +861,7 @@ impl Controller {
                 [255, 255, 255, 30],
             );
             crate::animation::notch::draw_text(
-                &mut frame,
+                frame,
                 &truncated,
                 cur_x + 10,
                 pill_y + ((pill_h - 12) / 2) as i32,
@@ -1010,15 +872,31 @@ impl Controller {
             );
         }
 
+        hits
+    }
+
+    /// Bar zone 3 (right): clock, battery, volume, RAM, and CPU pills.
+    /// Pure painter: draws into `frame` and returns its hit targets
+    /// for the orchestrator to install.
+    fn paint_bar_right(
+        &self,
+        frame: &mut FrameBuffer,
+        metrics: &BarMetricsCache,
+        width: u32,
+        bar_x: i32,
+        pill_y: i32,
+        pill_h: u32,
+    ) -> Vec<BarHit> {
+        let mut hits = Vec::new();
         // 3. Modules Right: Clock, Battery, Volume, RAM, CPU
         let mut cur_right = (width as i32) - bar_x - 12;
 
-        if show_clock {
+        if self.bar_module("right", "clock") {
             // Clock
             let clock_w = 84u32;
             cur_right -= clock_w as i32;
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 cur_right,
                 pill_y,
                 clock_w,
@@ -1028,7 +906,7 @@ impl Controller {
                 [255, 255, 255, 36],
             );
             crate::animation::notch::draw_text(
-                &mut frame,
+                frame,
                 &metrics.time_str,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
@@ -1039,7 +917,7 @@ impl Controller {
             );
         }
 
-        if show_battery {
+        if self.bar_module("right", "battery") {
             // Battery
             let (bat_opt, is_charging) = metrics.battery;
             if let Some(bat_pct) = bat_opt {
@@ -1052,7 +930,7 @@ impl Controller {
                     format!("BAT {}%", bat_pct)
                 };
                 crate::animation::notch::draw_rounded_rect(
-                    &mut frame,
+                    frame,
                     cur_right,
                     pill_y,
                     bat_w,
@@ -1062,7 +940,7 @@ impl Controller {
                     [255, 255, 255, 32],
                 );
                 crate::animation::notch::draw_text(
-                    &mut frame,
+                    frame,
                     &bat_text,
                     cur_right + 8,
                     pill_y + ((pill_h - 12) / 2) as i32,
@@ -1074,7 +952,7 @@ impl Controller {
             }
         }
 
-        if show_volume {
+        if self.bar_module("right", "volume") {
             // Volume
             cur_right -= 8;
             let vol = metrics.volume;
@@ -1091,7 +969,7 @@ impl Controller {
                 [255, 255, 255, 20]
             };
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 cur_right,
                 pill_y,
                 vol_w,
@@ -1101,7 +979,7 @@ impl Controller {
                 [255, 255, 255, 32],
             );
             crate::animation::notch::draw_text(
-                &mut frame,
+                frame,
                 &vol_text,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
@@ -1110,7 +988,7 @@ impl Controller {
                 false,
                 [220, 220, 220, 230],
             );
-            bar_hits.push((
+            hits.push((
                 crate::bar::HIT_BAR_VOLUME_TOGGLE,
                 cur_right,
                 pill_y,
@@ -1119,7 +997,7 @@ impl Controller {
             ));
         }
 
-        if show_memory {
+        if self.bar_module("right", "memory") {
             // RAM
             cur_right -= 8;
             let mem_pct = metrics.memory_pct;
@@ -1127,7 +1005,7 @@ impl Controller {
             cur_right -= mem_w as i32;
             let mem_text = format!("RAM {}%", mem_pct);
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 cur_right,
                 pill_y,
                 mem_w,
@@ -1137,7 +1015,7 @@ impl Controller {
                 [255, 255, 255, 32],
             );
             crate::animation::notch::draw_text(
-                &mut frame,
+                frame,
                 &mem_text,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
@@ -1148,7 +1026,7 @@ impl Controller {
             );
         }
 
-        if show_cpu {
+        if self.bar_module("right", "cpu") {
             // CPU
             cur_right -= 8;
             let cpu_pct = metrics.cpu_pct;
@@ -1156,7 +1034,7 @@ impl Controller {
             cur_right -= cpu_w as i32;
             let cpu_text = format!("CPU {}%", cpu_pct);
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 cur_right,
                 pill_y,
                 cpu_w,
@@ -1166,7 +1044,7 @@ impl Controller {
                 [255, 255, 255, 32],
             );
             crate::animation::notch::draw_text(
-                &mut frame,
+                frame,
                 &cpu_text,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
@@ -1177,16 +1055,31 @@ impl Controller {
             );
         }
 
+        hits
+    }
+
+    /// Bar zone 4 (center): the resting island pill, or the expanded card
+    /// composited below the bar. Owns [`Controller::icon_hits`]: it installs
+    /// the passed-in module hits alongside the island's own.
+    fn paint_bar_center(
+        &mut self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        now_ms: u64,
+        width: u32,
+        card: BarCard,
+        mut hits: Vec<BarHit>,
+    ) {
         // 4. Center Module: Dynamic Island
-        if !expanded {
-            if show_island {
+        if !card.expanded {
+            if self.bar_module("center", "island") {
                 // Resting Dynamic Island pill flush in the center of the bar.
                 // Shared with the hover sensor via bar_pill_rect: same rect here,
                 // in the hit target below, and in set_hover.
                 let (pill_cx, pill_y, pill_w, pill_h) = self.bar_pill_rect(width);
 
                 crate::animation::notch::draw_rounded_rect(
-                    &mut frame,
+                    frame,
                     pill_cx,
                     pill_y,
                     pill_w,
@@ -1201,7 +1094,7 @@ impl Controller {
                 let face_x = pill_cx + 4;
                 let face_y = pill_y + ((pill_h - face_sz) / 2) as i32;
                 crate::animation::notch::blit_rounded(
-                    &mut frame,
+                    frame,
                     &self.face_frame,
                     face_x,
                     face_y,
@@ -1217,7 +1110,7 @@ impl Controller {
                     if let Some(media) = &self.media {
                         let track = format!("{} — {}", media.title, media.artist);
                         crate::animation::notch::draw_text(
-                            &mut frame,
+                            frame,
                             &track,
                             label_x,
                             pill_y + ((pill_h - 12) / 2) as i32,
@@ -1228,7 +1121,7 @@ impl Controller {
                         );
                     } else {
                         crate::animation::notch::draw_text(
-                            &mut frame,
+                            frame,
                             "Now Playing",
                             label_x,
                             pill_y + ((pill_h - 12) / 2) as i32,
@@ -1242,7 +1135,7 @@ impl Controller {
                     let (sc, _) = crate::animation::notch::accent_colors(state);
                     let dot_r = 3u32;
                     crate::animation::notch::draw_disc(
-                        &mut frame,
+                        frame,
                         label_x + 4,
                         pill_y + (pill_h / 2) as i32,
                         dot_r,
@@ -1250,7 +1143,7 @@ impl Controller {
                     );
                     let state_name = format!("{:?}", state);
                     crate::animation::notch::draw_text(
-                        &mut frame,
+                        frame,
                         &state_name,
                         label_x + 12,
                         pill_y + ((pill_h - 12) / 2) as i32,
@@ -1261,7 +1154,7 @@ impl Controller {
                     );
                 } else {
                     crate::animation::notch::draw_text(
-                        &mut frame,
+                        frame,
                         "Termielle",
                         label_x,
                         pill_y + ((pill_h - 12) / 2) as i32,
@@ -1273,7 +1166,7 @@ impl Controller {
                 }
 
                 // Register hit target for clicking the Dynamic Island pill
-                bar_hits.push((
+                hits.push((
                     crate::bar::HIT_BAR_ISLAND_PILL,
                     pill_cx,
                     pill_y,
@@ -1281,18 +1174,18 @@ impl Controller {
                     pill_h,
                 ));
             }
-            self.icon_hits = bar_hits;
+            self.icon_hits = hits;
         } else {
             // Expanded Dynamic Island card dropping organically below the bar!
             // Island content only renders when the center module is listed;
             // the glass card and module hits below stay unconditional.
-            let mut content = self.blank_frame(island_w, exp_h);
-            if show_island {
+            let mut content = self.blank_frame(card.island_w, card.exp_h);
+            if self.bar_module("center", "island") {
                 let sub_blobs = [crate::animation::notch::BlobRect {
                     x: 0,
                     y: 0,
-                    w: island_w,
-                    h: exp_h,
+                    w: card.island_w,
+                    h: card.exp_h,
                     r: 18,
                     attached: true,
                 }];
@@ -1303,8 +1196,8 @@ impl Controller {
                     state,
                     &island_cfg,
                     crate::animation::notch::Presentation::Expanded,
-                    island_w,
-                    exp_h,
+                    card.island_w,
+                    card.exp_h,
                     &sub_blobs,
                     now_ms,
                 );
@@ -1312,12 +1205,12 @@ impl Controller {
 
             // Offset hit targets recorded in sub-frame by (island_x, island_y)
             for hit in &mut self.icon_hits {
-                hit.1 += island_x;
-                hit.2 += island_y;
+                hit.1 += card.island_x;
+                hit.2 += card.island_y;
             }
-            self.icon_hits.extend(bar_hits);
+            self.icon_hits.extend(hits);
 
-            if show_island {
+            if self.bar_module("center", "island") {
                 let age_ms = now_ms.saturating_sub(self.state_since_ms);
                 let (alpha, dx, dy) = Self::content_motion(
                     self.spring.as_ref(),
@@ -1326,18 +1219,15 @@ impl Controller {
                     age_ms,
                 );
                 crate::animation::notch::blend_frame_over(
-                    &mut frame,
+                    frame,
                     &content,
-                    island_x + dx,
-                    island_y + dy,
+                    card.island_x + dx,
+                    card.island_y + dy,
                     alpha,
                 );
             }
         }
-
-        frame
     }
-
     /// Content motion during a morph: a slight opacity dip while the
     /// container is at its fastest (mid-spring) and a small rise into
     /// place when the target is the expanded card. Settled frames get
@@ -4173,68 +4063,6 @@ fn error_code(error: &AnimationError) -> i32 {
         AnimationError::ReadFailed => 1,
         AnimationError::Empty => 2,
         AnimationError::Unsupported => 3,
-    }
-}
-
-#[cfg(test)]
-mod spring_tests {
-    use super::*;
-
-    #[test]
-    fn radius_rides_the_same_spring_to_its_target() {
-        let mut spring = Spring2D::new(140, 36, 18.0, 320, 154, 28.0, spring_params(500, 0.2));
-        for _ in 0..2000 {
-            let (_, settled) = spring.step(1.0 / 120.0);
-            if settled {
-                break;
-            }
-        }
-        assert_eq!(spring.x, 320.0);
-        assert_eq!(spring.y, 154.0);
-        assert_eq!(spring.z, 28.0, "corner radius must settle at its target");
-    }
-
-    #[test]
-    fn progress_advances_monotonically_and_preserves_velocity_on_retarget() {
-        let mut spring = Spring2D::new(140, 36, 18.0, 320, 36, 18.0, spring_params(350, 0.18));
-        let mut last = 0.0;
-        for _ in 0..20 {
-            spring.step(1.0 / 60.0);
-            let p = spring.progress();
-            assert!(p >= last - 1e-6, "progress must not regress");
-            last = p;
-        }
-        assert!(spring.vx != 0.0, "spring must be moving mid-flight");
-
-        // Interrupted morph: the new spring inherits the velocity.
-        let inherited = spring.vx;
-        let mut retargeted = Spring2D::new(
-            spring.x.round() as u32,
-            36,
-            18.0,
-            200,
-            36,
-            18.0,
-            spring_params(350, 0.18),
-        );
-        retargeted.vx = inherited;
-        let dt = 1.0 / 60.0;
-        retargeted.step(dt);
-        let coasted = retargeted.x;
-        let mut from_rest = Spring2D::new(
-            spring.x.round() as u32,
-            36,
-            18.0,
-            200,
-            36,
-            18.0,
-            spring_params(350, 0.18),
-        );
-        from_rest.step(dt);
-        assert!(
-            (coasted - from_rest.x).abs() > 0.01,
-            "inherited velocity must carry the morph forward"
-        );
     }
 }
 

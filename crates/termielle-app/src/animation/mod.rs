@@ -10,6 +10,7 @@ mod gif;
 pub mod notch;
 
 pub use fallback::fallback_frame;
+pub(crate) mod spring;
 pub use gif::{AnimationError, AnimationSource, FrameBuffer, GifAnimation};
 pub use notch::{
     BlobRect, NotchContent, Presentation, blend_frame_over, blit_rounded, blit_scaled,
