@@ -150,6 +150,18 @@ struct BarCard {
     exp_h: u32,
     expanded: bool,
 }
+/// Shared inputs for one expanded-card section paint pass: frame geometry
+/// plus the precomputed clock/accent values, so six section painters do
+/// not each re-query the registry or recompute the pose clock.
+struct CardPaintCtx {
+    width: u32,
+    height: u32,
+    cy: i32,
+    accent: [u8; 4],
+    now: u64,
+    eq_now: u64,
+    pad: i32,
+}
 
 /// Ties the session reducer, the animation pipeline, and one deadline together.
 ///
@@ -1316,15 +1328,41 @@ impl Controller {
         now_ms: u64,
     ) {
         use crate::animation::notch::Presentation;
-        let cy = (height / 2) as i32;
-        let accent = crate::system::accent_color_bgra();
-        let now = now_ms;
-        // A paused equalizer holds its pose instead of performing playback.
-        let eq_now = if self.media_playing() { now } else { 0 };
 
         // Render according to the active iOS/macOS presentation class.
+        // Each arm is a focused painter below; shared setup (glass, frame
+        // size) stays with the callers.
         self.icon_hits.clear();
-
+        if self.paint_alert_banner(frame, island, width, height, now_ms) {
+            return;
+        }
+        match presentation {
+            Presentation::Hidden => {}
+            Presentation::Minimal => {
+                self.paint_minimal_content(frame, island, width, height, now_ms)
+            }
+            Presentation::Compact => {
+                self.paint_compact_content(frame, state, island, width, height, blobs, now_ms);
+            }
+            Presentation::Expanded => {
+                self.paint_expanded_content(frame, state, island, width, height, now_ms);
+            }
+        }
+    }
+    /// Content painter 0: the active notification alert banner. Returns
+    /// true when a banner showed (the caller returns early); the cloned
+    /// alert unties the `alerts` borrow from the paint calls.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_alert_banner(
+        &mut self,
+        frame: &mut FrameBuffer,
+        island: &IslandConfig,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) -> bool {
+        let cy = (height / 2) as i32;
+        let now = now_ms;
         // 0. Active Notification Alert Banner
         if let Some(alert) = self.alerts.front() {
             let pad = 18i32;
@@ -1492,1263 +1530,1306 @@ impl Controller {
                 crate::animation::notch::draw_disc(frame, width as i32 - 20, cy, 5, alert.accent);
             }
 
-            return;
+            return true;
         }
+        false
+    }
 
-        match presentation {
-            Presentation::Hidden => {}
-            Presentation::Minimal => {
-                if self.media_playing() && island.has_widget("music") {
-                    let art_size = (height.saturating_sub(12)).min(22) as i32;
-                    let art_x = (width as i32 / 2) - 22;
-                    if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                        crate::animation::notch::blit_rounded(
-                            frame,
-                            &crate::animation::FrameBuffer {
-                                width: thumb.width,
-                                height: thumb.height,
-                                pixels_pbgra: thumb.pixels_pbgra.clone(),
-                                delay_ms: 0,
-                                loop_index: 0,
-                                scale: 1.0,
-                            },
-                            art_x,
-                            cy - art_size / 2,
-                            art_size as u32,
-                            art_size as u32,
-                            6,
-                        );
-                    } else {
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            art_x + art_size / 2,
-                            cy,
-                            (art_size / 2) as u32,
-                            [accent[0], accent[1], accent[2], 255],
-                        );
-                    }
-                    // Mini equalizer bars
-                    let eq_x = (width as i32 / 2) + 6;
-                    for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                        let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
-                            * std::f32::consts::TAU;
-                        let h = (3.0 + 5.0 * (t + i as f32).sin().abs()).round() as i32;
-                        crate::animation::notch::fill_rect_pub(
-                            frame,
-                            eq_x + i as i32 * 4,
-                            cy + 4 - h,
-                            2,
-                            h as u32,
-                            accent,
-                        );
-                    }
-                    self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
-                } else if island.has_widget("face") {
-                    let face_size = (height.saturating_sub(8)).min(32) as i32;
-                    crate::animation::notch::blit_scaled(
+    /// Content painter: the minimal dot/face presentation.
+    fn paint_minimal_content(
+        &mut self,
+        frame: &mut FrameBuffer,
+        island: &IslandConfig,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) {
+        let cy = (height / 2) as i32;
+        let accent = crate::system::accent_color_bgra();
+        let now = now_ms;
+        // A paused equalizer holds its pose instead of performing playback.
+        let eq_now = if self.media_playing() { now } else { 0 };
+        if self.media_playing() && island.has_widget("music") {
+            let art_size = (height.saturating_sub(12)).min(22) as i32;
+            let art_x = (width as i32 / 2) - 22;
+            if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+                crate::animation::notch::blit_rounded(
+                    frame,
+                    &crate::animation::FrameBuffer {
+                        width: thumb.width,
+                        height: thumb.height,
+                        pixels_pbgra: thumb.pixels_pbgra.clone(),
+                        delay_ms: 0,
+                        loop_index: 0,
+                        scale: 1.0,
+                    },
+                    art_x,
+                    cy - art_size / 2,
+                    art_size as u32,
+                    art_size as u32,
+                    6,
+                );
+            } else {
+                crate::animation::notch::draw_disc(
+                    frame,
+                    art_x + art_size / 2,
+                    cy,
+                    (art_size / 2) as u32,
+                    [accent[0], accent[1], accent[2], 255],
+                );
+            }
+            // Mini equalizer bars
+            let eq_x = (width as i32 / 2) + 6;
+            for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
+                let t =
+                    ((eq_now.saturating_add(phase) % 800) as f32 / 800.0) * std::f32::consts::TAU;
+                let h = (3.0 + 5.0 * (t + i as f32).sin().abs()).round() as i32;
+                crate::animation::notch::fill_rect_pub(
+                    frame,
+                    eq_x + i as i32 * 4,
+                    cy + 4 - h,
+                    2,
+                    h as u32,
+                    accent,
+                );
+            }
+            self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
+        } else if island.has_widget("face") {
+            let face_size = (height.saturating_sub(8)).min(32) as i32;
+            crate::animation::notch::blit_scaled(
+                frame,
+                &self.face_frame,
+                (width as i32 - face_size) / 2,
+                cy - face_size / 2,
+                face_size as u32,
+                face_size as u32,
+            );
+        }
+    }
+
+    /// Content painter: the compact live pill (face, status, media live
+    /// activity, session dots), including the two-blob split layout.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_compact_content(
+        &mut self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        island: &IslandConfig,
+        width: u32,
+        height: u32,
+        blobs: &[crate::animation::notch::BlobRect],
+        now_ms: u64,
+    ) {
+        let cy = (height / 2) as i32;
+        let accent = crate::system::accent_color_bgra();
+        let now = now_ms;
+        // A paused equalizer holds its pose instead of performing playback.
+        let eq_now = if self.media_playing() { now } else { 0 };
+        if blobs.len() > 1 {
+            // The Dynamic Island split: agent content leads in the
+            // primary blob, media lives in the detached blob, and
+            // the liquid bridge between them is drawn by the
+            // material. Clicks on the media blob toggle playback.
+            let (primary, media_blob) = (blobs[0], blobs[1]);
+            if island.has_widget("face") {
+                let face_size = (height.saturating_sub(8)).min(28) as i32;
+                let face_x = primary.x + 12;
+                if state != VisualState::Idle {
+                    let (sc, _) = crate::animation::notch::accent_colors(state);
+                    crate::animation::notch::draw_disc(
                         frame,
-                        &self.face_frame,
-                        (width as i32 - face_size) / 2,
-                        cy - face_size / 2,
-                        face_size as u32,
-                        face_size as u32,
+                        face_x + face_size / 2,
+                        cy,
+                        (face_size / 2 + 2) as u32,
+                        [sc[0], sc[1], sc[2], 50],
                     );
                 }
-            }
-            Presentation::Compact => {
-                if blobs.len() > 1 {
-                    // The Dynamic Island split: agent content leads in the
-                    // primary blob, media lives in the detached blob, and
-                    // the liquid bridge between them is drawn by the
-                    // material. Clicks on the media blob toggle playback.
-                    let (primary, media_blob) = (blobs[0], blobs[1]);
-                    if island.has_widget("face") {
-                        let face_size = (height.saturating_sub(8)).min(28) as i32;
-                        let face_x = primary.x + 12;
-                        if state != VisualState::Idle {
-                            let (sc, _) = crate::animation::notch::accent_colors(state);
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                face_x + face_size / 2,
-                                cy,
-                                (face_size / 2 + 2) as u32,
-                                [sc[0], sc[1], sc[2], 50],
-                            );
-                        }
-                        crate::animation::notch::blit_scaled(
-                            frame,
-                            &self.face_frame,
-                            face_x,
-                            cy - face_size / 2,
-                            face_size as u32,
-                            face_size as u32,
-                        );
-                        if state == VisualState::Working {
-                            // Worker orbit: three dots circle the face while
-                            // tools run.
-                            let (wc, _) = crate::animation::notch::accent_colors(state);
-                            let ocx = face_x + face_size / 2;
-                            for i in 0..3u32 {
-                                let (odx, ody) =
-                                    Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
-                                crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
-                            }
-                        }
-                    }
-                    if state != VisualState::Idle || self.reducer.session_count() > 0 {
-                        let (dot, _) = crate::animation::notch::accent_colors(state);
-                        let count = if island.has_widget("agents") {
-                            self.reducer.session_count().clamp(1, 4)
-                        } else {
-                            1
-                        };
-                        let mut dot_x = primary.x + primary.w as i32 - 16;
-                        for i in 0..count {
-                            let dy = Self::think_bob(state, i, now);
-                            crate::animation::notch::draw_disc(frame, dot_x, cy + dy, 3, dot);
-                            dot_x -= 10;
-                        }
-                    }
-                    // Media blob: album art plus the equalizer bars.
-                    let art_size = (height.saturating_sub(12)).min(22) as i32;
-                    let art_x = media_blob.x + 10;
-                    if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                        crate::animation::notch::blit_rounded(
-                            frame,
-                            &crate::animation::FrameBuffer {
-                                width: thumb.width,
-                                height: thumb.height,
-                                pixels_pbgra: thumb.pixels_pbgra.clone(),
-                                delay_ms: 0,
-                                loop_index: 0,
-                                scale: 1.0,
-                            },
-                            art_x,
-                            cy - art_size / 2,
-                            art_size as u32,
-                            art_size as u32,
-                            6,
-                        );
-                    } else {
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            art_x + art_size / 2,
-                            cy,
-                            (art_size / 2) as u32,
-                            accent,
-                        );
-                    }
-                    let eq_x = art_x + art_size + 6;
-                    for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                        let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
-                            * std::f32::consts::TAU;
-                        let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
-                        crate::animation::notch::fill_rect_pub(
-                            frame,
-                            eq_x + i as i32 * 4,
-                            cy + 4 - h,
-                            2,
-                            h as u32,
-                            accent,
-                        );
-                    }
-                    self.icon_hits.push((
-                        HIT_MEDIA_PLAY_PAUSE,
-                        media_blob.x,
-                        0,
-                        media_blob.w,
-                        height,
-                    ));
-                } else {
-                    // Split Dynamic Island: Leading face, Trailing activity
-                    if island.has_widget("face") {
-                        let face_size = (height.saturating_sub(8)).min(28) as i32;
-                        let face_x = 12;
-                        if state != VisualState::Idle {
-                            let (sc, _) = crate::animation::notch::accent_colors(state);
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                face_x + face_size / 2,
-                                cy,
-                                (face_size / 2 + 2) as u32,
-                                [sc[0], sc[1], sc[2], 50],
-                            );
-                        }
-                        crate::animation::notch::blit_scaled(
-                            frame,
-                            &self.face_frame,
-                            face_x,
-                            cy - face_size / 2,
-                            face_size as u32,
-                            face_size as u32,
-                        );
-                        if state == VisualState::Working {
-                            let (wc, _) = crate::animation::notch::accent_colors(state);
-                            let ocx = face_x + face_size / 2;
-                            for i in 0..3u32 {
-                                let (odx, ody) =
-                                    Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
-                                crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
-                            }
-                        }
-                    }
-
-                    let mut right_cursor = width as i32 - 14;
-
-                    // Media equalizer, with the album art leading it
-                    if self.media_playing() && island.has_widget("music") {
-                        let bx = right_cursor - 14;
-                        let art_size = (height.saturating_sub(12)).min(22) as i32;
-                        let art_x = bx - art_size - 6;
-                        if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref())
-                        {
-                            crate::animation::notch::blit_rounded(
-                                frame,
-                                &crate::animation::FrameBuffer {
-                                    width: thumb.width,
-                                    height: thumb.height,
-                                    pixels_pbgra: thumb.pixels_pbgra.clone(),
-                                    delay_ms: 0,
-                                    loop_index: 0,
-                                    scale: 1.0,
-                                },
-                                art_x,
-                                cy - art_size / 2,
-                                art_size as u32,
-                                art_size as u32,
-                                6,
-                            );
-                        } else {
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                art_x + art_size / 2,
-                                cy,
-                                (art_size / 2) as u32,
-                                [accent[0], accent[1], accent[2], 230],
-                            );
-                        }
-                        let base = cy + 7;
-                        for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
-                            let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
-                                * std::f32::consts::TAU;
-                            let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                bx + i as i32 * 5,
-                                base - h,
-                                3,
-                                h as u32,
-                                accent,
-                            );
-                        }
-                        self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
-                        right_cursor -= 22;
-                    }
-
-                    // Agent status beacon and dots
-                    if state != VisualState::Idle || self.reducer.session_count() > 0 {
-                        let (dot, _) = crate::animation::notch::accent_colors(state);
-                        let count = if island.has_widget("agents") {
-                            self.reducer.session_count().clamp(1, 4)
-                        } else {
-                            1
-                        };
-                        for i in 0..count {
-                            right_cursor -= 10;
-                            let dy = Self::think_bob(state, i, now);
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                right_cursor + 4,
-                                cy + dy,
-                                3,
-                                [dot[0], dot[1], dot[2], dot[3]],
-                            );
-                        }
-                    } else if state == VisualState::Idle && !self.media_playing() {
-                        let text_x = if island.has_widget("face") { 46 } else { 16 };
-                        let text_w = width.saturating_sub((text_x as u32) + 18);
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Termielle",
-                            text_x,
-                            cy - 6,
-                            text_w,
-                            11,
-                            true,
-                            [220, 225, 235, 210],
-                        );
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            width as i32 - 16,
-                            cy,
-                            3,
-                            [accent[0], accent[1], accent[2], 180],
-                        );
+                crate::animation::notch::blit_scaled(
+                    frame,
+                    &self.face_frame,
+                    face_x,
+                    cy - face_size / 2,
+                    face_size as u32,
+                    face_size as u32,
+                );
+                if state == VisualState::Working {
+                    // Worker orbit: three dots circle the face while
+                    // tools run.
+                    let (wc, _) = crate::animation::notch::accent_colors(state);
+                    let ocx = face_x + face_size / 2;
+                    for i in 0..3u32 {
+                        let (odx, ody) = Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
+                        crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
                     }
                 }
             }
-            Presentation::Expanded => {
-                let pad = 18i32;
-
-                if height >= 85 {
-                    // Authentic tall card layout dropping vertically downward
-                    // 1. Top Header Row
-                    if island.has_widget("face") {
-                        let face_size = 22i32;
-                        let fx = pad;
-                        let fy = 14;
-                        let (sc, _) = crate::animation::notch::accent_colors(state);
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            fx + face_size / 2,
-                            fy + face_size / 2,
-                            (face_size / 2 + 2) as u32,
-                            [sc[0], sc[1], sc[2], 65],
-                        );
-                        crate::animation::notch::blit_rounded(
-                            frame,
-                            &self.face_frame,
-                            fx,
-                            fy,
-                            face_size as u32,
-                            face_size as u32,
-                            6,
-                        );
+            if state != VisualState::Idle || self.reducer.session_count() > 0 {
+                let (dot, _) = crate::animation::notch::accent_colors(state);
+                let count = if island.has_widget("agents") {
+                    self.reducer.session_count().clamp(1, 4)
+                } else {
+                    1
+                };
+                let mut dot_x = primary.x + primary.w as i32 - 16;
+                for i in 0..count {
+                    let dy = Self::think_bob(state, i, now);
+                    crate::animation::notch::draw_disc(frame, dot_x, cy + dy, 3, dot);
+                    dot_x -= 10;
+                }
+            }
+            // Media blob: album art plus the equalizer bars.
+            let art_size = (height.saturating_sub(12)).min(22) as i32;
+            let art_x = media_blob.x + 10;
+            if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+                crate::animation::notch::blit_rounded(
+                    frame,
+                    &crate::animation::FrameBuffer {
+                        width: thumb.width,
+                        height: thumb.height,
+                        pixels_pbgra: thumb.pixels_pbgra.clone(),
+                        delay_ms: 0,
+                        loop_index: 0,
+                        scale: 1.0,
+                    },
+                    art_x,
+                    cy - art_size / 2,
+                    art_size as u32,
+                    art_size as u32,
+                    6,
+                );
+            } else {
+                crate::animation::notch::draw_disc(
+                    frame,
+                    art_x + art_size / 2,
+                    cy,
+                    (art_size / 2) as u32,
+                    accent,
+                );
+            }
+            let eq_x = art_x + art_size + 6;
+            for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
+                let t =
+                    ((eq_now.saturating_add(phase) % 800) as f32 / 800.0) * std::f32::consts::TAU;
+                let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
+                crate::animation::notch::fill_rect_pub(
+                    frame,
+                    eq_x + i as i32 * 4,
+                    cy + 4 - h,
+                    2,
+                    h as u32,
+                    accent,
+                );
+            }
+            self.icon_hits
+                .push((HIT_MEDIA_PLAY_PAUSE, media_blob.x, 0, media_blob.w, height));
+        } else {
+            // Split Dynamic Island: Leading face, Trailing activity
+            if island.has_widget("face") {
+                let face_size = (height.saturating_sub(8)).min(28) as i32;
+                let face_x = 12;
+                if state != VisualState::Idle {
+                    let (sc, _) = crate::animation::notch::accent_colors(state);
+                    crate::animation::notch::draw_disc(
+                        frame,
+                        face_x + face_size / 2,
+                        cy,
+                        (face_size / 2 + 2) as u32,
+                        [sc[0], sc[1], sc[2], 50],
+                    );
+                }
+                crate::animation::notch::blit_scaled(
+                    frame,
+                    &self.face_frame,
+                    face_x,
+                    cy - face_size / 2,
+                    face_size as u32,
+                    face_size as u32,
+                );
+                if state == VisualState::Working {
+                    let (wc, _) = crate::animation::notch::accent_colors(state);
+                    let ocx = face_x + face_size / 2;
+                    for i in 0..3u32 {
+                        let (odx, ody) = Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
+                        crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
                     }
+                }
+            }
 
-                    // Hairline glass divider
+            let mut right_cursor = width as i32 - 14;
+
+            // Media equalizer, with the album art leading it
+            if self.media_playing() && island.has_widget("music") {
+                let bx = right_cursor - 14;
+                let art_size = (height.saturating_sub(12)).min(22) as i32;
+                let art_x = bx - art_size - 6;
+                if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+                    crate::animation::notch::blit_rounded(
+                        frame,
+                        &crate::animation::FrameBuffer {
+                            width: thumb.width,
+                            height: thumb.height,
+                            pixels_pbgra: thumb.pixels_pbgra.clone(),
+                            delay_ms: 0,
+                            loop_index: 0,
+                            scale: 1.0,
+                        },
+                        art_x,
+                        cy - art_size / 2,
+                        art_size as u32,
+                        art_size as u32,
+                        6,
+                    );
+                } else {
+                    crate::animation::notch::draw_disc(
+                        frame,
+                        art_x + art_size / 2,
+                        cy,
+                        (art_size / 2) as u32,
+                        [accent[0], accent[1], accent[2], 230],
+                    );
+                }
+                let base = cy + 7;
+                for (i, &phase) in [0u64, 180, 360].iter().enumerate() {
+                    let t = ((eq_now.saturating_add(phase) % 800) as f32 / 800.0)
+                        * std::f32::consts::TAU;
+                    let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
                     crate::animation::notch::fill_rect_pub(
                         frame,
-                        pad,
-                        40,
-                        width.saturating_sub((pad as u32) * 2),
-                        1,
-                        [255, 255, 255, 22],
+                        bx + i as i32 * 5,
+                        base - h,
+                        3,
+                        h as u32,
+                        accent,
                     );
-
-                    if self.media_playing() && island.has_widget("music") {
-                        // Header title & mini equalizer in header row
-                        let tag_x = if island.has_widget("face") {
-                            pad + 30
-                        } else {
-                            pad
-                        };
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Now Playing",
-                            tag_x,
-                            16,
-                            width.saturating_sub((tag_x as u32) + 50),
-                            10,
-                            true,
-                            accent,
-                        );
-
-                        // 4-bar mini equalizer in top right
-                        let eq_x = width as i32 - pad - 20;
-                        for (i, &phase) in [0u64, 180, 360, 540].iter().enumerate() {
-                            let t = ((eq_now.saturating_add(phase) % 700) as f32 / 700.0)
-                                * std::f32::consts::TAU;
-                            let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                eq_x + i as i32 * 5,
-                                26 - h,
-                                3,
-                                h as u32,
-                                accent,
-                            );
-                        }
-
-                        // Prominent Media Body Card:
-                        // High-res 64x64 Album Artwork
-                        let art_size = 64i32;
-                        let art_x = pad;
-                        let art_y = 48i32;
-
-                        if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref())
-                        {
-                            crate::animation::notch::blit_rounded(
-                                frame,
-                                &crate::animation::FrameBuffer {
-                                    width: thumb.width,
-                                    height: thumb.height,
-                                    pixels_pbgra: thumb.pixels_pbgra.clone(),
-                                    delay_ms: 0,
-                                    loop_index: 0,
-                                    scale: 1.0,
-                                },
-                                art_x,
-                                art_y,
-                                art_size as u32,
-                                art_size as u32,
-                                12,
-                            );
-                        } else {
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                art_x + art_size / 2,
-                                art_y + art_size / 2,
-                                (art_size / 2) as u32,
-                                [accent[0], accent[1], accent[2], 220],
-                            );
-                        }
-
-                        // Track title, artist, and app
-                        let text_x = art_x + art_size + 14;
-                        let text_w = width.saturating_sub((text_x as u32) + (pad as u32));
-                        let title = self
-                            .media
-                            .as_ref()
-                            .map(|m| m.title.as_str())
-                            .unwrap_or("Playing");
-                        let artist = self
-                            .media
-                            .as_ref()
-                            .map(|m| m.artist.as_str())
-                            .unwrap_or("Media");
-
-                        crate::animation::notch::draw_text(
-                            frame,
-                            title,
-                            text_x,
-                            50,
-                            text_w,
-                            14,
-                            true,
-                            self.ink(),
-                        );
-                        crate::animation::notch::draw_text(
-                            frame,
-                            artist,
-                            text_x,
-                            74,
-                            text_w,
-                            11,
-                            false,
-                            self.ink_dim(),
-                        );
-
-                        let app_name = self.media.as_ref().map(|m| m.app.as_str()).unwrap_or("");
-                        if !app_name.is_empty() {
-                            crate::animation::notch::draw_text(
-                                frame,
-                                app_name,
-                                text_x,
-                                94,
-                                text_w,
-                                10,
-                                false,
-                                [accent[0], accent[1], accent[2], 210],
-                            );
-                        }
-
-                        // Progress / timeline bar
-                        if height >= 145 {
-                            let track_y = 120i32;
-                            let track_w = width.saturating_sub((pad as u32) * 2);
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                pad,
-                                track_y,
-                                track_w,
-                                3,
-                                [255, 255, 255, 30],
-                            );
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                pad,
-                                track_y,
-                                (track_w as f32 * 0.45) as u32,
-                                3,
-                                accent,
-                            );
-                        }
-
-                        // Dedicated Media Controls Row: Prev (⏮), Play/Pause (⏯), Next (⏭)
-                        if height >= 165 {
-                            let ctrl_y = 148i32;
-                            let center_x = width as i32 / 2;
-
-                            // Previous Track Button
-                            let prev_x = center_x - 56;
-                            let prev_hover = self.hover_point.is_some_and(|(px, py)| {
-                                (px - prev_x).pow(2) + (py - ctrl_y).pow(2) <= 16 * 16
-                            });
-                            let btn_bg = if prev_hover {
-                                [255, 255, 255, 45]
-                            } else {
-                                [255, 255, 255, 25]
-                            };
-                            crate::animation::notch::draw_button_circle(
-                                frame,
-                                prev_x,
-                                ctrl_y,
-                                14,
-                                btn_bg,
-                                [255, 255, 255, 60],
-                            );
-                            crate::animation::notch::draw_glyph_prev(
-                                frame,
-                                prev_x,
-                                ctrl_y,
-                                [255, 255, 255, 240],
-                            );
-                            self.icon_hits
-                                .push((HIT_MEDIA_PREV, prev_x - 16, ctrl_y - 16, 32, 32));
-
-                            // Play / Pause Button
-                            let play_hover = self.hover_point.is_some_and(|(px, py)| {
-                                (px - center_x).pow(2) + (py - ctrl_y).pow(2) <= 19 * 19
-                            });
-                            let play_bg = if play_hover {
-                                [accent[0], accent[1], accent[2], 255]
-                            } else {
-                                [accent[0], accent[1], accent[2], 210]
-                            };
-                            crate::animation::notch::draw_button_circle(
-                                frame,
-                                center_x,
-                                ctrl_y,
-                                17,
-                                play_bg,
-                                [255, 255, 255, 100],
-                            );
-                            if self.media.as_ref().is_some_and(|m| m.playing) {
-                                crate::animation::notch::draw_glyph_pause(
-                                    frame,
-                                    center_x,
-                                    ctrl_y,
-                                    self.ink(),
-                                );
-                            } else {
-                                crate::animation::notch::draw_glyph_play(
-                                    frame,
-                                    center_x,
-                                    ctrl_y,
-                                    self.ink(),
-                                );
-                            }
-                            self.icon_hits.push((
-                                HIT_MEDIA_PLAY_PAUSE,
-                                center_x - 18,
-                                ctrl_y - 18,
-                                36,
-                                36,
-                            ));
-
-                            // Next Track Button
-                            let next_x = center_x + 56;
-                            let next_hover = self.hover_point.is_some_and(|(px, py)| {
-                                (px - next_x).pow(2) + (py - ctrl_y).pow(2) <= 16 * 16
-                            });
-                            let btn_bg = if next_hover {
-                                [255, 255, 255, 45]
-                            } else {
-                                [255, 255, 255, 25]
-                            };
-                            crate::animation::notch::draw_button_circle(
-                                frame,
-                                next_x,
-                                ctrl_y,
-                                14,
-                                btn_bg,
-                                [255, 255, 255, 60],
-                            );
-                            crate::animation::notch::draw_glyph_next(
-                                frame,
-                                next_x,
-                                ctrl_y,
-                                [255, 255, 255, 240],
-                            );
-                            self.icon_hits
-                                .push((HIT_MEDIA_NEXT, next_x - 16, ctrl_y - 16, 32, 32));
-                        }
-                    } else if state != VisualState::Idle {
-                        // Agent Live Activity (e.g. Claude, Codex, Agy, OpenCode is running)
-                        let primary = self.reducer.primary_session();
-                        let agent_source = primary
-                            .as_ref()
-                            .map(|(s, _, _)| s.as_str())
-                            .unwrap_or("agent");
-                        let session_id =
-                            primary.as_ref().map(|(_, id, _)| id.as_str()).unwrap_or("");
-                        let (sc, _) = crate::animation::notch::accent_colors(state);
-
-                        let tag_x = if island.has_widget("face") {
-                            pad + 30
-                        } else {
-                            pad
-                        };
-                        let header_title = format!("Live Activity • {}", agent_source);
-                        crate::animation::notch::draw_text(
-                            frame,
-                            &header_title,
-                            tag_x,
-                            16,
-                            width.saturating_sub((tag_x as u32) + 50),
-                            10,
-                            true,
-                            [sc[0], sc[1], sc[2], 255],
-                        );
-
-                        // Session count dots top right
-                        let sessions = self.reducer.session_count().clamp(1, 4);
-                        for i in 0..sessions {
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                width as i32 - pad - (i as i32 * 10) - 4,
-                                24,
-                                3,
-                                [sc[0], sc[1], sc[2], sc[3]],
-                            );
-                        }
-
-                        // Main status body
-                        let (state_title, state_detail) = match state {
-                            VisualState::Idle => ("Termielle", "Ready for instructions"),
-                            VisualState::Thinking => (
-                                "Reasoning & Planning",
-                                "Analyzing context and constructing plan...",
-                            ),
-                            VisualState::Working => {
-                                ("Executing Actions", "Running autonomous tools and edits...")
-                            }
-                            VisualState::NeedsInput => {
-                                ("Action Required", "Waiting for confirmation or input")
-                            }
-                            VisualState::Ready => ("Turn Complete", "Task finished successfully!"),
-                            VisualState::Failed => ("Turn Failed", "Execution stopped with error"),
-                        };
-
-                        // Glowing state beacon disc
-                        let beacon_x = pad + 16;
-                        let beacon_y = 72;
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            beacon_x,
-                            beacon_y,
-                            14,
-                            [sc[0], sc[1], sc[2], 45],
-                        );
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            beacon_x,
-                            beacon_y,
-                            8,
-                            [sc[0], sc[1], sc[2], 255],
-                        );
-                        // Celebration sparkles after a turn completes; silent
-                        // once the 600 ms flight ends.
-                        if state == VisualState::Ready {
-                            let age = now.saturating_sub(self.state_since_ms);
-                            for i in 0..8u32 {
-                                if let Some((sx, sy, sa)) =
-                                    Self::sparkle_dot(beacon_x, beacon_y, i, age)
-                                {
-                                    if sa > 0 {
-                                        crate::animation::notch::draw_disc(
-                                            frame,
-                                            sx,
-                                            sy,
-                                            1,
-                                            [sc[0], sc[1], sc[2], sa],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        let text_x = beacon_x + 24;
-                        let text_w = width.saturating_sub((text_x as u32) + (pad as u32));
-                        crate::animation::notch::draw_text(
-                            frame,
-                            state_title,
-                            text_x,
-                            52,
-                            text_w,
-                            15,
-                            true,
-                            self.ink(),
-                        );
-                        crate::animation::notch::draw_text(
-                            frame,
-                            state_detail,
-                            text_x,
-                            76,
-                            text_w,
-                            11,
-                            false,
-                            self.ink_dim(),
-                        );
-
-                        // Session ID badge pill
-                        if !session_id.is_empty() && height >= 140 {
-                            let badge_text =
-                                format!("Session: {}", &session_id[..session_id.len().min(26)]);
-                            let bw = (badge_text.len() * 6 + 18) as u32;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                text_x,
-                                98,
-                                bw,
-                                18,
-                                [255, 255, 255, 18],
-                            );
-                            crate::animation::notch::draw_text(
-                                frame,
-                                &badge_text,
-                                text_x + 6,
-                                101,
-                                bw - 10,
-                                10,
-                                false,
-                                self.ink_dim(),
-                            );
-                        }
-
-                        // Bottom accent pill bar
-                        if height >= 145 {
-                            let bar_w = 64u32;
-                            let bar_x = (width as i32 - bar_w as i32) / 2;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                bar_x,
-                                height as i32 - 12,
-                                bar_w,
-                                3,
-                                [sc[0], sc[1], sc[2], 255],
-                            );
-                        }
-                    } else if island.has_widget("tasks")
-                        && island.show_tasks
-                        && !self.tasks.is_empty()
-                    {
-                        // Optional / Opt-in Open Windows Switcher (when tasks widget is explicitly enabled)
-                        let tag_x = if island.has_widget("face") {
-                            pad + 30
-                        } else {
-                            pad
-                        };
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Active Tasks & Windows",
-                            tag_x,
-                            16,
-                            width.saturating_sub((tag_x as u32) + 50),
-                            10,
-                            true,
-                            accent,
-                        );
-
-                        let tile_w = 44i32;
-                        let tile_h = 44i32;
-                        let gap = 12i32;
-                        let count = self.tasks.len().min(5) as i32;
-                        let total_w = count * tile_w + (count - 1) * gap;
-                        let start_x = ((width as i32 - total_w) / 2).max(pad);
-                        let tile_y = 56i32;
-
-                        for (i, task) in self.tasks.iter().take(5).enumerate() {
-                            let tx = start_x + i as i32 * (tile_w + gap);
-                            let is_hover = self.hover_point.is_some_and(|(px, py)| {
-                                px >= tx && px < tx + tile_w && py >= tile_y && py < tile_y + tile_h
-                            });
-                            let tile_bg = if is_hover {
-                                [255, 255, 255, 40]
-                            } else {
-                                [255, 255, 255, 18]
-                            };
-                            let tile_border = if is_hover {
-                                [accent[0], accent[1], accent[2], 220]
-                            } else {
-                                [255, 255, 255, 45]
-                            };
-
-                            // Tile glass background
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                tx,
-                                tile_y,
-                                tile_w as u32,
-                                tile_h as u32,
-                                tile_bg,
-                            );
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                tx,
-                                tile_y,
-                                tile_w as u32,
-                                1,
-                                tile_border,
-                            );
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                tx,
-                                tile_y + tile_h - 1,
-                                tile_w as u32,
-                                1,
-                                tile_border,
-                            );
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                tx,
-                                tile_y,
-                                1,
-                                tile_h as u32,
-                                tile_border,
-                            );
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                tx + tile_w - 1,
-                                tile_y,
-                                1,
-                                tile_h as u32,
-                                tile_border,
-                            );
-
-                            // Blit high-res window app icon inside tile
-                            crate::animation::notch::blit_rounded(
-                                frame,
-                                &crate::animation::FrameBuffer {
-                                    width: task.width,
-                                    height: task.height,
-                                    pixels_pbgra: task.pixels_pbgra.clone(),
-                                    delay_ms: 0,
-                                    loop_index: 0,
-                                    scale: 1.0,
-                                },
-                                tx + 4,
-                                tile_y + 4,
-                                (tile_w - 8) as u32,
-                                (tile_h - 8) as u32,
-                                6,
-                            );
-
-                            // Hit target for window activation
-                            self.icon_hits.push((
-                                task.hwnd,
-                                tx,
-                                tile_y,
-                                tile_w as u32,
-                                tile_h as u32,
-                            ));
-                        }
-
-                        // Window title tooltip / caption below tiles
-                        let hovered_task = self.tasks.iter().take(5).find(|t| {
-                            self.hover_point.is_some_and(|(px, py)| {
-                                self.icon_hits.iter().any(|&(h, hx, hy, hw, hh)| {
-                                    h == t.hwnd
-                                        && px >= hx
-                                        && px < hx + hw as i32
-                                        && py >= hy
-                                        && py < hy + hh as i32
-                                })
-                            })
-                        });
-                        let display_title = hovered_task
-                            .map(|t| t.title.as_str())
-                            .unwrap_or("Click an app to switch to it");
-                        crate::animation::notch::draw_text(
-                            frame,
-                            display_title,
-                            pad,
-                            116,
-                            width.saturating_sub((pad as u32) * 2),
-                            11,
-                            false,
-                            self.ink_dim(),
-                        );
-
-                        // Bottom accent pill bar
-                        if height >= 145 {
-                            let bar_w = 48u32;
-                            let bar_x = (width as i32 - bar_w as i32) / 2;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                bar_x,
-                                height as i32 - 12,
-                                bar_w,
-                                3,
-                                [accent[0], accent[1], accent[2], 200],
-                            );
-                        }
-                    } else {
-                        // Default Clean Standby & Glanceables Dashboard
-                        let tag_x = if island.has_widget("face") {
-                            pad + 30
-                        } else {
-                            pad
-                        };
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Standby • Ready",
-                            tag_x,
-                            16,
-                            width.saturating_sub((tag_x as u32) + 70),
-                            10,
-                            true,
-                            accent,
-                        );
-
-                        let stats = crate::system::collect();
-
-                        // Live time in top-right header
-                        crate::animation::notch::draw_text(
-                            frame,
-                            &stats.time,
-                            width as i32 - pad - 42,
-                            15,
-                            42,
-                            11,
-                            true,
-                            self.ink(),
-                        );
-
-                        // Trailing live beacon with halo next to time
-                        let beacon_x = width as i32 - pad - 52;
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            beacon_x,
-                            22,
-                            5,
-                            [accent[0], accent[1], accent[2], 45],
-                        );
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            beacon_x,
-                            22,
-                            2,
-                            [accent[0], accent[1], accent[2], 255],
-                        );
-
-                        // Headline & Subtitle
-                        let text_w = width.saturating_sub((pad as u32) * 2);
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Termielle is Ready",
-                            pad,
-                            42,
-                            text_w,
-                            13,
-                            true,
-                            self.ink(),
-                        );
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Standing by for agent instructions or media playback",
-                            pad,
-                            60,
-                            text_w,
-                            10,
-                            false,
-                            self.ink_dim(),
-                        );
-
-                        // System Telemetry Cards (CPU, RAM, Power/System)
-                        if height >= 125 {
-                            // 3 rich telemetry modules
-                            struct CardInfo {
-                                label: &'static str,
-                                dot_color: [u8; 4],
-                                value: String,
-                                pct: u8,
-                                fill_color: [u8; 4],
-                                caption: String,
-                            }
-
-                            // CPU card setup
-                            let cpu_heavy = stats.cpu_percent >= 75;
-                            let (cpu_dot, cpu_fill) = if cpu_heavy {
-                                ([30, 90, 245, 255], [30, 90, 245, 255])
-                            } else {
-                                (
-                                    [accent[0], accent[1], accent[2], 255],
-                                    [accent[0], accent[1], accent[2], 255],
-                                )
-                            };
-                            let cpu_caption = if stats.cpu_percent < 25 {
-                                "Calm".to_string()
-                            } else if stats.cpu_percent < 65 {
-                                "Active".to_string()
-                            } else {
-                                "High Load".to_string()
-                            };
-
-                            // RAM card setup
-                            let ram_dot = [225, 175, 20, 255]; // cyan/teal
-                            let ram_fill = [225, 175, 20, 255];
-                            let ram_caption = if stats.mem_total_gb > 0.0 {
-                                format!("{:.0}/{:.0} GB", stats.mem_used_gb, stats.mem_total_gb)
-                            } else {
-                                "System RAM".to_string()
-                            };
-
-                            // Power/Battery card setup
-                            let (bat_dot, bat_val, bat_fill, bat_pct, bat_caption) =
-                                if let Some(bat) = stats.battery {
-                                    let charging = stats.battery_charging;
-                                    let dot = if charging {
-                                        [60, 205, 80, 255]
-                                    } else if bat < 20 {
-                                        [20, 160, 245, 255]
-                                    } else {
-                                        [60, 205, 80, 255]
-                                    };
-                                    let val = if charging {
-                                        format!("{}% +", bat)
-                                    } else {
-                                        format!("{}%", bat)
-                                    };
-                                    let cap = if charging {
-                                        "Charging".to_string()
-                                    } else {
-                                        "On Battery".to_string()
-                                    };
-                                    (dot, val, dot, bat, cap)
-                                } else {
-                                    (
-                                        [60, 205, 80, 255],
-                                        "Online".to_string(),
-                                        [60, 205, 80, 255],
-                                        100,
-                                        "Desktop".to_string(),
-                                    )
-                                };
-
-                            let cards = [
-                                CardInfo {
-                                    label: "CPU",
-                                    dot_color: cpu_dot,
-                                    value: format!("{}%", stats.cpu_percent),
-                                    pct: stats.cpu_percent,
-                                    fill_color: cpu_fill,
-                                    caption: cpu_caption,
-                                },
-                                CardInfo {
-                                    label: "RAM",
-                                    dot_color: ram_dot,
-                                    value: format!("{}%", stats.mem_percent),
-                                    pct: stats.mem_percent,
-                                    fill_color: ram_fill,
-                                    caption: ram_caption,
-                                },
-                                CardInfo {
-                                    label: if stats.battery.is_some() {
-                                        "BATTERY"
-                                    } else {
-                                        "SYSTEM"
-                                    },
-                                    dot_color: bat_dot,
-                                    value: bat_val,
-                                    pct: bat_pct,
-                                    fill_color: bat_fill,
-                                    caption: bat_caption,
-                                },
-                            ];
-
-                            let card_count = cards.len() as i32;
-                            let gap = 8i32;
-                            let total_gap = (card_count - 1) * gap;
-                            let card_w = ((text_w as i32 - total_gap) / card_count).max(60);
-                            let card_y = 80i32;
-                            let card_h = 50u32;
-
-                            let card_bg = [
-                                (accent[0] as u32 * 20 / 255) as u8,
-                                (accent[1] as u32 * 20 / 255) as u8,
-                                (accent[2] as u32 * 20 / 255) as u8,
-                                26,
-                            ];
-                            let card_border = [255, 255, 255, 34];
-                            let track_color = [255, 255, 255, 20];
-
-                            for (i, card) in cards.iter().enumerate() {
-                                let cx = pad + i as i32 * (card_w + gap);
-
-                                // Smooth rounded frosted card
-                                crate::animation::notch::draw_rounded_rect(
-                                    frame,
-                                    cx,
-                                    card_y,
-                                    card_w as u32,
-                                    card_h,
-                                    7,
-                                    card_bg,
-                                    card_border,
-                                );
-
-                                // Top row: indicator dot + label + value
-                                crate::animation::notch::draw_disc(
-                                    frame,
-                                    cx + 9,
-                                    card_y + 11,
-                                    3,
-                                    card.dot_color,
-                                );
-                                crate::animation::notch::draw_text(
-                                    frame,
-                                    card.label,
-                                    cx + 16,
-                                    card_y + 6,
-                                    (card_w - 48).max(20) as u32,
-                                    9,
-                                    true,
-                                    self.ink_dim(),
-                                );
-                                crate::animation::notch::draw_text(
-                                    frame,
-                                    &card.value,
-                                    cx + card_w - 38,
-                                    card_y + 6,
-                                    34,
-                                    9,
-                                    true,
-                                    self.ink(),
-                                );
-
-                                // Mini progress bar
-                                let bar_w = (card_w - 18).max(10) as u32;
-                                crate::animation::notch::draw_progress_bar(
-                                    frame,
-                                    cx + 9,
-                                    card_y + 23,
-                                    bar_w,
-                                    4,
-                                    card.pct,
-                                    track_color,
-                                    card.fill_color,
-                                );
-
-                                // Detail caption under progress bar
-                                crate::animation::notch::draw_text(
-                                    frame,
-                                    &card.caption,
-                                    cx + 9,
-                                    card_y + 32,
-                                    bar_w,
-                                    9,
-                                    false,
-                                    self.ink_dim(),
-                                );
-                            }
-                        }
-
-                        // Bottom accent pill bar
-                        if height >= 145 {
-                            let bar_w = 48u32;
-                            let bar_x = (width as i32 - bar_w as i32) / 2;
-                            crate::animation::notch::fill_rect_pub(
-                                frame,
-                                bar_x,
-                                height as i32 - 10,
-                                bar_w,
-                                3,
-                                [accent[0], accent[1], accent[2], 200],
-                            );
-                        }
-                    }
-                } else {
-                    // Compact / transitioning view
-                    let face_size = (height.saturating_sub(20)).min(36) as i32;
-                    if island.has_widget("face") {
-                        let fx = pad;
-                        let fy = cy - face_size / 2;
-                        let (sc, _) = crate::animation::notch::accent_colors(state);
-                        crate::animation::notch::draw_disc(
-                            frame,
-                            fx + face_size / 2,
-                            cy,
-                            (face_size / 2 + 3) as u32,
-                            [sc[0], sc[1], sc[2], 55],
-                        );
-                        crate::animation::notch::blit_rounded(
-                            frame,
-                            &self.face_frame,
-                            fx,
-                            fy,
-                            face_size as u32,
-                            face_size as u32,
-                            8,
-                        );
-                    }
-
-                    if self.media_playing() && island.has_widget("music") {
-                        let art_size = 28i32;
-                        let media_start_x = pad + face_size + 14;
-                        let art_y = cy - art_size / 2;
-                        if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref())
-                        {
-                            crate::animation::notch::blit_rounded(
-                                frame,
-                                &crate::animation::FrameBuffer {
-                                    width: thumb.width,
-                                    height: thumb.height,
-                                    pixels_pbgra: thumb.pixels_pbgra.clone(),
-                                    delay_ms: 0,
-                                    loop_index: 0,
-                                    scale: 1.0,
-                                },
-                                media_start_x,
-                                art_y,
-                                art_size as u32,
-                                art_size as u32,
-                                6,
-                            );
-                        } else {
-                            crate::animation::notch::draw_disc(
-                                frame,
-                                media_start_x + art_size / 2,
-                                cy,
-                                (art_size / 2) as u32,
-                                [accent[0], accent[1], accent[2], 230],
-                            );
-                        }
-                        let text_x = media_start_x + art_size + 10;
-                        let text_w = (width as i32 - pad - text_x).max(40) as u32;
-                        let title = self
-                            .media
-                            .as_ref()
-                            .map(|m| m.title.as_str())
-                            .unwrap_or("Playing");
-                        crate::animation::notch::draw_text(
-                            frame,
-                            title,
-                            text_x,
-                            cy - 7,
-                            text_w,
-                            11,
-                            true,
-                            [255, 255, 255, 245],
-                        );
-                    } else {
-                        let left_edge = pad + face_size + 14;
-                        let text_w = (width as i32 - pad - left_edge).max(40) as u32;
-                        let title = match state {
-                            VisualState::Idle => "Termielle",
-                            VisualState::Thinking => "Reasoning",
-                            VisualState::Working => "Working",
-                            VisualState::NeedsInput => "Needs Input",
-                            VisualState::Ready => "Turn Complete",
-                            VisualState::Failed => "Turn Failed",
-                        };
-                        crate::animation::notch::draw_text(
-                            frame,
-                            title,
-                            left_edge,
-                            cy - 7,
-                            text_w,
-                            12,
-                            true,
-                            [255, 255, 255, 240],
-                        );
-                    }
                 }
+                self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
+                right_cursor -= 22;
+            }
+
+            // Agent status beacon and dots
+            if state != VisualState::Idle || self.reducer.session_count() > 0 {
+                let (dot, _) = crate::animation::notch::accent_colors(state);
+                let count = if island.has_widget("agents") {
+                    self.reducer.session_count().clamp(1, 4)
+                } else {
+                    1
+                };
+                for i in 0..count {
+                    right_cursor -= 10;
+                    let dy = Self::think_bob(state, i, now);
+                    crate::animation::notch::draw_disc(
+                        frame,
+                        right_cursor + 4,
+                        cy + dy,
+                        3,
+                        [dot[0], dot[1], dot[2], dot[3]],
+                    );
+                }
+            } else if state == VisualState::Idle && !self.media_playing() {
+                let text_x = if island.has_widget("face") { 46 } else { 16 };
+                let text_w = width.saturating_sub((text_x as u32) + 18);
+                crate::animation::notch::draw_text(
+                    frame,
+                    "Termielle",
+                    text_x,
+                    cy - 6,
+                    text_w,
+                    11,
+                    true,
+                    [220, 225, 235, 210],
+                );
+                crate::animation::notch::draw_disc(
+                    frame,
+                    width as i32 - 16,
+                    cy,
+                    3,
+                    [accent[0], accent[1], accent[2], 180],
+                );
             }
         }
     }
-    /// Cached frosted-glass layer, keyed by geometry and blob layout.
+    /// Content painter: the expanded dashboard card (media body, agent
+    /// live activity, task switcher, standby telemetry).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_expanded_content(
+        &mut self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        island: &IslandConfig,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) {
+        let cy = (height / 2) as i32;
+        let accent = crate::system::accent_color_bgra();
+        let now = now_ms;
+        // A paused equalizer holds its pose instead of performing playback.
+        let eq_now = if self.media_playing() { now } else { 0 };
+        let pad = 18i32;
+
+        let ctx = CardPaintCtx {
+            width,
+            height,
+            cy,
+            accent,
+            now,
+            eq_now,
+            pad,
+        };
+
+        if height >= 85 {
+            // Authentic tall card layout dropping vertically downward.
+            self.paint_card_header(frame, state, island, &ctx);
+            if self.media_playing() && island.has_widget("music") {
+                self.paint_media_card(frame, island, &ctx);
+            } else if state != VisualState::Idle {
+                self.paint_agent_activity(frame, state, island, &ctx);
+            } else if island.has_widget("tasks") && island.show_tasks && !self.tasks.is_empty() {
+                self.paint_task_switcher(frame, island, &ctx);
+            } else {
+                self.paint_standby_dashboard(frame, island, &ctx);
+            }
+        } else {
+            // Compact / transitioning view.
+            self.paint_short_card(frame, state, island, &ctx);
+        }
+    }
+    /// Expanded card header row: face glyph plus the hairline divider.
+    fn paint_card_header(
+        &self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Authentic tall card layout dropping vertically downward
+        // 1. Top Header Row
+        if island.has_widget("face") {
+            let face_size = 22i32;
+            let fx = ctx.pad;
+            let fy = 14;
+            let (sc, _) = crate::animation::notch::accent_colors(state);
+            crate::animation::notch::draw_disc(
+                frame,
+                fx + face_size / 2,
+                fy + face_size / 2,
+                (face_size / 2 + 2) as u32,
+                [sc[0], sc[1], sc[2], 65],
+            );
+            crate::animation::notch::blit_rounded(
+                frame,
+                &self.face_frame,
+                fx,
+                fy,
+                face_size as u32,
+                face_size as u32,
+                6,
+            );
+        }
+
+        // Hairline glass divider
+        crate::animation::notch::fill_rect_pub(
+            frame,
+            ctx.pad,
+            40,
+            ctx.width.saturating_sub((ctx.pad as u32) * 2),
+            1,
+            [255, 255, 255, 22],
+        );
+    }
+
+    /// Expanded card section: prominent media body (artwork, track,
+    /// progress, transport controls).
+    fn paint_media_card(
+        &mut self,
+        frame: &mut FrameBuffer,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Header title & mini equalizer in header row
+        let tag_x = if island.has_widget("face") {
+            ctx.pad + 30
+        } else {
+            ctx.pad
+        };
+        crate::animation::notch::draw_text(
+            frame,
+            "Now Playing",
+            tag_x,
+            16,
+            ctx.width.saturating_sub((tag_x as u32) + 50),
+            10,
+            true,
+            ctx.accent,
+        );
+
+        // 4-bar mini equalizer in top right
+        let eq_x = ctx.width as i32 - ctx.pad - 20;
+        for (i, &phase) in [0u64, 180, 360, 540].iter().enumerate() {
+            let t =
+                ((ctx.eq_now.saturating_add(phase) % 700) as f32 / 700.0) * std::f32::consts::TAU;
+            let h = (3.0 + 8.0 * (t + i as f32).sin().abs()).round() as i32;
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                eq_x + i as i32 * 5,
+                26 - h,
+                3,
+                h as u32,
+                ctx.accent,
+            );
+        }
+
+        // Prominent Media Body Card:
+        // High-res 64x64 Album Artwork
+        let art_size = 64i32;
+        let art_x = ctx.pad;
+        let art_y = 48i32;
+
+        if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+            crate::animation::notch::blit_rounded(
+                frame,
+                &crate::animation::FrameBuffer {
+                    width: thumb.width,
+                    height: thumb.height,
+                    pixels_pbgra: thumb.pixels_pbgra.clone(),
+                    delay_ms: 0,
+                    loop_index: 0,
+                    scale: 1.0,
+                },
+                art_x,
+                art_y,
+                art_size as u32,
+                art_size as u32,
+                12,
+            );
+        } else {
+            crate::animation::notch::draw_disc(
+                frame,
+                art_x + art_size / 2,
+                art_y + art_size / 2,
+                (art_size / 2) as u32,
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 220],
+            );
+        }
+
+        // Track title, artist, and app
+        let text_x = art_x + art_size + 14;
+        let text_w = ctx.width.saturating_sub((text_x as u32) + (ctx.pad as u32));
+        let title = self
+            .media
+            .as_ref()
+            .map(|m| m.title.as_str())
+            .unwrap_or("Playing");
+        let artist = self
+            .media
+            .as_ref()
+            .map(|m| m.artist.as_str())
+            .unwrap_or("Media");
+
+        crate::animation::notch::draw_text(frame, title, text_x, 50, text_w, 14, true, self.ink());
+        crate::animation::notch::draw_text(
+            frame,
+            artist,
+            text_x,
+            74,
+            text_w,
+            11,
+            false,
+            self.ink_dim(),
+        );
+
+        let app_name = self.media.as_ref().map(|m| m.app.as_str()).unwrap_or("");
+        if !app_name.is_empty() {
+            crate::animation::notch::draw_text(
+                frame,
+                app_name,
+                text_x,
+                94,
+                text_w,
+                10,
+                false,
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 210],
+            );
+        }
+
+        // Progress / timeline bar
+        if ctx.height >= 145 {
+            let track_y = 120i32;
+            let track_w = ctx.width.saturating_sub((ctx.pad as u32) * 2);
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                ctx.pad,
+                track_y,
+                track_w,
+                3,
+                [255, 255, 255, 30],
+            );
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                ctx.pad,
+                track_y,
+                (track_w as f32 * 0.45) as u32,
+                3,
+                ctx.accent,
+            );
+        }
+
+        // Dedicated Media Controls Row: Prev (⏮), Play/Pause (⏯), Next (⏭)
+        if ctx.height >= 165 {
+            let ctrl_y = 148i32;
+            let center_x = ctx.width as i32 / 2;
+
+            // Previous Track Button
+            let prev_x = center_x - 56;
+            let prev_hover = self
+                .hover_point
+                .is_some_and(|(px, py)| (px - prev_x).pow(2) + (py - ctrl_y).pow(2) <= 16 * 16);
+            let btn_bg = if prev_hover {
+                [255, 255, 255, 45]
+            } else {
+                [255, 255, 255, 25]
+            };
+            crate::animation::notch::draw_button_circle(
+                frame,
+                prev_x,
+                ctrl_y,
+                14,
+                btn_bg,
+                [255, 255, 255, 60],
+            );
+            crate::animation::notch::draw_glyph_prev(frame, prev_x, ctrl_y, [255, 255, 255, 240]);
+            self.icon_hits
+                .push((HIT_MEDIA_PREV, prev_x - 16, ctrl_y - 16, 32, 32));
+
+            // Play / Pause Button
+            let play_hover = self
+                .hover_point
+                .is_some_and(|(px, py)| (px - center_x).pow(2) + (py - ctrl_y).pow(2) <= 19 * 19);
+            let play_bg = if play_hover {
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 255]
+            } else {
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 210]
+            };
+            crate::animation::notch::draw_button_circle(
+                frame,
+                center_x,
+                ctrl_y,
+                17,
+                play_bg,
+                [255, 255, 255, 100],
+            );
+            if self.media.as_ref().is_some_and(|m| m.playing) {
+                crate::animation::notch::draw_glyph_pause(frame, center_x, ctrl_y, self.ink());
+            } else {
+                crate::animation::notch::draw_glyph_play(frame, center_x, ctrl_y, self.ink());
+            }
+            self.icon_hits
+                .push((HIT_MEDIA_PLAY_PAUSE, center_x - 18, ctrl_y - 18, 36, 36));
+
+            // Next Track Button
+            let next_x = center_x + 56;
+            let next_hover = self
+                .hover_point
+                .is_some_and(|(px, py)| (px - next_x).pow(2) + (py - ctrl_y).pow(2) <= 16 * 16);
+            let btn_bg = if next_hover {
+                [255, 255, 255, 45]
+            } else {
+                [255, 255, 255, 25]
+            };
+            crate::animation::notch::draw_button_circle(
+                frame,
+                next_x,
+                ctrl_y,
+                14,
+                btn_bg,
+                [255, 255, 255, 60],
+            );
+            crate::animation::notch::draw_glyph_next(frame, next_x, ctrl_y, [255, 255, 255, 240]);
+            self.icon_hits
+                .push((HIT_MEDIA_NEXT, next_x - 16, ctrl_y - 16, 32, 32));
+        }
+    }
+    /// Expanded card section: agent live activity (sessions, status,
+    /// beacon, sparkles, session badge).
+    fn paint_agent_activity(
+        &mut self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Agent Live Activity (e.g. Claude, Codex, Agy, OpenCode is running)
+        let primary = self.reducer.primary_session();
+        let agent_source = primary
+            .as_ref()
+            .map(|(s, _, _)| s.as_str())
+            .unwrap_or("agent");
+        let session_id = primary.as_ref().map(|(_, id, _)| id.as_str()).unwrap_or("");
+        let (sc, _) = crate::animation::notch::accent_colors(state);
+
+        let tag_x = if island.has_widget("face") {
+            ctx.pad + 30
+        } else {
+            ctx.pad
+        };
+        let header_title = format!("Live Activity • {}", agent_source);
+        crate::animation::notch::draw_text(
+            frame,
+            &header_title,
+            tag_x,
+            16,
+            ctx.width.saturating_sub((tag_x as u32) + 50),
+            10,
+            true,
+            [sc[0], sc[1], sc[2], 255],
+        );
+
+        // Session count dots top right
+        let sessions = self.reducer.session_count().clamp(1, 4);
+        for i in 0..sessions {
+            crate::animation::notch::draw_disc(
+                frame,
+                ctx.width as i32 - ctx.pad - (i as i32 * 10) - 4,
+                24,
+                3,
+                [sc[0], sc[1], sc[2], sc[3]],
+            );
+        }
+
+        // Main status body
+        let (state_title, state_detail) = match state {
+            VisualState::Idle => ("Termielle", "Ready for instructions"),
+            VisualState::Thinking => (
+                "Reasoning & Planning",
+                "Analyzing context and constructing plan...",
+            ),
+            VisualState::Working => ("Executing Actions", "Running autonomous tools and edits..."),
+            VisualState::NeedsInput => ("Action Required", "Waiting for confirmation or input"),
+            VisualState::Ready => ("Turn Complete", "Task finished successfully!"),
+            VisualState::Failed => ("Turn Failed", "Execution stopped with error"),
+        };
+
+        // Glowing state beacon disc
+        let beacon_x = ctx.pad + 16;
+        let beacon_y = 72;
+        crate::animation::notch::draw_disc(
+            frame,
+            beacon_x,
+            beacon_y,
+            14,
+            [sc[0], sc[1], sc[2], 45],
+        );
+        crate::animation::notch::draw_disc(
+            frame,
+            beacon_x,
+            beacon_y,
+            8,
+            [sc[0], sc[1], sc[2], 255],
+        );
+        // Celebration sparkles after a turn completes; silent
+        // once the 600 ms flight ends.
+        if state == VisualState::Ready {
+            let age = ctx.now.saturating_sub(self.state_since_ms);
+            for i in 0..8u32 {
+                if let Some((sx, sy, sa)) = Self::sparkle_dot(beacon_x, beacon_y, i, age) {
+                    if sa > 0 {
+                        crate::animation::notch::draw_disc(
+                            frame,
+                            sx,
+                            sy,
+                            1,
+                            [sc[0], sc[1], sc[2], sa],
+                        );
+                    }
+                }
+            }
+        }
+
+        let text_x = beacon_x + 24;
+        let text_w = ctx.width.saturating_sub((text_x as u32) + (ctx.pad as u32));
+        crate::animation::notch::draw_text(
+            frame,
+            state_title,
+            text_x,
+            52,
+            text_w,
+            15,
+            true,
+            self.ink(),
+        );
+        crate::animation::notch::draw_text(
+            frame,
+            state_detail,
+            text_x,
+            76,
+            text_w,
+            11,
+            false,
+            self.ink_dim(),
+        );
+
+        // Session ID badge pill
+        if !session_id.is_empty() && ctx.height >= 140 {
+            let badge_text = format!("Session: {}", &session_id[..session_id.len().min(26)]);
+            let bw = (badge_text.len() * 6 + 18) as u32;
+            crate::animation::notch::fill_rect_pub(frame, text_x, 98, bw, 18, [255, 255, 255, 18]);
+            crate::animation::notch::draw_text(
+                frame,
+                &badge_text,
+                text_x + 6,
+                101,
+                bw - 10,
+                10,
+                false,
+                self.ink_dim(),
+            );
+        }
+
+        // Bottom ctx.accent pill bar
+        if ctx.height >= 145 {
+            let bar_w = 64u32;
+            let bar_x = (ctx.width as i32 - bar_w as i32) / 2;
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                bar_x,
+                ctx.height as i32 - 12,
+                bar_w,
+                3,
+                [sc[0], sc[1], sc[2], 255],
+            );
+        }
+    }
+    /// Expanded card section: opt-in open-windows switcher tiles.
+    fn paint_task_switcher(
+        &mut self,
+        frame: &mut FrameBuffer,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Optional / Opt-in Open Windows Switcher (when tasks widget is explicitly enabled)
+        let tag_x = if island.has_widget("face") {
+            ctx.pad + 30
+        } else {
+            ctx.pad
+        };
+        crate::animation::notch::draw_text(
+            frame,
+            "Active Tasks & Windows",
+            tag_x,
+            16,
+            ctx.width.saturating_sub((tag_x as u32) + 50),
+            10,
+            true,
+            ctx.accent,
+        );
+
+        let tile_w = 44i32;
+        let tile_h = 44i32;
+        let gap = 12i32;
+        let count = self.tasks.len().min(5) as i32;
+        let total_w = count * tile_w + (count - 1) * gap;
+        let start_x = ((ctx.width as i32 - total_w) / 2).max(ctx.pad);
+        let tile_y = 56i32;
+
+        for (i, task) in self.tasks.iter().take(5).enumerate() {
+            let tx = start_x + i as i32 * (tile_w + gap);
+            let is_hover = self.hover_point.is_some_and(|(px, py)| {
+                px >= tx && px < tx + tile_w && py >= tile_y && py < tile_y + tile_h
+            });
+            let tile_bg = if is_hover {
+                [255, 255, 255, 40]
+            } else {
+                [255, 255, 255, 18]
+            };
+            let tile_border = if is_hover {
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 220]
+            } else {
+                [255, 255, 255, 45]
+            };
+
+            // Tile glass background
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                tx,
+                tile_y,
+                tile_w as u32,
+                tile_h as u32,
+                tile_bg,
+            );
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                tx,
+                tile_y,
+                tile_w as u32,
+                1,
+                tile_border,
+            );
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                tx,
+                tile_y + tile_h - 1,
+                tile_w as u32,
+                1,
+                tile_border,
+            );
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                tx,
+                tile_y,
+                1,
+                tile_h as u32,
+                tile_border,
+            );
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                tx + tile_w - 1,
+                tile_y,
+                1,
+                tile_h as u32,
+                tile_border,
+            );
+
+            // Blit high-res window app icon inside tile
+            crate::animation::notch::blit_rounded(
+                frame,
+                &crate::animation::FrameBuffer {
+                    width: task.width,
+                    height: task.height,
+                    pixels_pbgra: task.pixels_pbgra.clone(),
+                    delay_ms: 0,
+                    loop_index: 0,
+                    scale: 1.0,
+                },
+                tx + 4,
+                tile_y + 4,
+                (tile_w - 8) as u32,
+                (tile_h - 8) as u32,
+                6,
+            );
+
+            // Hit target for window activation
+            self.icon_hits
+                .push((task.hwnd, tx, tile_y, tile_w as u32, tile_h as u32));
+        }
+
+        // Window title tooltip / caption below tiles
+        let hovered_task = self.tasks.iter().take(5).find(|t| {
+            self.hover_point.is_some_and(|(px, py)| {
+                self.icon_hits.iter().any(|&(h, hx, hy, hw, hh)| {
+                    h == t.hwnd
+                        && px >= hx
+                        && px < hx + hw as i32
+                        && py >= hy
+                        && py < hy + hh as i32
+                })
+            })
+        });
+        let display_title = hovered_task
+            .map(|t| t.title.as_str())
+            .unwrap_or("Click an app to switch to it");
+        crate::animation::notch::draw_text(
+            frame,
+            display_title,
+            ctx.pad,
+            116,
+            ctx.width.saturating_sub((ctx.pad as u32) * 2),
+            11,
+            false,
+            self.ink_dim(),
+        );
+
+        // Bottom ctx.accent pill bar
+        if ctx.height >= 145 {
+            let bar_w = 48u32;
+            let bar_x = (ctx.width as i32 - bar_w as i32) / 2;
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                bar_x,
+                ctx.height as i32 - 12,
+                bar_w,
+                3,
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 200],
+            );
+        }
+    }
+    /// Expanded card section: default standby and glanceables dashboard
+    /// (time, headline, telemetry cards).
+    fn paint_standby_dashboard(
+        &mut self,
+        frame: &mut FrameBuffer,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Default Clean Standby & Glanceables Dashboard
+        let tag_x = if island.has_widget("face") {
+            ctx.pad + 30
+        } else {
+            ctx.pad
+        };
+        crate::animation::notch::draw_text(
+            frame,
+            "Standby • Ready",
+            tag_x,
+            16,
+            ctx.width.saturating_sub((tag_x as u32) + 70),
+            10,
+            true,
+            ctx.accent,
+        );
+
+        let stats = crate::system::collect();
+
+        // Live time in top-right header
+        crate::animation::notch::draw_text(
+            frame,
+            &stats.time,
+            ctx.width as i32 - ctx.pad - 42,
+            15,
+            42,
+            11,
+            true,
+            self.ink(),
+        );
+
+        // Trailing live beacon with halo next to time
+        let beacon_x = ctx.width as i32 - ctx.pad - 52;
+        crate::animation::notch::draw_disc(
+            frame,
+            beacon_x,
+            22,
+            5,
+            [ctx.accent[0], ctx.accent[1], ctx.accent[2], 45],
+        );
+        crate::animation::notch::draw_disc(
+            frame,
+            beacon_x,
+            22,
+            2,
+            [ctx.accent[0], ctx.accent[1], ctx.accent[2], 255],
+        );
+
+        // Headline & Subtitle
+        let text_w = ctx.width.saturating_sub((ctx.pad as u32) * 2);
+        crate::animation::notch::draw_text(
+            frame,
+            "Termielle is Ready",
+            ctx.pad,
+            42,
+            text_w,
+            13,
+            true,
+            self.ink(),
+        );
+        crate::animation::notch::draw_text(
+            frame,
+            "Standing by for agent instructions or media playback",
+            ctx.pad,
+            60,
+            text_w,
+            10,
+            false,
+            self.ink_dim(),
+        );
+
+        // System Telemetry Cards (CPU, RAM, Power/System)
+        if ctx.height >= 125 {
+            // 3 rich telemetry modules
+            struct CardInfo {
+                label: &'static str,
+                dot_color: [u8; 4],
+                value: String,
+                pct: u8,
+                fill_color: [u8; 4],
+                caption: String,
+            }
+
+            // CPU card setup
+            let cpu_heavy = stats.cpu_percent >= 75;
+            let (cpu_dot, cpu_fill) = if cpu_heavy {
+                ([30, 90, 245, 255], [30, 90, 245, 255])
+            } else {
+                (
+                    [ctx.accent[0], ctx.accent[1], ctx.accent[2], 255],
+                    [ctx.accent[0], ctx.accent[1], ctx.accent[2], 255],
+                )
+            };
+            let cpu_caption = if stats.cpu_percent < 25 {
+                "Calm".to_string()
+            } else if stats.cpu_percent < 65 {
+                "Active".to_string()
+            } else {
+                "High Load".to_string()
+            };
+
+            // RAM card setup
+            let ram_dot = [225, 175, 20, 255]; // cyan/teal
+            let ram_fill = [225, 175, 20, 255];
+            let ram_caption = if stats.mem_total_gb > 0.0 {
+                format!("{:.0}/{:.0} GB", stats.mem_used_gb, stats.mem_total_gb)
+            } else {
+                "System RAM".to_string()
+            };
+
+            // Power/Battery card setup
+            let (bat_dot, bat_val, bat_fill, bat_pct, bat_caption) =
+                if let Some(bat) = stats.battery {
+                    let charging = stats.battery_charging;
+                    let dot = if charging {
+                        [60, 205, 80, 255]
+                    } else if bat < 20 {
+                        [20, 160, 245, 255]
+                    } else {
+                        [60, 205, 80, 255]
+                    };
+                    let val = if charging {
+                        format!("{}% +", bat)
+                    } else {
+                        format!("{}%", bat)
+                    };
+                    let cap = if charging {
+                        "Charging".to_string()
+                    } else {
+                        "On Battery".to_string()
+                    };
+                    (dot, val, dot, bat, cap)
+                } else {
+                    (
+                        [60, 205, 80, 255],
+                        "Online".to_string(),
+                        [60, 205, 80, 255],
+                        100,
+                        "Desktop".to_string(),
+                    )
+                };
+
+            let cards = [
+                CardInfo {
+                    label: "CPU",
+                    dot_color: cpu_dot,
+                    value: format!("{}%", stats.cpu_percent),
+                    pct: stats.cpu_percent,
+                    fill_color: cpu_fill,
+                    caption: cpu_caption,
+                },
+                CardInfo {
+                    label: "RAM",
+                    dot_color: ram_dot,
+                    value: format!("{}%", stats.mem_percent),
+                    pct: stats.mem_percent,
+                    fill_color: ram_fill,
+                    caption: ram_caption,
+                },
+                CardInfo {
+                    label: if stats.battery.is_some() {
+                        "BATTERY"
+                    } else {
+                        "SYSTEM"
+                    },
+                    dot_color: bat_dot,
+                    value: bat_val,
+                    pct: bat_pct,
+                    fill_color: bat_fill,
+                    caption: bat_caption,
+                },
+            ];
+
+            let card_count = cards.len() as i32;
+            let gap = 8i32;
+            let total_gap = (card_count - 1) * gap;
+            let card_w = ((text_w as i32 - total_gap) / card_count).max(60);
+            let card_y = 80i32;
+            let card_h = 50u32;
+
+            let card_bg = [
+                (ctx.accent[0] as u32 * 20 / 255) as u8,
+                (ctx.accent[1] as u32 * 20 / 255) as u8,
+                (ctx.accent[2] as u32 * 20 / 255) as u8,
+                26,
+            ];
+            let card_border = [255, 255, 255, 34];
+            let track_color = [255, 255, 255, 20];
+
+            for (i, card) in cards.iter().enumerate() {
+                let cx = ctx.pad + i as i32 * (card_w + gap);
+
+                // Smooth rounded frosted card
+                crate::animation::notch::draw_rounded_rect(
+                    frame,
+                    cx,
+                    card_y,
+                    card_w as u32,
+                    card_h,
+                    7,
+                    card_bg,
+                    card_border,
+                );
+
+                // Top row: indicator dot + label + value
+                crate::animation::notch::draw_disc(frame, cx + 9, card_y + 11, 3, card.dot_color);
+                crate::animation::notch::draw_text(
+                    frame,
+                    card.label,
+                    cx + 16,
+                    card_y + 6,
+                    (card_w - 48).max(20) as u32,
+                    9,
+                    true,
+                    self.ink_dim(),
+                );
+                crate::animation::notch::draw_text(
+                    frame,
+                    &card.value,
+                    cx + card_w - 38,
+                    card_y + 6,
+                    34,
+                    9,
+                    true,
+                    self.ink(),
+                );
+
+                // Mini progress bar
+                let bar_w = (card_w - 18).max(10) as u32;
+                crate::animation::notch::draw_progress_bar(
+                    frame,
+                    cx + 9,
+                    card_y + 23,
+                    bar_w,
+                    4,
+                    card.pct,
+                    track_color,
+                    card.fill_color,
+                );
+
+                // Detail caption under progress bar
+                crate::animation::notch::draw_text(
+                    frame,
+                    &card.caption,
+                    cx + 9,
+                    card_y + 32,
+                    bar_w,
+                    9,
+                    false,
+                    self.ink_dim(),
+                );
+            }
+        }
+
+        // Bottom ctx.accent pill bar
+        if ctx.height >= 145 {
+            let bar_w = 48u32;
+            let bar_x = (ctx.width as i32 - bar_w as i32) / 2;
+            crate::animation::notch::fill_rect_pub(
+                frame,
+                bar_x,
+                ctx.height as i32 - 10,
+                bar_w,
+                3,
+                [ctx.accent[0], ctx.accent[1], ctx.accent[2], 200],
+            );
+        }
+    }
+    /// Expanded card fallback: compact transitioning view for short cards.
+    fn paint_short_card(
+        &mut self,
+        frame: &mut FrameBuffer,
+        state: VisualState,
+        island: &IslandConfig,
+        ctx: &CardPaintCtx,
+    ) {
+        // Compact / transitioning view
+        let face_size = (ctx.height.saturating_sub(20)).min(36) as i32;
+        if island.has_widget("face") {
+            let fx = ctx.pad;
+            let fy = ctx.cy - face_size / 2;
+            let (sc, _) = crate::animation::notch::accent_colors(state);
+            crate::animation::notch::draw_disc(
+                frame,
+                fx + face_size / 2,
+                ctx.cy,
+                (face_size / 2 + 3) as u32,
+                [sc[0], sc[1], sc[2], 55],
+            );
+            crate::animation::notch::blit_rounded(
+                frame,
+                &self.face_frame,
+                fx,
+                fy,
+                face_size as u32,
+                face_size as u32,
+                8,
+            );
+        }
+
+        if self.media_playing() && island.has_widget("music") {
+            let art_size = 28i32;
+            let media_start_x = ctx.pad + face_size + 14;
+            let art_y = ctx.cy - art_size / 2;
+            if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
+                crate::animation::notch::blit_rounded(
+                    frame,
+                    &crate::animation::FrameBuffer {
+                        width: thumb.width,
+                        height: thumb.height,
+                        pixels_pbgra: thumb.pixels_pbgra.clone(),
+                        delay_ms: 0,
+                        loop_index: 0,
+                        scale: 1.0,
+                    },
+                    media_start_x,
+                    art_y,
+                    art_size as u32,
+                    art_size as u32,
+                    6,
+                );
+            } else {
+                crate::animation::notch::draw_disc(
+                    frame,
+                    media_start_x + art_size / 2,
+                    ctx.cy,
+                    (art_size / 2) as u32,
+                    [ctx.accent[0], ctx.accent[1], ctx.accent[2], 230],
+                );
+            }
+            let text_x = media_start_x + art_size + 10;
+            let text_w = (ctx.width as i32 - ctx.pad - text_x).max(40) as u32;
+            let title = self
+                .media
+                .as_ref()
+                .map(|m| m.title.as_str())
+                .unwrap_or("Playing");
+            crate::animation::notch::draw_text(
+                frame,
+                title,
+                text_x,
+                ctx.cy - 7,
+                text_w,
+                11,
+                true,
+                [255, 255, 255, 245],
+            );
+        } else {
+            let left_edge = ctx.pad + face_size + 14;
+            let text_w = (ctx.width as i32 - ctx.pad - left_edge).max(40) as u32;
+            let title = match state {
+                VisualState::Idle => "Termielle",
+                VisualState::Thinking => "Reasoning",
+                VisualState::Working => "Working",
+                VisualState::NeedsInput => "Needs Input",
+                VisualState::Ready => "Turn Complete",
+                VisualState::Failed => "Turn Failed",
+            };
+            crate::animation::notch::draw_text(
+                frame,
+                title,
+                left_edge,
+                ctx.cy - 7,
+                text_w,
+                12,
+                true,
+                [255, 255, 255, 240],
+            );
+        }
+    }
     /// Theme/material changes clear it via [`Controller::set_island_config`].
     fn glass_layer_blobs(
         &mut self,
