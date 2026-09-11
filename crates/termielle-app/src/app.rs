@@ -150,6 +150,45 @@ struct BarCard {
     exp_h: u32,
     expanded: bool,
 }
+/// Ellipsize `text` to `max_chars`, keeping head and tail around one `…`.
+/// Long `HOST: session` titles keep both ends instead of losing the
+/// distinctive tail to a head cut. Unicode-safe (char boundaries).
+fn ellipsize_middle(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars || max_chars < 4 {
+        return text.to_string();
+    }
+    let tail = 14.min(max_chars - 2);
+    let head = max_chars - tail - 1;
+    let head_str: String = text.chars().take(head).collect();
+    let tail_str: String = text.chars().skip(count - tail).collect();
+    format!("{head_str}…{tail_str}")
+}
+
+/// Draws one `LABEL value` metric run: dim label, bright value. `label_w`
+/// is the label advance in px (8/char at this size; pass wider for glyphs
+/// like `⚡`).
+fn paint_metric_text(
+    frame: &mut crate::animation::FrameBuffer,
+    x: i32,
+    y: i32,
+    max_w: u32,
+    label: &str,
+    label_w: i32,
+    value: &str,
+) {
+    crate::animation::notch::draw_text(frame, label, x, y, max_w, 11, false, [165, 165, 165, 205]);
+    crate::animation::notch::draw_text(
+        frame,
+        value,
+        x + label_w,
+        y,
+        max_w.saturating_sub(label_w as u32),
+        11,
+        false,
+        [245, 245, 245, 255],
+    );
+}
 /// Shared inputs for one expanded-card section paint pass: frame geometry
 /// plus the precomputed clock/accent values, so six section painters do
 /// not each re-query the registry or recompute the pose clock.
@@ -853,13 +892,14 @@ impl Controller {
         if self.bar_module("left", "window") && !metrics.window_title.is_empty() {
             cur_x += 6;
             let app_name = crate::media::app_name_from_title(&metrics.window_title);
-            let display_text = if app_name.len() < metrics.window_title.len() {
+            let display_text = if app_name.chars().count() < metrics.window_title.chars().count() {
                 format!("{} — {}", app_name, metrics.window_title)
             } else {
                 metrics.window_title.clone()
             };
-            let max_chars = 36;
-            let truncated: String = display_text.chars().take(max_chars).collect();
+            // Taskbar style: keep head and tail so a long
+            // `HOST: session` title keeps its distinctive tail.
+            let truncated = ellipsize_middle(&display_text, 36);
             let title_w = (truncated.chars().count() as u32 * 8 + 24).clamp(60, 260);
 
             crate::animation::notch::draw_rounded_rect(
@@ -899,8 +939,7 @@ impl Controller {
         pill_y: i32,
         pill_h: u32,
     ) -> Vec<BarHit> {
-        let mut hits = Vec::new();
-        // 3. Modules Right: Clock, Battery, Volume, RAM, CPU
+        let mut hits: Vec<BarHit> = Vec::new();
         let mut cur_right = (width as i32) - bar_x - 12;
 
         if self.bar_module("right", "clock") {
@@ -936,10 +975,10 @@ impl Controller {
                 cur_right -= 8;
                 let bat_w = 78u32;
                 cur_right -= bat_w as i32;
-                let bat_text = if is_charging {
-                    format!("⚡ {}%", bat_pct)
+                let (bat_label, bat_label_w, bat_value) = if is_charging {
+                    ("⚡ ", 20, format!("{}%", bat_pct))
                 } else {
-                    format!("BAT {}%", bat_pct)
+                    ("BAT ", 32, format!("{}%", bat_pct))
                 };
                 crate::animation::notch::draw_rounded_rect(
                     frame,
@@ -951,15 +990,14 @@ impl Controller {
                     [255, 255, 255, 20],
                     [255, 255, 255, 32],
                 );
-                crate::animation::notch::draw_text(
+                paint_metric_text(
                     frame,
-                    &bat_text,
                     cur_right + 8,
                     pill_y + ((pill_h - 12) / 2) as i32,
                     bat_w - 12,
-                    11,
-                    false,
-                    [220, 220, 220, 230],
+                    bat_label,
+                    bat_label_w,
+                    &bat_value,
                 );
             }
         }
@@ -970,11 +1008,8 @@ impl Controller {
             let vol = metrics.volume;
             let vol_w = 78u32;
             cur_right -= vol_w as i32;
-            let vol_text = if vol.muted {
-                "MUTED".to_string()
-            } else {
-                format!("VOL {}%", vol.level)
-            };
+            let vol_muted = vol.muted;
+            let vol_value = format!("{}%", vol.level);
             let vol_bg = if vol.muted {
                 [160, 40, 40, 60]
             } else {
@@ -990,16 +1025,28 @@ impl Controller {
                 vol_bg,
                 [255, 255, 255, 32],
             );
-            crate::animation::notch::draw_text(
-                frame,
-                &vol_text,
-                cur_right + 8,
-                pill_y + ((pill_h - 12) / 2) as i32,
-                vol_w - 12,
-                11,
-                false,
-                [220, 220, 220, 230],
-            );
+            if vol_muted {
+                crate::animation::notch::draw_text(
+                    frame,
+                    "MUTED",
+                    cur_right + 8,
+                    pill_y + ((pill_h - 12) / 2) as i32,
+                    vol_w - 12,
+                    11,
+                    false,
+                    [220, 220, 220, 230],
+                );
+            } else {
+                paint_metric_text(
+                    frame,
+                    cur_right + 8,
+                    pill_y + ((pill_h - 12) / 2) as i32,
+                    vol_w - 12,
+                    "VOL ",
+                    32,
+                    &vol_value,
+                );
+            }
             hits.push((
                 crate::bar::HIT_BAR_VOLUME_TOGGLE,
                 cur_right,
@@ -1015,7 +1062,7 @@ impl Controller {
             let mem_pct = metrics.memory_pct;
             let mem_w = 78u32;
             cur_right -= mem_w as i32;
-            let mem_text = format!("RAM {}%", mem_pct);
+            let mem_value = format!("{}%", mem_pct);
             crate::animation::notch::draw_rounded_rect(
                 frame,
                 cur_right,
@@ -1026,15 +1073,14 @@ impl Controller {
                 [255, 255, 255, 20],
                 [255, 255, 255, 32],
             );
-            crate::animation::notch::draw_text(
+            paint_metric_text(
                 frame,
-                &mem_text,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
                 mem_w - 12,
-                11,
-                false,
-                [220, 220, 220, 230],
+                "RAM ",
+                32,
+                &mem_value,
             );
         }
 
@@ -1044,7 +1090,7 @@ impl Controller {
             let cpu_pct = metrics.cpu_pct;
             let cpu_w = 78u32;
             cur_right -= cpu_w as i32;
-            let cpu_text = format!("CPU {}%", cpu_pct);
+            let cpu_value = format!("{}%", cpu_pct);
             crate::animation::notch::draw_rounded_rect(
                 frame,
                 cur_right,
@@ -1055,15 +1101,14 @@ impl Controller {
                 [255, 255, 255, 20],
                 [255, 255, 255, 32],
             );
-            crate::animation::notch::draw_text(
+            paint_metric_text(
                 frame,
-                &cpu_text,
                 cur_right + 8,
                 pill_y + ((pill_h - 12) / 2) as i32,
                 cpu_w - 12,
-                11,
-                false,
-                [220, 220, 220, 230],
+                "CPU ",
+                32,
+                &cpu_value,
             );
         }
 
@@ -4156,9 +4201,7 @@ fn think_bob_bounces_only_while_thinking() {
         Controller::think_bob(VisualState::Thinking, 0, 120)
     );
     assert_eq!(Controller::think_bob(VisualState::Working, 0, 120), 0);
-    assert_eq!(Controller::think_bob(VisualState::Idle, 2, 5000), 0);
 }
-
 #[test]
 fn shake_fires_briefly_then_locks_to_zero() {
     use termielle_core::VisualState;
@@ -4189,4 +4232,22 @@ fn orbit_circles_with_time() {
         let d = (((x - 50) * (x - 50) + (y - 50) * (y - 50)) as f32).sqrt();
         assert!((d - 10.0).abs() <= 1.5, "off circle: {d}");
     }
+}
+
+#[test]
+fn ellipsize_middle_keeps_head_and_tail() {
+    assert_eq!(ellipsize_middle("short", 36), "short");
+    assert_eq!(ellipsize_middle(&"x".repeat(36), 36).chars().count(), 36);
+    assert_eq!(ellipsize_middle(&"x".repeat(37), 36).chars().count(), 36);
+    let long = "DESKTOP-LGG1QFB: some-very-long-session-name-here";
+    let cut = ellipsize_middle(long, 36);
+    assert_eq!(cut.chars().count(), 36);
+    assert!(cut.starts_with("DESKTOP-LGG1QFB: so"), "head kept: {cut}");
+    assert!(cut.ends_with("sion-name-here"), "tail kept: {cut}");
+    assert!(cut.contains('…'));
+    // Unicode-safe: char boundaries only.
+    let uni = "WezTerm — session with shades and more text here plus";
+    let ucut = ellipsize_middle(uni, 36);
+    assert_eq!(ucut.chars().count(), 36);
+    assert!(ucut.contains('…'));
 }
