@@ -107,12 +107,13 @@ pub struct Controller {
     pub(crate) alert_visible: bool,
     /// Next timeout-countdown repaint while a banner is visible.
     pub(crate) alert_deadline: Option<u64>,
-    /// Cached frosted-glass layer keyed by (w, h, radius, attached). The
-    /// single-pass paint is ~1ms; caching makes face ticks ~free.
-    /// Cached frosted-glass layer keyed by (w, h, radius, attached, black,
-    /// blob count, media-blob x, media-blob w). The single-pass paint is
-    /// ~1ms; caching makes face ticks ~free.
-    pub(crate) glass_cache: Option<(GlassCacheKey, FrameBuffer)>,
+    /// Cached frosted-glass layers keyed by (w, h, radius, attached, black,
+    /// blob count, media-blob x, media-blob w, scale, first-blob w,
+    /// separation). The single-pass paint is ~1ms; caching makes face ticks
+    /// ~free. A bar frame needs two live layers at once (the strip and the
+    /// center pill), so this holds a few rather than one: with a single slot
+    /// the two would evict each other every frame and repaint both.
+    pub(crate) glass_caches: Vec<(GlassCacheKey, FrameBuffer)>,
     /// Last now-playing media state from the background worker.
     pub(crate) media: Option<MediaInfo>,
     /// Open window task icons from the background worker.
@@ -225,7 +226,7 @@ impl Controller {
             hover_point: None,
             media: None,
             tasks: Vec::new(),
-            glass_cache: None,
+            glass_caches: Vec::new(),
             clock_ms: 0,
             state_since_ms: 0,
             alerts: VecDeque::new(),
@@ -406,7 +407,7 @@ impl Controller {
         let is_enabled = island.is_enabled();
         let mode_changed = self.island.layout != island.layout;
         self.island = island;
-        self.glass_cache = None;
+        self.glass_caches.clear();
         self.bar_left_cache = None;
         self.bar_right_cache = None;
         self.hover_expanded = false;

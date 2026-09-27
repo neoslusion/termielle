@@ -335,4 +335,73 @@ mod tests {
                 && hit.0 > crate::bar::HIT_BAR_WORKSPACE_BASE - 50
         }));
     }
+
+    /// The compact pill is painted into a strip-local canvas that is then
+    /// composited at `bar_y`. On a bottom bar `bar_y` is non-zero, so content
+    /// addressed with the shifted y lands outside that canvas and is clipped
+    /// away: the strip keeps its glass but loses the pill's face, label and
+    /// glyph. Pinning the whole strip against the top bar catches that
+    /// without having to guess which pixel is content.
+    #[test]
+    fn bottom_bar_strip_matches_the_top_bar_strip() {
+        fn bar_controller(position: termielle_core::BarPosition) -> Controller {
+            let mut island = IslandConfig {
+                layout: IslandLayout::Bar,
+                ..IslandConfig::default()
+            };
+            island.bar.height = 36;
+            island.bar.position = position;
+            island.bar.modules_center = vec!["termielle".to_string()];
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                false,
+                None,
+                island,
+            );
+            controller.set_bar_width(1536);
+            controller
+        }
+
+        let width = 1536u32;
+        let bar_h = 36u32;
+        // Tall enough that a bottom bar's strip starts below the frame origin
+        // (so strip-local and bar-frame y differ), short enough that the
+        // compact pill is still the thing on screen.
+        let height = 40u32;
+
+        let mut top = bar_controller(termielle_core::BarPosition::Top);
+        let top_frame = top.render_bar(VisualState::Idle, width, height, 60_000);
+        let mut bottom = bar_controller(termielle_core::BarPosition::Bottom);
+        let bottom_frame = bottom.render_bar(VisualState::Idle, width, height, 60_000);
+
+        let bar_y = (height - bar_h) as usize;
+        let differing = (0..bar_h as usize)
+            .flat_map(|row| (0..width as usize).map(move |col| (row, col)))
+            .find(|(row, col)| {
+                let top_idx = (row * width as usize + col) * 4;
+                let bottom_idx = ((bar_y + row) * width as usize + col) * 4;
+                top_frame.pixels_pbgra[top_idx..top_idx + 4]
+                    != bottom_frame.pixels_pbgra[bottom_idx..bottom_idx + 4]
+            });
+        assert!(
+            differing.is_none(),
+            "bottom bar strip differs from the top bar strip at {differing:?}"
+        );
+
+        // The click target is in bar-frame coordinates, so it has to move with
+        // the strip rather than stay on the pill's strip-local y.
+        let (pill_cx, pill_off, _, pill_h) = bottom.bar_pill_rect(width);
+        let hit = bottom
+            .icon_hits
+            .iter()
+            .find(|(id, ..)| *id == crate::bar::HIT_BAR_TERMIELLE_MODULE)
+            .copied()
+            .expect("collapsed pill registers a click target");
+        assert_eq!(
+            (hit.1, hit.2, hit.4),
+            (pill_cx, bar_y as i32 + pill_off, pill_h)
+        );
+    }
 }

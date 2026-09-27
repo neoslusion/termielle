@@ -6,6 +6,10 @@ use crate::animation::notch::BRIDGE_K_MAX;
 use crate::animation::spring::BLOB_GAP_PX;
 
 impl Controller {
+    /// How many frosted-glass layers stay cached at once. A bar frame paints
+    /// the strip and the center pill in the same pass, so one slot would make
+    /// them evict each other and repaint both every frame.
+    const GLASS_CACHE_SLOTS: usize = 4;
     /// Theme/material changes clear it via [`Controller::set_island_config`].
     pub(crate) fn glass_layer_blobs(
         &mut self,
@@ -32,10 +36,8 @@ impl Controller {
             blobs.first().map_or(0, |blob| blob.w),
             self.separation_now().to_bits(),
         );
-        if let Some((cached_key, buf)) = &self.glass_cache {
-            if *cached_key == key {
-                return buf.clone();
-            }
+        if let Some((_, buf)) = self.glass_caches.iter().find(|(cached, _)| *cached == key) {
+            return buf.clone();
         }
         // The liquid bridge between blobs thins and snaps as the
         // separation extends.
@@ -50,7 +52,13 @@ impl Controller {
             bridge_k,
             self.render_scale(),
         );
-        self.glass_cache = Some((key, buf.clone()));
+        // Bounded so a run of distinct geometries cannot grow the cache
+        // without limit. Four covers every live layer a frame paints: the
+        // bar strip, the center pill, and the expanded card.
+        if self.glass_caches.len() >= Self::GLASS_CACHE_SLOTS {
+            self.glass_caches.remove(0);
+        }
+        self.glass_caches.push((key, buf.clone()));
         buf
     }
 }

@@ -350,12 +350,41 @@ impl Controller {
                 let (pill_cx, local_pill_y, pill_w, pill_h) = self.bar_pill_rect(width);
                 let pill_y = card.bar_y + local_pill_y;
 
+                // The pill is its own piece of glass, not a hole in the strip:
+                // the content below rides on top of a rounded chip with the
+                // theme's tint, border, highlight and shadow. Without it the
+                // center reads as whatever happens to be behind the
+                // translucent strip, and a dark window behind the bar looks
+                // like a mis-painted rectangle rather than an island.
+                //
+                // It is painted into the compact frame rather than the bar
+                // frame, so it inherits that frame's fade and dissolves with
+                // the pill as the card takes over.
+                let pill_r = pill_h / 2;
+                let pill_blobs = [crate::animation::notch::BlobRect {
+                    x: 0,
+                    y: 0,
+                    w: pill_w,
+                    h: pill_h,
+                    r: pill_r,
+                    attached: false,
+                }];
+                let chip =
+                    self.glass_layer_blobs(pill_w, pill_h, pill_r, false, &pill_blobs, false);
+                crate::animation::notch::blend_frame_over(
+                    compact_frame,
+                    &chip,
+                    pill_cx,
+                    local_pill_y,
+                    255,
+                );
+
                 // The face is an optional Termielle widget. Bar mode follows
                 // the same widget contract as standalone Island mode.
                 let face_sz = if self.island.has_widget("face") {
                     let face_sz = (pill_h - 4).min(22);
                     let face_x = pill_cx + 4;
-                    let face_y = pill_y + ((pill_h - face_sz) / 2) as i32;
+                    let face_y = local_pill_y + ((pill_h - face_sz) / 2) as i32;
                     crate::animation::notch::blit_rounded(
                         compact_frame,
                         &self.face_frame,
@@ -383,7 +412,7 @@ impl Controller {
                         crate::animation::notch::draw_text_in_rect(
                             compact_frame,
                             track,
-                            (label_x, pill_y, label_max_w, pill_h),
+                            (label_x, local_pill_y, label_max_w, pill_h),
                             12,
                             false,
                             primary,
@@ -393,7 +422,7 @@ impl Controller {
                         crate::animation::notch::draw_text_in_rect(
                             compact_frame,
                             "Media",
-                            (label_x, pill_y, label_max_w, pill_h),
+                            (label_x, local_pill_y, label_max_w, pill_h),
                             12,
                             false,
                             primary,
@@ -405,14 +434,19 @@ impl Controller {
                     crate::animation::notch::draw_disc(
                         compact_frame,
                         label_x + 4,
-                        pill_y + (pill_h / 2) as i32,
+                        local_pill_y + (pill_h / 2) as i32,
                         3,
                         sc,
                     );
                     crate::animation::notch::draw_text_in_rect(
                         compact_frame,
                         state.display_name(),
-                        (label_x + 12, pill_y, label_max_w.saturating_sub(14), pill_h),
+                        (
+                            label_x + 12,
+                            local_pill_y,
+                            label_max_w.saturating_sub(14),
+                            pill_h,
+                        ),
                         12,
                         false,
                         primary,
@@ -422,7 +456,7 @@ impl Controller {
                     crate::animation::notch::draw_text_in_rect(
                         compact_frame,
                         "Termielle",
-                        (label_x, pill_y, label_max_w, pill_h),
+                        (label_x, local_pill_y, label_max_w, pill_h),
                         12,
                         true,
                         primary,
@@ -435,7 +469,7 @@ impl Controller {
                 // the open/close click keeps every other pixel to itself.
                 let panel_w = 20i32;
                 let panel_x = pill_cx + pill_w as i32 - panel_w - 6;
-                let panel_y = pill_y + (pill_h as i32 - panel_w) / 2;
+                let panel_y = local_pill_y + (pill_h as i32 - panel_w) / 2;
                 for (row, len) in [9i32, 14, 7].iter().enumerate() {
                     let line_y = panel_y + 5 + row as i32 * 5;
                     crate::animation::notch::fill_rect_pub(
@@ -457,7 +491,7 @@ impl Controller {
                 hits.push((
                     crate::app::types::HIT_CARD_PANEL,
                     panel_x - 2,
-                    panel_y,
+                    pill_y + (pill_h as i32 - panel_w) / 2,
                     panel_w as u32 + 4,
                     panel_w as u32,
                 ));
