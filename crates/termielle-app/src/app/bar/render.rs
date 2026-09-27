@@ -10,9 +10,15 @@ use crate::window::scaled_size;
 use std::rc::Rc;
 use termielle_core::VisualState;
 
-/// Copies a logical x-range from a transparent cached layer into the
+/// Composites a transparent cached layer over a logical x-range of the
 /// destination, at the given logical row offset. Both frames share the render
 /// scale, so the conversion stays in device pixels.
+///
+/// The layer is *blended*, not copied: a cached side zone only carries the
+/// pixels it actually paints, and a raw copy would replace every transparent
+/// pixel it owns with nothing. Copying over the strip therefore erased the
+/// row's glass everywhere except the gap between the zones, leaving the bar
+/// unpainted and the desktop showing through it raw.
 fn composite_region(dst: &mut FrameBuffer, src: &FrameBuffer, y: i32, x0: u32, x1: u32) {
     let x0 = (x0 as f32 * dst.scale).round() as usize;
     let x1 = ((x1 as f32 * dst.scale).round() as usize).min(dst.width as usize);
@@ -25,11 +31,22 @@ fn composite_region(dst: &mut FrameBuffer, src: &FrameBuffer, y: i32, x0: u32, x
         if dy < 0 || dy >= dst.height as i32 {
             continue;
         }
-        let length = (x1 - x0) * 4;
-        let src_start = (row * src.width as usize + x0) * 4;
-        let dst_start = (dy as usize * dst.width as usize + x0) * 4;
-        dst.pixels_pbgra[dst_start..dst_start + length]
-            .copy_from_slice(&src.pixels_pbgra[src_start..src_start + length]);
+        let src_row = row * src.width as usize;
+        let dst_row = dy as usize * dst.width as usize;
+        for col in x0..x1 {
+            let si = (src_row + col) * 4;
+            let sa = src.pixels_pbgra[si + 3] as u32;
+            if sa == 0 {
+                continue;
+            }
+            let di = (dst_row + col) * 4;
+            let ia = 255 - sa;
+            let d = &mut dst.pixels_pbgra[di..di + 4];
+            d[0] = (src.pixels_pbgra[si] as u32 + d[0] as u32 * ia / 255).min(255) as u8;
+            d[1] = (src.pixels_pbgra[si + 1] as u32 + d[1] as u32 * ia / 255).min(255) as u8;
+            d[2] = (src.pixels_pbgra[si + 2] as u32 + d[2] as u32 * ia / 255).min(255) as u8;
+            d[3] = (sa + d[3] as u32 * ia / 255) as u8;
+        }
     }
 }
 
@@ -403,5 +420,64 @@ mod tests {
             (hit.1, hit.2, hit.4),
             (pill_cx, bar_y as i32 + pill_off, pill_h)
         );
+    }
+
+    /// The strip is one continuous glass surface. The side zones are cached
+    /// transparent layers that only carry the pixels they paint, so they have
+    /// to be blended over the row: copying them replaced their transparent
+    /// pixels with nothing and left the bar with glass only in the gap between
+    /// the zones, so the desktop showed through the strip raw.
+    #[test]
+    fn strip_glass_survives_under_both_side_zones() {
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..IslandConfig::default()
+        };
+        island.bar.height = 36;
+        island.bar.modules_left = vec!["workspaces".to_string(), "window".to_string()];
+        island.bar.modules_right = vec!["cpu".to_string(), "clock".to_string()];
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            island,
+        );
+        let width = 1536u32;
+        controller.set_bar_width(width);
+        controller.set_bar_metrics(
+            Snapshot {
+                workspaces: WorkspaceSnapshot {
+                    total: 2,
+                    active: 1,
+                },
+                ..Snapshot::empty()
+            },
+            0,
+        );
+
+        let frame = controller.render_bar(VisualState::Idle, width, 36, 60_000);
+        let alpha = |x: u32, y: u32| -> u8 {
+            let idx = ((y as usize * frame.width as usize) + x as usize) * 4;
+            frame.pixels_pbgra[idx + 3]
+        };
+        let (pill_cx, pill_off, pill_w, _) = controller.bar_pill_rect(width);
+        let y = (pill_off + 4) as u32;
+
+        // Left of the pill, under the left zone; right of the pill, under the
+        // right zone. Both must still be the row's glass, not a hole.
+        let probes = [
+            8u32,
+            pill_cx as u32 / 2,
+            pill_cx as u32 + pill_w + 8,
+            width - 8,
+        ];
+        for x in probes {
+            assert!(
+                alpha(x, y) > 0,
+                "strip is unpainted at x={x}: the side zones erased the row's glass"
+            );
+        }
     }
 }
