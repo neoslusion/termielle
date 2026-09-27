@@ -494,6 +494,69 @@ fn bar_alert_click_returns_to_the_bar() {
 }
 
 #[test]
+fn bar_popup_alert_timeout_drains_at_frame_rate() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.face_animated = false;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    c.handle_event(event("s1", EventKind::NeedsInput, 10_000), 10_000);
+    c.on_timer(10_200);
+    assert!(
+        c.current_frame().height > 36,
+        "the alert should open the popup card"
+    );
+
+    // The remaining life has to drain between frames. Riding the bar's
+    // two-second metrics refresh makes the countdown read as a stutter.
+    let first = c.current_frame().pixels_pbgra.clone();
+    c.on_timer(10_216);
+    let second = c.current_frame().pixels_pbgra.clone();
+    assert_ne!(
+        first, second,
+        "visible alert timeout must repaint every frame"
+    );
+    assert!(
+        c.next_deadline_ms().is_some_and(|due| due <= 10_216 + 16),
+        "countdown must schedule the next frame"
+    );
+}
+
+#[test]
+fn alert_countdown_stops_once_the_banner_is_gone() {
+    use termielle_app::app::ClickOutcome;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.handle_event(event("s1", EventKind::NeedsInput, 10_000), 10_000);
+    c.on_timer(10_016);
+    assert!(
+        c.next_deadline_ms().is_some_and(|due| due <= 10_016 + 16),
+        "a visible banner schedules its countdown"
+    );
+
+    assert_eq!(c.handle_click(10, 10, 10_200), ClickOutcome::AlertDismiss);
+    // Leave the input-pulse state, then let the dismiss morph and the ready
+    // hold run out, so the countdown is the only thing left that could keep
+    // the surface repainting.
+    c.handle_event(event("s1", EventKind::TurnCompleted, 10_300), 10_300);
+    for tick in (10_400..20_000).step_by(16) {
+        c.on_timer(tick);
+    }
+    let settled_at = 20_000;
+    let deadline = c.next_deadline_ms();
+    assert!(
+        deadline.is_none_or(|due| due > settled_at + 16),
+        "a dismissed banner must not keep per-frame repaints: {deadline:?}"
+    );
+    assert!(
+        !c.on_timer(settled_at + 16).present_frame,
+        "a settled surface must stay quiet"
+    );
+}
+
+#[test]
 fn media_transport_hits_match_the_refined_control_row() {
     use termielle_app::tasks::{MediaInfo, WorkerUpdate};
 
@@ -1152,12 +1215,20 @@ fn failed_shake_settles_pixel_stable() {
     c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
     c.handle_event(event("s1", EventKind::TurnFailed, 10100), 10100);
     assert_eq!(c.visible_state(), termielle_core::VisualState::Failed);
-    // Past morph end and the 300 ms shake window: locked to zero.
-    for t in (10100..10600).step_by(50) {
+    // Dismiss the failure banner first: a live timeout keeps its hairline
+    // moving, so the shake cannot be measured through it. The banner's hit
+    // target exists once the card has actually painted.
+    c.on_timer(10200);
+    assert_eq!(
+        c.handle_click(10, 10, 10200),
+        termielle_app::app::ClickOutcome::AlertDismiss
+    );
+    // Past the dismiss morph and the 300 ms shake window: locked to zero.
+    for t in (10250..11000).step_by(50) {
         c.on_timer(t);
     }
     let a = c.current_frame().pixels_pbgra.clone();
-    for t in (10600..10750).step_by(50) {
+    for t in (11000..11150).step_by(50) {
         c.on_timer(t);
     }
     assert_eq!(
@@ -1593,10 +1664,266 @@ fn bar_module_list_gates_volume_hit() {
     island2.bar.modules_right = vec!["clock".to_string()];
     c.set_island_config(island2, 1100);
     assert!(!c.volume_at(1896, 18));
+    // The clock module owns its own hit now: it opens the shell clock
+    // flyout, so the same point resolves to that action, not to nothing.
     assert_eq!(
         c.handle_click(1896, 18, 1200),
-        termielle_app::app::ClickOutcome::None
+        termielle_app::app::ClickOutcome::Shell(termielle_app::bar::shell::ShellAction::Clock)
     );
+}
+
+/// Replacement-mode bar: the shell controls each resolve to their own Windows
+/// surface, and the controls are absent when the native taskbar is kept.
+#[test]
+fn shell_controls_drive_windows_surfaces_only_in_replacement_mode() {
+    use termielle_app::app::ClickOutcome;
+    use termielle_app::bar::shell::ShellAction;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.bar.replace_taskbar = true;
+    island.bar.modules_left = vec!["workspaces".to_string()];
+    island.bar.modules_right = vec!["clock".to_string()];
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+
+    // Left zone: 12 px inset, label-sized controls, 4 px gaps. The hit rect
+    // is the painted button, so the center of each control is its own action.
+    let mut x = 12i32;
+    for (index, action) in ShellAction::ALL.iter().enumerate() {
+        let width = action.control_width() as i32;
+        assert_eq!(
+            c.handle_click(x + width / 2, 18, 1000 + index as u64),
+            ClickOutcome::Shell(*action),
+            "control {action:?} must own its own hit"
+        );
+        x += width + 4;
+    }
+
+    // The center pill and the right zone are untouched by replacement mode.
+    assert_eq!(c.handle_click(960, 18, 1100), ClickOutcome::Expanded);
+    c.set_island_config(
+        IslandConfig {
+            layout: IslandLayout::Bar,
+            bar: termielle_core::BarConfig {
+                height: 36,
+                replace_taskbar: false,
+                modules_left: vec!["workspaces".to_string()],
+                modules_right: vec!["clock".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        2000,
+    );
+    assert_eq!(c.handle_click(960, 18, 2100), ClickOutcome::Collapsed);
+    assert_ne!(
+        c.handle_click(28, 18, 2200),
+        ClickOutcome::Shell(ShellAction::Start),
+        "no shell controls while the native taskbar is kept"
+    );
+}
+
+/// Left-zone content is laid out up to the center pill, so a narrow bar drops
+/// the overflow instead of painting it under the pill and leaving a live hit
+/// target on an invisible control.
+#[test]
+fn left_zone_drops_overflow_instead_of_crossing_the_center_pill() {
+    use termielle_app::app::ClickOutcome;
+    use termielle_app::bar::metrics::Snapshot;
+    use termielle_app::bar::shell::ShellAction;
+    use termielle_app::bar::workspaces::WorkspaceSnapshot;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.bar.replace_taskbar = true;
+    island.bar.modules_left = vec!["workspaces".to_string()];
+    island.bar.modules_right = vec!["clock".to_string()];
+    let metrics = Snapshot {
+        workspaces: WorkspaceSnapshot {
+            total: 6,
+            active: 1,
+        },
+        window_title: "Editor — a fairly long window title".into(),
+        ..Default::default()
+    };
+
+    // The first workspace button follows the shell controls and their gap,
+    // exactly where the painter puts it.
+    let first_workspace_x = 12
+        + ShellAction::ALL
+            .iter()
+            .map(|action| action.control_width() as i32 + 4)
+            .sum::<i32>()
+        + 6
+        + 14;
+
+    // Room to spare: the switcher follows the shell controls.
+    let mut wide = Controller::new_with_island(5000, 60000, catalog(), false, None, island.clone());
+    wide.set_bar_width(1920);
+    wide.set_bar_metrics(metrics.clone(), 1000);
+    assert_eq!(
+        wide.handle_click(first_workspace_x, 18, 1100),
+        ClickOutcome::WorkspaceSwitch(1)
+    );
+
+    // Narrow: the center pill moves left, so the switcher is dropped instead
+    // of painted underneath it — no pixel, and no live hit target either.
+    let mut narrow = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    narrow.set_bar_width(640);
+    narrow.set_bar_metrics(metrics, 1000);
+    // The same point is now inside the center pill's own space: the pill
+    // answers instead of a workspace switch that was dropped.
+    assert_eq!(
+        narrow.handle_click(first_workspace_x, 18, 1200),
+        ClickOutcome::Expanded
+    );
+}
+
+/// The pill's panel glyph opens the popup on the panel body, and the popup's
+/// own click closes the popup and hands the next open back to the default
+/// card.
+/// The pill's panel glyph opens the popup on the panel body, and the popup's
+/// own click closes the popup and hands the next open back to the default
+/// card.
+#[test]
+fn panel_glyph_opens_the_panel_and_the_pill_hands_the_card_back() {
+    use termielle_app::app::ClickOutcome;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    let collapsed_h = c.current_frame().height;
+
+    // The glyph sits at the pill's right end, ahead of the pill's own hit.
+    assert_eq!(
+        c.handle_click(panel_glyph_x(), 18, 1000),
+        ClickOutcome::PanelToggled
+    );
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(
+        c.current_frame().height > 120,
+        "the panel is a tall card: {}",
+        c.current_frame().height
+    );
+
+    // The pill still owns its own surface: clicking it closes the popup.
+    assert_eq!(c.handle_click(960, 18, 1500), ClickOutcome::Collapsed);
+    for tick in (1500..2100).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert_eq!(
+        c.current_frame().height,
+        collapsed_h,
+        "the popup is closed again"
+    );
+    assert_eq!(
+        c.handle_click(960, 18, 2200),
+        ClickOutcome::Expanded,
+        "the next open shows the default card, not the panel"
+    );
+}
+
+/// The volume row is an absolute level, a wheel target, and a mute button, and
+/// each Termielle row names the setting it owns. Windows' own quick settings
+/// stay delegated to the shell.
+#[test]
+fn panel_rows_drive_the_level_and_name_their_settings() {
+    use termielle_app::app::ClickOutcome;
+    use termielle_app::app::PanelToggle;
+    use termielle_app::bar::metrics::Snapshot;
+    use termielle_app::bar::volume::VolumeSnapshot;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    c.set_bar_metrics(
+        Snapshot {
+            volume: VolumeSnapshot {
+                level: 60,
+                muted: false,
+            },
+            ..Default::default()
+        },
+        1000,
+    );
+    assert_eq!(
+        c.handle_click(panel_glyph_x(), 18, 1000),
+        ClickOutcome::PanelToggled
+    );
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+
+    // The card is `expanded_width` wide, centered under a 36 px strip with a
+    // 6 px gap. The panel's rows start 40 px below the card top, 28 px tall,
+    // 8 px apart, and the steppers and speaker are laid out in card-local
+    // space (app/cards/panel.rs).
+    let card_w = c.island_config().expanded_width.min(1920 - 32) as i32;
+    let card_left = (1920 - card_w) / 2;
+    let card_top = 36 + 6;
+    let row = |index: i32| card_top + 40 + 36 * index + 14;
+    let down = card_left + card_w - 18 - 56 + 14;
+    let up = card_left + card_w - 18 - 14;
+    assert_eq!(
+        c.handle_click(down, row(0), 1500),
+        ClickOutcome::VolumeSet(55),
+        "the down stepper lowers the level the row showed"
+    );
+    assert_eq!(
+        c.handle_click(up, row(0), 1600),
+        ClickOutcome::VolumeSet(65),
+        "the up stepper raises it by the same step"
+    );
+    assert!(
+        c.panel_volume_at(card_left + 100, row(0)),
+        "the volume track answers the wheel"
+    );
+    assert_eq!(
+        c.handle_click(card_left + 30, row(0), 1650),
+        ClickOutcome::VolumeToggle,
+        "the speaker glyph is the mute button"
+    );
+
+    // Each Termielle row reports the setting it owns, in row order.
+    for (index, setting) in [
+        (1, PanelToggle::HoverExpand),
+        (2, PanelToggle::Face),
+        (3, PanelToggle::Music),
+    ] {
+        assert_eq!(
+            c.handle_click(card_left + 40, row(index), 1700 + index as u64 * 10),
+            ClickOutcome::PanelToggle(setting),
+            "row {index} owns {setting:?}"
+        );
+    }
+    assert_eq!(
+        c.handle_click(card_left + 40, row(4), 2000),
+        ClickOutcome::Shell(termielle_app::bar::shell::ShellAction::SystemTray),
+        "the shell's own quick settings stay delegated"
+    );
+}
+
+/// The glyph's x follows the pill's right end, so the tests never hard-code
+/// the pill's own width.
+fn panel_glyph_x() -> i32 {
+    960 + 90 - 26 + 10
 }
 
 #[test]

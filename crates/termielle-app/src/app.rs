@@ -21,5 +21,7 @@ pub(crate) mod types;
 pub use controller::Controller;
 pub use types::{
     AlertBanner, AlertKind, ClickOutcome, ControllerActions, FALLBACK_FRAME_SIZE,
-    HIT_ALERT_DISMISS, HIT_MEDIA_NEXT, HIT_MEDIA_PLAY_PAUSE, HIT_MEDIA_PREV,
+    HIT_ALERT_DISMISS, HIT_CARD_PANEL, HIT_MEDIA_NEXT, HIT_MEDIA_PLAY_PAUSE, HIT_MEDIA_PREV,
+    HIT_PANEL_TOGGLE_BASE, HIT_PANEL_VOLUME_DOWN, HIT_PANEL_VOLUME_UP, PANEL_VOLUME_STEP,
+    PanelToggle,
 };

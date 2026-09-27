@@ -17,6 +17,10 @@ pub(crate) const MAX_QUEUED_ALERTS: usize = 3;
 /// Passive bar modules refresh every two seconds; direct controls refresh
 /// their affected metrics immediately.
 pub(crate) const BAR_REFRESH_MS: u64 = 2_000;
+/// Cadence of the visible alert's timeout hairline. The banner repaints on
+/// this tick while it is on screen, so the remaining life drains at display
+/// rate instead of riding the bar's two-second metrics refresh.
+pub(crate) const ALERT_COUNTDOWN_TICK_MS: u64 = 16;
 
 /// Transient alert banner displayed in the Dynamic Island on notifications.
 /// Cache key for the frosted-glass layer: geometry, material, blob layout,
@@ -41,6 +45,30 @@ pub const HIT_MEDIA_PLAY_PAUSE: isize = -1;
 pub const HIT_MEDIA_PREV: isize = -2;
 pub const HIT_MEDIA_NEXT: isize = -3;
 pub const HIT_ALERT_DISMISS: isize = -4;
+/// The compact pill's control-panel target. Clicking it swaps the popup's
+/// body for the panel instead of reusing the pill's open/close click.
+pub const HIT_CARD_PANEL: isize = -500;
+/// The panel's volume row: the whole track answers the wheel, and these two
+/// steppers own the pointer.
+pub const HIT_PANEL_VOLUME_DOWN: isize = -501;
+pub const HIT_PANEL_VOLUME_UP: isize = -502;
+/// The volume track. Not a click target — it exists so the wheel can find
+/// the row in the same frame coordinates the click path already uses.
+pub const HIT_PANEL_VOLUME_TRACK: isize = -503;
+/// Base for the panel's Termielle toggles; each row owns one id.
+pub const HIT_PANEL_TOGGLE_BASE: isize = -510;
+/// How much one press of the volume steppers moves the level.
+pub const PANEL_VOLUME_STEP: i8 = 5;
+
+/// Which Termielle setting a panel row owns. Toggling one emits the same
+/// command the tray menu sends, so the two surfaces cannot disagree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PanelToggle {
+    HoverExpand,
+    Face,
+    Music,
+}
+
 /// What a click on the island should do.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClickOutcome {
@@ -58,6 +86,17 @@ pub enum ClickOutcome {
     WorkspaceSwitch(u32),
     /// Toggle system audio mute.
     VolumeToggle,
+    /// Set the system volume to an absolute level. The steppers emit this
+    /// rather than a delta, so the target never drifts from the level the
+    /// user last saw in the row.
+    VolumeSet(u8),
+    /// The control panel opened or closed. The controller has already flipped
+    /// its own state; the host only needs to repaint.
+    PanelToggled,
+    /// Flip one of Termielle's own settings.
+    PanelToggle(PanelToggle),
+    /// Open a Windows shell surface owned by the shell.
+    Shell(crate::bar::shell::ShellAction),
     /// The dashboard opened.
     Expanded,
     /// The dashboard closed.

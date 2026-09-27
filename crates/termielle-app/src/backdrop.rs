@@ -45,6 +45,32 @@ impl Backdrop {
     }
 }
 
+/// Smallest rect containing both `a` and `b`, in physical screen pixels.
+///
+/// The frosted glass samples a captured image screen-anchored, and a sample
+/// outside that image falls back to a flat tint. So a capture published for
+/// only the rect that was just drawn leaves every pixel a growing surface has
+/// not reached yet showing flat colour — the glass stops reflecting what is
+/// behind it exactly while it is moving. Covering the union of where the
+/// surface is and where it is going keeps every covered pixel sampleable for
+/// the whole travel.
+pub fn cover_rect(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> (i32, i32, u32, u32) {
+    let left = a.0.min(b.0);
+    let top = a.1.min(b.1);
+    let right =
+        a.0.saturating_add(a.2 as i32)
+            .max(b.0.saturating_add(b.2 as i32));
+    let bottom =
+        a.1.saturating_add(a.3 as i32)
+            .max(b.1.saturating_add(b.3 as i32));
+    (
+        left,
+        top,
+        (right - left).max(1) as u32,
+        (bottom - top).max(1) as u32,
+    )
+}
+
 /// Captures the virtual-screen region `(x, y, w, h)` in physical pixels.
 /// Out-of-screen areas are filled with `fill` (straight BGRA). Returns `None`
 /// when no device context is available (locked/secure desktop) so the caller
@@ -394,5 +420,50 @@ mod tests {
         };
         desaturate(&mut flat, 0.0);
         assert_eq!(flat.pixels, vec![10, 200, 30, 255]);
+    }
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    /// Whether `outer` fully contains the screen rect `inner`.
+    fn contains(outer: (i32, i32, u32, u32), inner: (i32, i32, u32, u32)) -> bool {
+        inner.0 >= outer.0
+            && inner.1 >= outer.1
+            && inner.0 + inner.2 as i32 <= outer.0 + outer.2 as i32
+            && inner.1 + inner.3 as i32 <= outer.1 + outer.3 as i32
+    }
+
+    #[test]
+    fn cover_holds_both_rects() {
+        let current = (700, 0, 140, 36);
+        let target = (600, 0, 340, 210);
+        let cover = cover_rect(current, target);
+        assert!(
+            contains(cover, current),
+            "{cover:?} must hold the current rect"
+        );
+        assert!(
+            contains(cover, target),
+            "{cover:?} must hold the target rect"
+        );
+    }
+
+    #[test]
+    fn a_growing_surface_is_covered_even_when_it_grows_upwards() {
+        // A floating island with a y offset moves its top edge up as it grows,
+        // so the cover has to start above both.
+        let current = (700, 120, 140, 36);
+        let target = (690, 80, 340, 180);
+        let cover = cover_rect(current, target);
+        assert!(cover.1 <= target.1);
+        assert!(contains(cover, target));
+    }
+
+    #[test]
+    fn identical_rects_collapse_to_themselves() {
+        let rect = (10, 20, 30, 40);
+        assert_eq!(cover_rect(rect, rect), rect);
     }
 }

@@ -11,7 +11,8 @@ use windows::Win32::UI::Shell::{
     ABE_BOTTOM, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA, SHAppBarMessage,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW, ShowWindow,
+    FindWindowW, GetSystemMetrics, IsWindowVisible, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOW,
+    ShowWindow,
 };
 use windows::core::w;
 
@@ -175,11 +176,41 @@ pub fn hide_taskbar() {
     TASKBAR_HIDDEN.store(true, Ordering::SeqCst);
 }
 
-/// Restores the native Windows taskbar windows if they were hidden.
-pub fn restore_taskbar() {
-    if !TASKBAR_HIDDEN.swap(false, Ordering::SeqCst) {
-        return;
+/// Re-asserts the hidden taskbar if something else showed it again.
+///
+/// Explorer puts its taskbar back whenever it restarts, re-creates the
+/// taskbar, or reacts to a settings/display change. There is no notification
+/// we can register for on every Windows build, so the replacement mode
+/// re-checks on a slow timer instead: two window lookups every few seconds
+/// cost nothing and survive shell restarts the user did not ask for.
+pub fn ensure_taskbar_hidden() {
+    for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
+        if let Ok(hwnd) = unsafe { FindWindowW(class, None) } {
+            if !hwnd.is_invalid() && unsafe { IsWindowVisible(hwnd).as_bool() } {
+                let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            }
+        }
     }
+    TASKBAR_HIDDEN.store(true, Ordering::SeqCst);
+}
+
+/// Restores the native taskbar windows, but only when this process is the one
+/// that hid them. A user who keeps the taskbar on auto-hide never sees it
+/// forced open by a clean exit.
+pub fn restore_taskbar() {
+    if TASKBAR_HIDDEN.swap(false, Ordering::SeqCst) {
+        show_taskbar_windows();
+    }
+}
+
+/// Restores the taskbar unconditionally. Used by the watchdog process, which
+/// never hid the taskbar itself and therefore has no local flag to consult.
+pub fn restore_taskbar_force() {
+    TASKBAR_HIDDEN.store(false, Ordering::SeqCst);
+    show_taskbar_windows();
+}
+
+fn show_taskbar_windows() {
     if let Ok(main_tray) = unsafe { FindWindowW(w!("Shell_TrayWnd"), None) } {
         if !main_tray.is_invalid() {
             let _ = unsafe { ShowWindow(main_tray, SW_SHOW) };

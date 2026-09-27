@@ -21,6 +21,7 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 - **Dynamic Content-Based Sizing** — no rigid fixed widths; compact mode automatically scales to hug active content (scaling smoothly as multiple agent sessions or live media sessions activate).
 - **Media Player Card** — expanded mode features 64×64 rounded album art, track/artist typography, a bottom-aligned transport row with evenly spaced previous/play-pause/next controls, and a centered 4-bar equalizer. No timeline is shown because playback-position data is not available.
 - **Transient alert ownership** — fresh `needs_input`/`turn_failed` events and Windows toasts use a bounded queue. A user-action agent alert can temporarily preempt a passive toast; the toast resumes with a fresh visible lifetime. Repeated stable event IDs update rather than multiply banners. Each banner owns 3.5 s (agent) or 6 s (toast) only while it is actually in front. Clicking anywhere dismisses it immediately.
+- **Live timeout countdown** — a visible banner's remaining life drains on its own repaint tick (16 ms) instead of riding the bar's two-second metrics refresh, so the hairline reads as a timer rather than a stutter. The tick stops the frame a banner leaves the screen, so a pending-but-hidden alert costs nothing; the countdown repaints only the card, keeping the bar's cached side zones.
 - **Windows toast forwarding** (`forward_toasts`, default on) — app notifications from Action Center ride the island as transient alert banners (app name plus the first text lines, 6 s). Needs notification-listener access (Settings → Privacy → Notifications); without it the watcher exits silently. Local-only: nothing leaves the machine. Pre-existing toasts never flood on startup — only new arrivals fire.
 - **Motion signatures** — motion stays purposeful: thinking dots bounce, Ready gets a brief 600 ms sparkle burst, failure shakes damped over 300 ms, and needs-input breathes. The animated face carries the working state without an additional orbit competing around it. Procedural motion follows the overlay monitor’s vertical blank through a dedicated DXGI clock. Idle frames do not continuously redraw, and reduced motion disables procedural effects.
 - **Triple-spring morphs** — expands bounce (`animation_ms`), collapses settle critically damped and quicker (`collapse_ms`), alert banners drop in fast (`alert_ms`). Three unseen alerts may wait behind the visible alert without consuming their timeout early.
@@ -71,6 +72,71 @@ The bar keeps a fixed strip height while the focused Termielle popup opens
 below or above it. This is a persistent Waybar-style surface, not a macOS menu
 bar clone. The popup is a focused detail view; it does not duplicate the
 system telemetry already present in the bar.
+
+### Control panel
+
+The pill carries a small sliders glyph at its right end, ahead of the pill's
+own open/close hit. That glyph opens the popup on the **control panel** body:
+the one surface where Termielle owns state end to end.
+
+- **Volume row** — the speaker mutes, the `−` and `+` steppers move the level
+  in steps of 5, and the wheel over the track adjusts it exactly like the
+  bar's speaker. The steppers emit an absolute level rather than a delta, so
+  the row can never drift from the target it shows.
+- **Termielle rows** — `Expand on hover`, `Termielle face`, and `Media` are
+  switches over Termielle's own config. They route through the *same*
+  mutation the tray menu uses (`apply_setting` in `main.rs`), so the panel and
+  the tray's checkmarks can never disagree about the same setting.
+- **System tray** — one row that opens Windows' own quick-settings flyout
+  (`Win+A`). Windows exposes no API for the rest of a Control Center's
+  contents — Wi-Fi, Bluetooth, AirDrop and Focus toggles, brightness, per-app
+  quick settings — so the panel delegates instead of faking them.
+
+The panel is a deliberate body, never a takeover: media, agent activity, and
+the task switcher keep their priority when they arrive, and closing the popup
+drops the panel with it, so the next open shows the card the user came for.
+
+
+### Taskbar replacement mode
+
+`bar.replace_taskbar` turns the bar into a taskbar replacement: the native
+taskbar is hidden, the desktop work area is reserved through the AppBar API,
+and the bar gains the affordances the shell used to own.
+
+**Replaced.** Five shell controls on the left, each sized to its label and
+each with its own hit target: **Start**, **Find** (search), **Task View**, the
+**system tray** overflow, and **Show Desktop**. Live application buttons for
+visible, non-cloaked windows sit next to them and activate the window. The
+clock module opens the shell clock flyout. Start, Find, Task View, the tray,
+and Show Desktop are the chords the taskbar itself uses (`Win`, `Win+S`,
+`Win+Tab`, `Win+A`, `Win+D`); the clock is the `ms-clock:` flyout. `shell:`
+namespace URIs are deliberately avoided — they open File Explorer windows
+instead of the surface the user asked for.
+
+**Not replaced — Windows shell surfaces Termielle does not reimplement.** The
+Start menu's own pin list, jump lists, and per-app "recent" entries; taskbar
+thumbnails and window previews on hover; right-click context menus on taskbar
+buttons (jump lists, pinned-app verbs, workspace rename, cascade windows);
+dragging windows onto or between desktops; the notification-area icons
+themselves — the control opens the shell's own overflow panel rather than
+drawing the icons; per-monitor secondary taskbars beyond the one bar this
+process draws; taskbar auto-hide and peek behavior; and live badge counts on
+taskbar buttons. Virtual desktops are addressed by number, because the shell
+does not expose desktop names to a bar process.
+
+**Layout rules.** The left zone is anchored to the same place in both modes,
+so nothing existing moves when replacement is turned on. Content is laid out
+from that anchor and dropped, in reverse priority, when the center pill runs
+out of room: window title first, then workspaces, then application buttons,
+and the shell controls last to go. Anything dropped is not painted and gets
+no hit target — a narrow bar never leaves an invisible live control under the
+pill, and never silently shifts the pill or the right zone.
+
+**Lifecycle.** Turning the flag on hides the taskbar, turns it off hands it
+back, and a one-shot watchdog process restores it if the overlay dies without
+running its own teardown. Explorer re-shows the taskbar on its own after a
+shell restart, and offers no notification that can be registered for on every
+Windows build, so a 2 s tick re-asserts the hidden state.
 
 Use the tray to switch layouts, themes, widget visibility, and hover behavior.
 The menu marks the active layout, theme, position, and widget state. Classic,
@@ -249,6 +315,16 @@ motion → layered Win32 present`.
   monitor/DPI selection, and `UpdateLayeredWindow`/color-key presentation.
 - `bar/appbar.rs` reserves work area through the Windows AppBar API and restores
   the native taskbar on graceful, restart, panic, and early-failure paths.
+- Taskbar replacement (`bar.replace_taskbar`) has a single owner:
+  `sync_taskbar_mode` hides the taskbar while the bar owns it, hands it back
+  the moment the mode ends, and starts a one-shot watchdog process. The
+  watchdog restores the taskbar if the overlay dies without running its own
+  teardown; every teardown path (`leave_bar_shell`, the panic hook, `Drop`)
+  restores it in-process. Explorer re-shows the taskbar on its own after a
+  shell restart or taskbar re-creation and offers no notification this app can
+  rely on, so a 2 s tick re-asserts the hidden state. The in-process restore is
+  gated on "we hid it", so an auto-hide taskbar is never forced open by a clean
+  exit.
 - Bar modules are declared in one typed registry with explicit zone ownership. Left/right strip content is cached as transparent device-resolution layers, and metric damage repaints only the invalidated side while preserving the other side, center content, and hit regions. Full damage still rebuilds the bar for animation, popup, DPI, and layout changes; no user scripts are executed.
 - Bar popup geometry is a separate island surface: a six logical pixel transparent gap and independently rounded card corners keep it visually detached from the persistent strip. The gap is click-through and preserved for both top and bottom bars.
 - The default config path is watched with a debounced, validated reload. Same-layout reloads retarget live springs; a layout cutover resets only surface-specific state.

@@ -844,6 +844,30 @@ impl OverlayWindow {
         self.present_with_anchor(frame, None)
     }
 
+    /// Where a surface of `w` x `h` would land with the current anchoring, in
+    /// physical pixels. The frosted backdrop publishes its capture rect before
+    /// the surface arrives there, so it needs the same anchoring math a
+    /// present would use.
+    pub fn island_dest_for(
+        &mut self,
+        w: u32,
+        h: u32,
+        island: Option<(bool, i32)>,
+    ) -> (i32, i32, u32, u32) {
+        match island {
+            Some((attached, y_offset)) => {
+                let (x, y) = self.island_anchored_position(w as i32, h as i32, attached, y_offset);
+                (x, y, w, h)
+            }
+            None => {
+                let mut rect = RECT::default();
+                let _ = unsafe { GetWindowRect(self.hwnd, &mut rect) };
+                let (x, y) = self.clamped_position(w as i32, h as i32, (rect.left, rect.top));
+                (x, y, w, h)
+            }
+        }
+    }
+
     /// Present with optional island anchoring. When `island` is `Some` the
     /// window is centered at the top edge (notch) or just below it (island)
     /// instead of clamping to the work area.

@@ -32,11 +32,22 @@ use windows::Win32::Foundation::{
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, OpenProcess, PROCESS_ACCESS_RIGHTS, WaitForSingleObject,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
+
 use windows::core::{BOOL, PCWSTR};
+
+/// `SYNCHRONIZE` from winnt.h (0x00100000). The `windows` crate does not bind
+/// the constant, and the watchdog needs nothing else from the process.
+const PROCESS_SYNCHRONIZE_ACCESS: PROCESS_ACCESS_RIGHTS = PROCESS_ACCESS_RIGHTS(0x0010_0000);
+
+/// `INFINITE` from winbase.h. The `windows` crate does not bind it, and a
+/// watchdog that outlives its parent is exactly the wait that never times out.
+const WAIT_FOREVER: u32 = u32::MAX;
 
 /// All six visual states, in priority order, for the smoke test.
 const ALL_STATES: [VisualState; 6] = [
@@ -62,6 +73,8 @@ struct Cli {
     layout: Option<IslandLayout>,
     bar_pos: Option<BarPosition>,
     replace_taskbar: Option<bool>,
+    restore_taskbar: bool,
+    watchdog_parent_pid: Option<u32>,
 }
 
 impl Cli {
@@ -76,6 +89,8 @@ impl Cli {
         let mut bar_pos = None;
         let mut config_path = None;
         let mut replace_taskbar = None;
+        let mut restore_taskbar = false;
+        let mut watchdog_parent_pid = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -89,6 +104,10 @@ impl Cli {
                         Some("color-key") | Some("color_key") => Some(RenderMode::ColorKey),
                         _ => None,
                     };
+                }
+                "--restore-taskbar" => restore_taskbar = true,
+                "--watchdog-parent-pid" => {
+                    watchdog_parent_pid = iter.next().and_then(|value| value.parse().ok());
                 }
                 "--bar" => layout = Some(IslandLayout::Bar),
                 "--island" => layout = Some(IslandLayout::Island),
@@ -126,6 +145,8 @@ impl Cli {
             layout,
             bar_pos,
             replace_taskbar,
+            restore_taskbar,
+            watchdog_parent_pid,
         }
     }
 }
@@ -159,6 +180,10 @@ fn main() {
     }));
 
     let cli = Cli::parse();
+    if cli.restore_taskbar {
+        run_taskbar_watchdog(cli.watchdog_parent_pid);
+        return;
+    }
 
     // One-time move of user state from the pre-0.2 location.
     migrate_legacy_data();
@@ -230,6 +255,7 @@ fn main() {
                 return;
             }
         };
+    sync_taskbar_mode(&config.island);
     let wake = window.wake_handle();
     if !cli.smoke_test && cli.pipe == DEFAULT_PIPE_NAME {
         // Only the production overlay gets the tray icon: diagnostics runs on
@@ -272,9 +298,6 @@ fn main() {
     if config.island.is_bar() {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
         controller.set_bar_width(logical_w);
-        if config.island.bar.replace_taskbar {
-            termielle_app::bar::appbar::hide_taskbar();
-        }
         if config.island.bar.reserve_space {
             let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
             // SHAppBarMessage takes device pixels; the config height is logical.
@@ -331,7 +354,8 @@ fn main() {
     let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
         config.island.is_enabled(),
         config.island.has_widget("music"),
-        config.island.has_widget("tasks") && config.island.show_tasks,
+        (config.island.has_widget("tasks") && config.island.show_tasks)
+            || (config.island.is_bar() && config.island.bar.replace_taskbar),
     ));
     let (thumb_sender, thumb_receiver) = channel();
     let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
@@ -396,6 +420,73 @@ fn main() {
         }
     }
 }
+
+/// Starts the helper that hands the taskbar back if this process dies without
+/// getting to its own teardown. Spawned at most once per process: a config
+/// reload that re-enters replacement mode must not pile up watchers, and a
+/// restart gets a fresh process (and therefore a fresh watchdog) anyway.
+fn spawn_taskbar_watchdog() {
+    static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let pid = std::process::id().to_string();
+    let _ = Command::new(exe)
+        .args(["--restore-taskbar", "--watchdog-parent-pid"])
+        .arg(pid)
+        .spawn();
+}
+
+fn run_taskbar_watchdog(parent_pid: Option<u32>) {
+    if let Some(pid) = parent_pid {
+        wait_for_process_exit(pid);
+        // Give a replacement instance time to claim the taskbar before the
+        // watchdog restores it.
+        std::thread::sleep(Duration::from_millis(1_200));
+    }
+    termielle_app::bar::appbar::restore_taskbar_force();
+}
+
+/// Blocks until `pid` exits without polling.
+///
+/// `WaitForSingleObject` on a `SYNCHRONIZE` handle parks the watchdog in the
+/// kernel, so it costs nothing while the overlay runs. A parent that cannot be
+/// opened with that right falls back to the process snapshot, which keeps its
+/// conservative "assume alive" behavior.
+fn wait_for_process_exit(pid: u32) {
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE_ACCESS, false, pid) }) else {
+        while process_alive(pid) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return;
+    };
+    // SAFETY: `handle` is a process-owned kernel handle valid for this call.
+    unsafe {
+        let _ = WaitForSingleObject(handle, WAIT_FOREVER);
+        let _ = CloseHandle(handle);
+    }
+}
+
+/// Applies the taskbar replacement mode of `config`: hide the native taskbar
+/// while the bar owns it, hand it back the moment it does not, and keep a
+/// watchdog alive for as long as we are the ones holding it.
+fn sync_taskbar_mode(config: &termielle_core::IslandConfig) {
+    if config.is_bar() && config.bar.replace_taskbar {
+        termielle_app::bar::appbar::hide_taskbar();
+        spawn_taskbar_watchdog();
+    } else {
+        termielle_app::bar::appbar::restore_taskbar();
+    }
+}
+
+/// Cadence for re-asserting taskbar replacement. Explorer can re-show the
+/// taskbar on its own (shell restart, taskbar re-creation, settings change)
+/// and offers no notification we can rely on everywhere, so the overlay
+/// re-checks on this slow tick. Two window lookups per interval.
+const TASKBAR_REASSERT_MS: u64 = 2_000;
 
 /// The overlay's data directory: `%USERPROFILE%\.termielle`, the same
 /// dot-directory convention as `~/.claude`. All user-facing state lives
@@ -605,14 +696,9 @@ fn reload_config(
 
     if was_bar && !next_bar {
         termielle_app::bar::appbar::leave_bar_shell();
-    } else if !was_bar && next_bar {
-        if !config.island.bar.follow_active_monitor {
-            window.pin_primary_monitor();
-            controller.set_dpi_scale(window.anchor_dpi_scale());
-        }
-        if config.island.bar.replace_taskbar {
-            termielle_app::bar::appbar::hide_taskbar();
-        }
+    } else if !was_bar && next_bar && !config.island.bar.follow_active_monitor {
+        window.pin_primary_monitor();
+        controller.set_dpi_scale(window.anchor_dpi_scale());
     }
     if next_bar {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
@@ -634,6 +720,7 @@ fn reload_config(
     window.set_island(config.island.is_enabled());
     window.set_bar(config.island.is_bar());
     window.set_glass(&config.island.glass);
+    sync_taskbar_mode(&config.island);
     thumb_cfg.enabled.store(
         config.island.is_enabled(),
         std::sync::atomic::Ordering::Relaxed,
@@ -643,7 +730,8 @@ fn reload_config(
         std::sync::atomic::Ordering::Relaxed,
     );
     thumb_cfg.poll_tasks.store(
-        config.island.has_widget("tasks") && config.island.show_tasks,
+        (config.island.has_widget("tasks") && config.island.show_tasks)
+            || (config.island.is_bar() && config.island.bar.replace_taskbar),
         std::sync::atomic::Ordering::Relaxed,
     );
     true
@@ -927,6 +1015,101 @@ fn spawn_pipe_thread(
     });
 }
 
+/// The rect the glass should capture for this frame, in physical pixels.
+///
+/// The frosted material samples a captured image, and a sample outside that
+/// image falls back to a flat tint. A surface that is mid-morph is therefore
+/// flat in the area it is growing into unless the capture covers its whole
+/// travel. The bar's popup envelope is permanent; an island only needs the
+/// envelope while it can still be heading somewhere, so a settled pill keeps
+/// its small rect. Pure, so that invariant is testable.
+fn backdrop_request_rect(
+    current: (i32, i32, u32, u32),
+    target: Option<(i32, i32, u32, u32)>,
+    is_bar: bool,
+    bar_height: u32,
+    bar_bottom: bool,
+) -> (i32, i32, u32, u32) {
+    let (x, y, w, h) = current;
+    if is_bar {
+        // The bar's popup is always one click away: capture the full envelope
+        // up front so the blur kernel and screen origin stay fixed through
+        // every morph.
+        let envelope = bar_height.saturating_add(320).max(h);
+        let y = if bar_bottom {
+            y - envelope.saturating_sub(h) as i32
+        } else {
+            y
+        };
+        return (x, y, w, h.max(envelope));
+    }
+    match target {
+        Some(target) => termielle_app::backdrop::cover_rect(current, target),
+        None => current,
+    }
+}
+
+/// The mutation half of one of Termielle's own setting toggles: no I/O, no
+/// window, no controller. Both the tray menu and the control panel end up
+/// here, so the field a toggle flips is the same field the other surface
+/// reads. Returns false for events that are not setting toggles.
+fn apply_setting(event: &WindowEvent, island: &mut termielle_core::IslandConfig) -> bool {
+    match *event {
+        WindowEvent::ToggleMusic => {
+            if island.has_widget("music") {
+                island.widgets.retain(|w| w != "music");
+            } else {
+                island.widgets.push("music".to_string());
+            }
+            true
+        }
+        WindowEvent::ToggleHoverExpand => {
+            island.expand_on_hover = !island.expand_on_hover;
+            true
+        }
+        WindowEvent::ToggleFace => {
+            if island.has_widget("face") {
+                island.widgets.retain(|w| w != "face");
+            } else {
+                island.widgets.push("face".to_string());
+            }
+            island.clamp();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Applies a setting toggle end to end: mutate the single config owner,
+/// persist it, and mirror it into the controller.
+fn apply_settings_event(
+    event: WindowEvent,
+    config: &mut AppConfig,
+    controller: &mut Controller,
+    thumb_cfg: &Arc<termielle_app::tasks::WorkerConfig>,
+) -> Option<ControllerActions> {
+    if !apply_setting(&event, &mut config.island) {
+        return None;
+    }
+    if matches!(event, WindowEvent::ToggleMusic) {
+        thumb_cfg.poll_media.store(
+            config.island.has_widget("music"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let _ = save_config_atomic(
+        &data_dir()
+            .map(|d| d.join("config.json"))
+            .unwrap_or_else(|| PathBuf::from("config.json")),
+        config,
+    );
+    controller.set_island_config(config.island.clone(), now_ms());
+    Some(ControllerActions {
+        present_frame: true,
+        ..Default::default()
+    })
+}
+
 /// Presents the controller's current frame, retrying once and then falling
 /// back to the procedural still, logging one bounded record per failure. Each
 /// successful present is recorded in the acknowledgement file, if any.
@@ -977,19 +1160,33 @@ fn present_current(
     // Publish the glass capture request: the rect the pill was just drawn
     // at. The worker owns the (potentially slow) capture and blur.
     if let Some(request) = backdrop_request {
-        let (x, mut y, w, mut h) = window.last_dest();
+        let (x, y, w, h) = window.last_dest();
         if w > 1 {
             let cfg = controller.island_config();
-            if cfg.is_bar() {
-                // Capture the complete expansion envelope up front. The bar's
-                // blur kernel and screen origin then stay fixed through a morph.
-                let envelope =
-                    ((cfg.bar.height + 320) as f32 * controller.render_scale()).ceil() as u32;
-                if cfg.bar.position == termielle_core::BarPosition::Bottom {
-                    y -= envelope.saturating_sub(h) as i32;
-                }
-                h = envelope.max(h);
-            }
+            // The glass samples a captured image; a sample outside it falls
+            // back to a flat tint. So the capture has to cover where the
+            // surface is going, not only the rect that was just drawn, or the
+            // glass goes flat in exactly the area a growing surface is
+            // filling. `target` is None when the surface has settled, which
+            // keeps a resting pill's capture small.
+            let target = if controller.surface_can_grow() {
+                let (tw, th) = controller.max_surface_size();
+                let scale = controller.render_scale();
+                Some(window.island_dest_for(
+                    (tw as f32 * scale).ceil() as u32,
+                    (th as f32 * scale).ceil() as u32,
+                    anchor,
+                ))
+            } else {
+                None
+            };
+            let (x, y, w, h) = backdrop_request_rect(
+                (x, y, w, h),
+                target,
+                cfg.is_bar(),
+                cfg.bar.height,
+                cfg.bar.position == termielle_core::BarPosition::Bottom,
+            );
             *request.lock().unwrap() = Some(termielle_app::tasks::BackdropRequest {
                 x,
                 y,
@@ -1259,10 +1456,17 @@ fn run_gui(
     } else {
         None
     };
+    let mut next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);
     loop {
         // Only the display clock advances animation. Unrelated window/worker
         // messages must not bypass vertical-blank pacing.
         bar_service.configure(&config.island);
+        if now_ms() >= next_taskbar_reassert {
+            next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);
+            if config.island.is_bar() && config.island.bar.replace_taskbar {
+                termielle_app::bar::appbar::ensure_taskbar_hidden();
+            }
+        }
         if let Some(snapshot) = bar_service.take_snapshot() {
             if controller.set_bar_metrics(snapshot, now_ms()) {
                 present_current(
@@ -1385,9 +1589,6 @@ fn run_gui(
                     let logical_w =
                         (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
                     controller.set_bar_width(logical_w);
-                    if config.island.bar.replace_taskbar {
-                        termielle_app::bar::appbar::hide_taskbar();
-                    }
                     if config.island.bar.reserve_space {
                         let is_top = config.island.bar.position == termielle_core::BarPosition::Top;
                         let height_px = (config.island.bar.height as f32
@@ -1412,6 +1613,7 @@ fn run_gui(
                 window.set_island(config.island.is_enabled());
                 window.set_bar(config.island.is_bar());
                 window.set_glass(&config.island.glass);
+                sync_taskbar_mode(&config.island);
                 thumb_cfg.enabled.store(
                     config.island.is_enabled(),
                     std::sync::atomic::Ordering::Relaxed,
@@ -1421,7 +1623,8 @@ fn run_gui(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 thumb_cfg.poll_tasks.store(
-                    config.island.has_widget("tasks") && config.island.show_tasks,
+                    (config.island.has_widget("tasks") && config.island.show_tasks)
+                        || (config.island.is_bar() && config.island.bar.replace_taskbar),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 ControllerActions {
@@ -1474,7 +1677,9 @@ fn run_gui(
                 }
             }
             WindowEvent::ScrollAt(x, y, delta) => {
-                if delta != 0 && controller.volume_at(x, y) {
+                // The panel's volume row answers the wheel exactly like the
+                // bar's speaker, through the same worker command.
+                if delta != 0 && (controller.volume_at(x, y) || controller.panel_volume_at(x, y)) {
                     bar_service.send(termielle_app::bar::metrics::Command::VolumeWheel(delta));
                 }
                 ControllerActions::default()
@@ -1518,6 +1723,34 @@ fn run_gui(
                     bar_service.send(termielle_app::bar::metrics::Command::ToggleMute);
                     ControllerActions::default()
                 }
+                termielle_app::app::ClickOutcome::VolumeSet(level) => {
+                    bar_service.send(termielle_app::bar::metrics::Command::SetVolume(level));
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::PanelToggled => ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                },
+                termielle_app::app::ClickOutcome::PanelToggle(setting) => {
+                    // The panel sends the same commands the tray menu sends,
+                    // so one owner (this config) serves both surfaces and the
+                    // menu's checkmarks can never disagree with the panel.
+                    let event = match setting {
+                        termielle_app::app::PanelToggle::HoverExpand => {
+                            WindowEvent::ToggleHoverExpand
+                        }
+                        termielle_app::app::PanelToggle::Face => WindowEvent::ToggleFace,
+                        termielle_app::app::PanelToggle::Music => WindowEvent::ToggleMusic,
+                    };
+                    apply_settings_event(event, config, controller, thumb_cfg).unwrap_or_default()
+                }
+                termielle_app::app::ClickOutcome::Shell(action) => {
+                    termielle_app::bar::shell::activate(action);
+                    ControllerActions::default()
+                }
                 termielle_app::app::ClickOutcome::AlertDismiss
                 | termielle_app::app::ClickOutcome::Expanded
                 | termielle_app::app::ClickOutcome::Collapsed => ControllerActions {
@@ -1540,60 +1773,18 @@ fn run_gui(
                     ..Default::default()
                 }
             }
-            WindowEvent::ToggleMusic => {
-                if config.island.has_widget("music") {
-                    config.island.widgets.retain(|w| w != "music");
-                } else {
-                    config.island.widgets.push("music".to_string());
-                }
-                thumb_cfg.poll_media.store(
-                    config.island.has_widget("music"),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
+            WindowEvent::ToggleMusic | WindowEvent::ToggleHoverExpand | WindowEvent::ToggleFace => {
+                apply_settings_event(
+                    match event {
+                        WindowEvent::ToggleMusic => WindowEvent::ToggleMusic,
+                        WindowEvent::ToggleHoverExpand => WindowEvent::ToggleHoverExpand,
+                        _ => WindowEvent::ToggleFace,
+                    },
                     config,
-                );
-                controller.set_island_config(config.island.clone(), now_ms());
-                ControllerActions {
-                    present_frame: true,
-                    ..Default::default()
-                }
-            }
-            WindowEvent::ToggleHoverExpand => {
-                config.island.expand_on_hover = !config.island.expand_on_hover;
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
-                controller.set_island_config(config.island.clone(), now_ms());
-                ControllerActions {
-                    present_frame: true,
-                    ..Default::default()
-                }
-            }
-            WindowEvent::ToggleFace => {
-                if config.island.has_widget("face") {
-                    config.island.widgets.retain(|w| w != "face");
-                } else {
-                    config.island.widgets.push("face".to_string());
-                }
-                config.island.clamp();
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
-                controller.set_island_config(config.island.clone(), now_ms());
-                ControllerActions {
-                    present_frame: true,
-                    ..Default::default()
-                }
+                    controller,
+                    thumb_cfg,
+                )
+                .unwrap_or_default()
             }
             WindowEvent::SystemThemeChanged => {
                 // The Windows light/dark setting flipped: re-resolve `auto`
@@ -1785,5 +1976,101 @@ fn config_error_code(error: &termielle_core::ConfigError) -> i32 {
     match error {
         termielle_core::ConfigError::Malformed(_) => 1,
         termielle_core::ConfigError::Io(error) => error.raw_os_error().unwrap_or(2),
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use termielle_app::app::PanelToggle;
+
+    /// The panel's rows and the tray menu are two surfaces over one config.
+    /// Each toggle must flip exactly the field the tray menu renders, so the
+    /// two can never show different states for the same setting.
+    /// The glass samples a captured image, and anything outside it falls back
+    /// to a flat tint. A surface mid-morph must therefore be covered for its
+    /// whole travel, or the area it is growing into shows flat colour.
+    #[test]
+    fn backdrop_capture_covers_a_morphing_surface() {
+        let current = (700, 0, 140, 36);
+        let target = (600, 0, 340, 210);
+        let (x, y, w, h) = backdrop_request_rect(current, Some(target), false, 0, false);
+        for (rect, label) in [(current, "current"), (target, "target")] {
+            assert!(
+                rect.0 >= x
+                    && rect.1 >= y
+                    && rect.0 + rect.2 as i32 <= x + w as i32
+                    && rect.1 + rect.3 as i32 <= y + h as i32,
+                "the capture must hold the {label} rect: {:?} vs {rect:?}",
+                (x, y, w, h)
+            );
+        }
+    }
+
+    #[test]
+    fn a_settled_island_keeps_its_small_capture() {
+        let current = (700, 0, 140, 36);
+        assert_eq!(
+            backdrop_request_rect(current, None, false, 0, false),
+            current,
+            "a resting pill must not pay for an envelope it cannot reach"
+        );
+    }
+
+    #[test]
+    fn the_bar_keeps_its_popup_envelope_always() {
+        let strip = (0, 0, 1920, 36);
+        let (x, y, w, h) = backdrop_request_rect(strip, None, true, 36, false);
+        assert_eq!((x, y, w), (0, 0, 1920));
+        assert!(
+            h >= 36 + 320,
+            "the bar's popup needs room inside the capture"
+        );
+
+        // A bottom bar's strip sits at the screen's bottom edge, so its
+        // envelope grows upward and must not push the strip off-screen.
+        let bottom_strip = (0, 1044, 1920, 36);
+        let (_, y, _, h) = backdrop_request_rect(bottom_strip, None, true, 36, true);
+        assert_eq!(y + h as i32, bottom_strip.1 + bottom_strip.3 as i32);
+        assert!(y < bottom_strip.1, "the envelope grows upward");
+    }
+
+    #[test]
+    fn panel_toggles_flip_the_fields_the_tray_menu_renders() {
+        for (setting, event) in [
+            (PanelToggle::HoverExpand, WindowEvent::ToggleHoverExpand),
+            (PanelToggle::Face, WindowEvent::ToggleFace),
+            (PanelToggle::Music, WindowEvent::ToggleMusic),
+        ] {
+            let mut island = termielle_core::IslandConfig::default();
+            let before = termielle_app::tray::MenuState::from_island(&island);
+            assert!(apply_setting(&event, &mut island), "{setting:?} must apply");
+            let after = termielle_app::tray::MenuState::from_island(&island);
+            match setting {
+                PanelToggle::HoverExpand => assert_ne!(before.hover, after.hover),
+                PanelToggle::Face => assert_ne!(before.face, after.face),
+                PanelToggle::Music => assert_ne!(before.music, after.music),
+            }
+            // A second application lands back where it started, so the
+            // panel row and the menu item are both true toggles.
+            assert!(apply_setting(&event, &mut island));
+            let round_trip = termielle_app::tray::MenuState::from_island(&island);
+            match setting {
+                PanelToggle::HoverExpand => assert_eq!(round_trip.hover, before.hover),
+                PanelToggle::Face => assert_eq!(round_trip.face, before.face),
+                PanelToggle::Music => assert_eq!(round_trip.music, before.music),
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_events_are_not_setting_toggles() {
+        let island = termielle_core::IslandConfig::default();
+        let mut untouched = island.clone();
+        assert!(
+            !apply_setting(&WindowEvent::SystemThemeChanged, &mut untouched),
+            "only setting toggles may mutate config here"
+        );
+        assert_eq!(untouched.expand_on_hover, island.expand_on_hover);
     }
 }

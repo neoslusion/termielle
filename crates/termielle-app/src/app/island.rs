@@ -32,6 +32,10 @@ impl Controller {
         if self.island.is_bar() {
             return self.render_bar(state, width, height, now_ms);
         }
+        // Every fresh frame re-derives banner visibility: the countdown tick
+        // must stop the moment a collapse or cutover leaves no banner on
+        // screen, even though that frame never reaches `render_content`.
+        self.alert_visible = false;
 
         use crate::animation::notch::Presentation;
 
@@ -181,6 +185,35 @@ impl Controller {
     /// paused session. Playback animation still uses [`Self::media_playing`].
     pub(crate) fn media_available(&self) -> bool {
         self.island.has_widget("music") && self.media.is_some()
+    }
+
+    /// The largest size this surface can reach from here, in logical pixels.
+    /// The frosted backdrop captures a rect up front rather than a rect per
+    /// frame, so it needs to know how far the surface can travel.
+    pub fn max_surface_size(&self) -> (u32, u32) {
+        let (mut w, mut h) = self.target_size(self.state);
+        // An alert banner is the tallest thing the island can show, and it can
+        // arrive while the surface is mid-morph.
+        w = w.max(self.island.expanded_width.max(320));
+        h = h.max(210u32).max(self.island.height);
+        (w, h)
+    }
+
+    /// Whether the surface can still be heading somewhere: mid-morph, held
+    /// open, or about to grow because an activity or alert showed up. A
+    /// settled compact pill has no reason to capture a larger backdrop.
+    pub fn surface_can_grow(&self) -> bool {
+        if self.island.is_bar() {
+            // The bar popup is always one click away, so it keeps its
+            // envelope permanently, exactly like the strip's own.
+            return true;
+        }
+        self.spring.is_some()
+            || self.manually_expanded
+            || self.hover_expanded
+            || !self.alerts.is_empty()
+            || self.media_available()
+            || !self.tasks.is_empty()
     }
 
     /// Target (width, height) for the current visual and presentation state.
@@ -556,6 +589,23 @@ impl Controller {
         })
     }
 
+    /// Whether the pointer is over the panel's volume row. The row answers
+    /// the wheel exactly like the bar's speaker, so the same
+    /// `Command::VolumeWheel` path serves both.
+    pub fn panel_volume_at(&self, x: i32, y: i32) -> bool {
+        if !self.panel_open {
+            return false;
+        }
+        let (x, y) = (self.to_logical(x), self.to_logical(y));
+        self.icon_hits.iter().any(|&(id, hx, hy, hw, hh)| {
+            id == crate::app::types::HIT_PANEL_VOLUME_TRACK
+                && x >= hx
+                && x < hx + hw as i32
+                && y >= hy
+                && y < hy + hh as i32
+        })
+    }
+
     pub fn refresh_bar_metrics(&mut self, now_ms: u64) {
         if self.island.is_bar() {
             self.bar_deadline = Some(now_ms);
@@ -609,9 +659,49 @@ impl Controller {
                 }
                 HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
                 HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
+                id if crate::bar::shell::ShellAction::from_hit(id).is_some() => {
+                    return ClickOutcome::Shell(
+                        crate::bar::shell::ShellAction::from_hit(id)
+                            .unwrap_or(crate::bar::shell::ShellAction::Start),
+                    );
+                }
                 crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
+                crate::app::types::HIT_CARD_PANEL => {
+                    // The glyph only exists while the popup is closed, so
+                    // this always means "open, showing the panel".
+                    self.panel_open = true;
+                    if self.toggle_expand(now_ms) {
+                        self.morph_to_target(now_ms);
+                        return ClickOutcome::PanelToggled;
+                    }
+                    return ClickOutcome::None;
+                }
+                crate::app::types::HIT_PANEL_VOLUME_DOWN
+                | crate::app::types::HIT_PANEL_VOLUME_UP => {
+                    let (level, _) = self.panel_volume();
+                    let step = if id == crate::app::types::HIT_PANEL_VOLUME_DOWN {
+                        -(crate::app::types::PANEL_VOLUME_STEP as i32)
+                    } else {
+                        crate::app::types::PANEL_VOLUME_STEP as i32
+                    };
+                    return ClickOutcome::VolumeSet((i32::from(level) + step).clamp(0, 100) as u8);
+                }
+                id if id <= crate::app::types::HIT_PANEL_TOGGLE_BASE
+                    && id > crate::app::types::HIT_PANEL_TOGGLE_BASE - 8 =>
+                {
+                    let offset = crate::app::types::HIT_PANEL_TOGGLE_BASE - id;
+                    let setting = match offset {
+                        0 => crate::app::types::PanelToggle::HoverExpand,
+                        1 => crate::app::types::PanelToggle::Face,
+                        _ => crate::app::types::PanelToggle::Music,
+                    };
+                    return ClickOutcome::PanelToggle(setting);
+                }
                 crate::bar::HIT_BAR_TERMIELLE_MODULE => {
                     if self.collapse_if_expanded(now_ms) {
+                        // Closing the popup drops the panel with it, so the
+                        // next open shows the card the user came for.
+                        self.panel_open = false;
                         return ClickOutcome::Collapsed;
                     } else if self.toggle_expand(now_ms) {
                         return ClickOutcome::Expanded;

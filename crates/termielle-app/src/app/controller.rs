@@ -1,6 +1,8 @@
 //! [`Controller`]: the session-reducer fold, the classic animation path, event/timer entry points.
 
+use super::bar::modules::BarDamage;
 use super::bar::types::{BarMetricsCache, BarZoneCache};
+use super::types::ALERT_COUNTDOWN_TICK_MS;
 use super::types::ALERT_FRESHNESS_MS;
 use super::types::AlertBanner;
 use super::types::BAR_REFRESH_MS;
@@ -69,6 +71,11 @@ pub struct Controller {
     pub(crate) manually_expanded: bool,
     /// Set while the cursor hovers the island (when `expand_on_hover`).
     pub(crate) hover_expanded: bool,
+    /// Which body the bar popup is showing: `None` is the default card (media,
+    /// activity, switcher, dashboard by priority), `Some` is the control
+    /// panel. The panel is a deliberate choice, so it never steals the card
+    /// from an activity: the pill's own click closes it first.
+    pub(crate) panel_open: bool,
     pub(crate) hover_deadline: Option<(bool, u64)>,
     pub(crate) hover_suppressed: bool,
     /// Pre-decoded termielle face frames (downscaled to [`FACE_SIZE`]) plus
@@ -94,6 +101,12 @@ pub struct Controller {
     /// Cursor position in frame coordinates (from the hover poll), so the
     /// icon under the cursor draws its accent border.
     pub(crate) hover_point: Option<(i32, i32)>,
+    /// Whether the last painted frame showed a notification banner. The
+    /// timeout countdown only ticks while this holds, so a pending alert
+    /// that is not on screen costs nothing.
+    pub(crate) alert_visible: bool,
+    /// Next timeout-countdown repaint while a banner is visible.
+    pub(crate) alert_deadline: Option<u64>,
     /// Cached frosted-glass layer keyed by (w, h, radius, attached). The
     /// single-pass paint is ~1ms; caching makes face ticks ~free.
     /// Cached frosted-glass layer keyed by (w, h, radius, attached, black,
@@ -196,6 +209,7 @@ impl Controller {
             separation: None,
             pressed: false,
             manually_expanded: false,
+            panel_open: false,
             hover_expanded: false,
             hover_deadline: None,
             hover_suppressed: false,
@@ -206,6 +220,8 @@ impl Controller {
             face_deadline: None,
             face_frame,
             icon_hits: Vec::new(),
+            alert_visible: false,
+            alert_deadline: None,
             hover_point: None,
             media: None,
             tasks: Vec::new(),
@@ -275,6 +291,12 @@ impl Controller {
         let target = self.target_size(self.state);
         if target != from {
             self.morph_to_target(now_ms);
+            return true;
+        }
+        if tasks_changed && self.island.is_bar() && self.island.bar.replace_taskbar {
+            self.bar_left_cache = None;
+            self.current =
+                self.render_bar_with_damage(self.state, from.0, from.1, now_ms, BarDamage::LEFT);
             return true;
         }
         if !self.dashboard_expanded() && !self.media_available() {
@@ -438,6 +460,14 @@ impl Controller {
     }
 
     /// Feeds the measured cost of the last present back into frame pacing.
+    /// Opens the control panel body. The pill's glyph is the user-facing
+    /// door; this is the same door for the review harness and for a host that
+    /// wants to show the panel directly.
+    pub fn open_control_panel(&mut self, now_ms: u64) -> bool {
+        self.panel_open = true;
+        self.morph_to_target(now_ms)
+    }
+
     pub fn set_present_cost(&mut self, elapsed_ms: u64) {
         self.present_cost_ms = (self.present_cost_ms + elapsed_ms) / 2;
     }
@@ -525,6 +555,25 @@ impl Controller {
             }
             self.morph_to_target(now_ms);
             actions.present_frame = true;
+        }
+
+        // Timeout countdown tick: the visible banner's hairline has to
+        // advance every frame, otherwise the remaining life reads as a
+        // stutter. Only runs while a banner is on screen; the bar's 2 s
+        // metrics refresh is far too coarse to carry it.
+        if self.alert_visible
+            && self
+                .alerts
+                .front()
+                .is_some_and(|alert| alert.expires_at_ms.is_some())
+        {
+            if self.alert_deadline.is_none_or(|due| now_ms >= due) {
+                self.repaint_alert_countdown(now_ms);
+                actions.present_frame = true;
+            }
+            self.alert_deadline = Some(now_ms.saturating_add(ALERT_COUNTDOWN_TICK_MS));
+        } else {
+            self.alert_deadline = None;
         }
 
         // Spring morph tick: integrate (width, height, radius) toward the
@@ -664,6 +713,18 @@ impl Controller {
         actions
     }
 
+    /// Repaints only what a running timeout changes: the card carrying the
+    /// hairline. The bar's side zones keep their cached layers, so a live
+    /// countdown costs a card redraw rather than a full bar rebuild.
+    fn repaint_alert_countdown(&mut self, now_ms: u64) {
+        let (width, height) = self.current_logical_size();
+        self.current = if self.island.is_bar() {
+            self.render_bar_with_damage(self.state, width, height, now_ms, BarDamage::CENTER)
+        } else {
+            self.render_island(self.state, width, height, now_ms)
+        };
+    }
+
     /// Whether any procedural motion is live: thinking bounce, worker orbit,
     /// input pulse, celebration/shake one-shots, or a playing equalizer.
     /// Gated on island mode and full motion — reduced motion stills
@@ -700,6 +761,9 @@ impl Controller {
         };
         if let Some(expires_at) = self.alerts.front().and_then(|alert| alert.expires_at_ms) {
             deadline = Some(deadline.map_or(expires_at, |at| at.min(expires_at)));
+        }
+        if let Some(countdown_at) = self.alert_deadline {
+            deadline = Some(deadline.map_or(countdown_at, |at| at.min(countdown_at)));
         }
         if let Some(transition) = &self.content_transition {
             let ends_at = transition.started_ms.saturating_add(transition.duration_ms);

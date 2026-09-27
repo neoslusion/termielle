@@ -3,6 +3,7 @@
 use super::super::controller::Controller;
 use super::modules::BarDamage;
 use super::types::BAR_POPUP_GAP;
+use super::types::BAR_ZONE_GAP;
 use super::types::{BarCard, BarMetricsCache, BarZoneCache};
 use crate::animation::FrameBuffer;
 use crate::window::scaled_size;
@@ -72,6 +73,10 @@ struct ZonePaint {
     bar_x: i32,
     pill_off: i32,
     pill_h: u32,
+    /// Exclusive right edge the left zone may paint into. The center pill and
+    /// the right zone own everything past it, so left-zone content stops
+    /// here instead of being clipped away after the fact.
+    left_limit: i32,
     key: (u32, u32, f32, u32),
 }
 
@@ -98,6 +103,9 @@ impl Controller {
         now_ms: u64,
         damage: BarDamage,
     ) -> FrameBuffer {
+        // See `render_island`: banner visibility is re-derived per frame so a
+        // collapsed popup cannot keep the countdown tick alive.
+        self.alert_visible = false;
         let bar_h = self.island.bar.height;
         let is_top = self.island.bar.position == termielle_core::BarPosition::Top;
         let bar_y = if is_top {
@@ -160,6 +168,8 @@ impl Controller {
             .clone()
             .unwrap_or_else(BarMetricsCache::empty);
 
+        let left_end = pill_cx.max(0) as u32;
+        let right_start = (pill_cx + pill_w as i32).max(0) as u32;
         let zone = ZonePaint {
             metrics,
             width,
@@ -167,6 +177,7 @@ impl Controller {
             bar_x,
             pill_off,
             pill_h,
+            left_limit: left_end.saturating_sub(BAR_ZONE_GAP) as i32,
             key,
         };
         let metric_refresh = !damage.contains(BarDamage::CENTER);
@@ -191,8 +202,6 @@ impl Controller {
             .map(|(id, x, y, w, h)| (*id, *x, *y + bar_y, *w, *h))
             .collect();
 
-        let left_end = pill_cx.max(0) as u32;
-        let right_start = (pill_cx + pill_w as i32).max(0) as u32;
         if can_partial {
             let mut frame = self.current.clone();
             if damage.contains(BarDamage::LEFT) {
@@ -258,10 +267,10 @@ impl Controller {
         let hits = self.paint_bar_left(
             &mut frame,
             &zone.metrics,
-            crate::system::accent_color_bgra(),
             zone.bar_x,
             zone.pill_off,
             zone.pill_h,
+            zone.left_limit,
         );
         BarZoneCache {
             key: zone.key,

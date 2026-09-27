@@ -46,6 +46,9 @@ pub enum Command {
     VolumeWheel(i16),
     ToggleMute,
     Workspace(usize),
+    /// Set an absolute level. The panel's steppers send this instead of a
+    /// delta, so the target matches the level the user last saw.
+    SetVolume(u8),
 }
 
 pub struct Service {
@@ -82,7 +85,9 @@ impl Service {
                     if has(&config.bar.modules_right, "battery") {
                         fresh.battery = crate::system::battery_status();
                     }
-                    if has(&config.bar.modules_right, "volume") {
+                    // The control panel shows a level whether or not the
+                    // bar lists a volume module, so bar mode always polls it.
+                    if has(&config.bar.modules_right, "volume") || config.is_bar() {
                         if let Ok(volume) = super::volume::try_query_volume() {
                             fresh.volume = volume;
                         }
@@ -128,6 +133,11 @@ impl Service {
                         Command::ToggleMute => {
                             if let Err(error) = super::volume::toggle_mute() {
                                 eprintln!("volume toggle failed: {error}");
+                            }
+                        }
+                        Command::SetVolume(level) => {
+                            if let Err(error) = super::volume::set_volume(level) {
+                                eprintln!("volume set failed: {error}");
                             }
                         }
                         Command::Workspace(index) => {

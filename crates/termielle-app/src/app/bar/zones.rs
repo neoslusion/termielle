@@ -14,21 +14,85 @@ impl Controller {
         &self,
         frame: &mut FrameBuffer,
         metrics: &BarMetricsCache,
-        _accent: [u8; 4],
         bar_x: i32,
         pill_y: i32,
         pill_h: u32,
+        left_limit: i32,
     ) -> Vec<BarHit> {
         let mut hits = Vec::new();
         // 2. Modules Left: Workspaces + Window Title
         let mut cur_x = bar_x + 12;
         let (primary, secondary) = crate::animation::notch::ink_pair(&self.island.glass);
+        // Everything the left zone paints is laid out from the same anchor and
+        // dropped, lowest priority first, when the center pill runs out of
+        // room. Hidden controls must not keep hit targets either.
+        let room = |x: i32, w: u32| x + w as i32 <= left_limit;
+
+        if self.island.is_bar() && self.island.bar.replace_taskbar {
+            use crate::bar::shell::ShellAction;
+            for action in ShellAction::ALL {
+                let control_w = action.control_width();
+                if !room(cur_x, control_w) {
+                    break;
+                }
+                crate::animation::notch::draw_rounded_rect(
+                    frame,
+                    cur_x,
+                    pill_y,
+                    control_w,
+                    pill_h,
+                    8,
+                    // A scrim, not a highlight: the bar is translucent, so a
+                    // light wash would fight the 10 px label instead of
+                    // helping it read over whatever is behind the strip.
+                    [0, 0, 0, 56],
+                    [255, 255, 255, 32],
+                );
+                crate::animation::notch::draw_text_in_rect(
+                    frame,
+                    action.label_of(),
+                    (cur_x, pill_y, control_w, pill_h),
+                    10,
+                    false,
+                    primary,
+                    true,
+                );
+                hits.push((action.hit_id(), cur_x, pill_y, control_w, pill_h));
+                cur_x += control_w as i32 + 4;
+            }
+            cur_x += 6;
+
+            // Native replacement mode keeps real application buttons in the
+            // bar. The worker already filters to visible, non-cloaked windows.
+            let icon = (pill_h.saturating_sub(8)).min(24);
+            for task in self.tasks.iter().take(4) {
+                if !room(cur_x, icon) {
+                    break;
+                }
+                crate::animation::notch::blit_rounded_pixels(
+                    frame,
+                    &task.pixels_pbgra,
+                    task.width,
+                    task.height,
+                    cur_x + 2,
+                    pill_y + (pill_h as i32 - icon as i32) / 2,
+                    icon,
+                    icon,
+                    6,
+                );
+                hits.push((task.hwnd, cur_x, pill_y, icon, pill_h));
+                cur_x += icon as i32 + 6;
+            }
+        }
 
         if self.bar_module("left", "workspaces") {
             // Workspaces
             let ws = metrics.workspaces;
             let ws_w = 28u32;
             for i in 1..=ws.total.min(10) {
+                if !room(cur_x, ws_w) {
+                    break;
+                }
                 let active = i == ws.active;
                 let (bg, border, text_col) = if active {
                     (
@@ -45,7 +109,10 @@ impl Controller {
                     pill_y,
                     ws_w,
                     pill_h,
-                    pill_h / 2,
+                    // Half the narrower side, so the number's chip keeps the
+                    // stadium shape the row uses instead of relying on the
+                    // draw helper to clamp a bar-tall radius for us.
+                    ws_w.min(pill_h) / 2,
                     bg,
                     border,
                 );
@@ -86,6 +153,16 @@ impl Controller {
             // `HOST: session` title keeps its distinctive tail.
             let truncated = ellipsize_middle(&display_text, 36);
             let title_w = (truncated.chars().count() as u32 * 8 + 24).clamp(60, 260);
+            // Nothing legible fits: the title yields to the fixed zones.
+            let title_w = if room(cur_x, title_w) {
+                title_w
+            } else {
+                let available = (left_limit - cur_x).max(0) as u32;
+                if available < 60 { 0 } else { available }
+            };
+            if title_w == 0 {
+                return hits;
+            }
 
             crate::animation::notch::draw_rounded_rect(
                 frame,
@@ -136,41 +213,75 @@ impl Controller {
                 primary,
                 true,
             );
+            hits.push((
+                crate::bar::shell::ShellAction::Clock.hit_id(),
+                right,
+                pill_y,
+                84,
+                pill_h,
+            ));
             right -= 16;
         }
         if self.bar_module("right", "battery") {
             if let Some(percent) = metrics.battery.0 {
-                right -= 72;
+                right -= super::battery::BATTERY_MODULE_W;
                 draw_text_in_rect(
                     frame,
                     &format!("{percent}%"),
-                    (right, pill_y, 38, pill_h),
+                    (right, pill_y, super::battery::BATTERY_TEXT_W, pill_h),
                     12,
                     false,
                     primary,
                     true,
                 );
-                let x = right + 44;
-                let y = pill_y + (pill_h as i32 - 10) / 2;
+                let y = pill_y + (pill_h as i32 - super::battery::BATTERY_H as i32) / 2;
+                let parts = super::battery::battery_geometry(right, y, percent);
                 let color = if percent <= 20 && !metrics.battery.1 {
                     [85, 85, 240, 255]
                 } else {
                     primary
                 };
-                draw_rounded_rect(frame, x, y, 22, 10, 2, [0; 4], color);
-                draw_rounded_rect(frame, x + 23, y + 3, 2, 4, 1, color, [0; 4]);
-                if percent > 0 {
-                    let fill = (18 * u32::from(percent.min(100)) / 100).max(1);
-                    draw_rounded_rect(frame, x + 2, y + 2, fill, 6, 1, color, [0; 4]);
-                }
+                draw_rounded_rect(
+                    frame,
+                    parts.body.0,
+                    parts.body.1,
+                    parts.body.2,
+                    parts.body.3,
+                    2,
+                    [0; 4],
+                    color,
+                );
+                draw_rounded_rect(
+                    frame,
+                    parts.nub.0,
+                    parts.nub.1,
+                    parts.nub.2,
+                    parts.nub.3,
+                    1,
+                    color,
+                    [0; 4],
+                );
+                draw_rounded_rect(
+                    frame,
+                    parts.fill.0,
+                    parts.fill.1,
+                    parts.fill.2,
+                    parts.fill.3,
+                    1,
+                    color,
+                    [0; 4],
+                );
                 if metrics.battery.1 {
+                    // Beside the battery, not inside it: the body is only
+                    // 10 px tall, and a bolt drawn into it clipped the glyph
+                    // and hung a tail below the outline.
                     draw_text_in_rect(
                         frame,
                         "ϟ",
-                        (x + 5, y - 3, 12, 16),
-                        14,
+                        (parts.bolt.0, parts.bolt.1, parts.bolt.2, parts.bolt.3),
+                        9,
                         true,
-                        self.island.glass.tint,
+                        color,
                         true,
                     );
                 }
@@ -318,6 +429,38 @@ impl Controller {
                         false,
                     );
                 }
+
+                // The control-panel glyph lives inside the pill's right end.
+                // It is registered before the pill's whole-surface hit, so
+                // the open/close click keeps every other pixel to itself.
+                let panel_w = 20i32;
+                let panel_x = pill_cx + pill_w as i32 - panel_w - 6;
+                let panel_y = pill_y + (pill_h as i32 - panel_w) / 2;
+                for (row, len) in [9i32, 14, 7].iter().enumerate() {
+                    let line_y = panel_y + 5 + row as i32 * 5;
+                    crate::animation::notch::fill_rect_pub(
+                        compact_frame,
+                        panel_x,
+                        line_y,
+                        *len as u32,
+                        2,
+                        [255, 255, 255, 110],
+                    );
+                    crate::animation::notch::draw_disc(
+                        compact_frame,
+                        panel_x + *len,
+                        line_y,
+                        2,
+                        [255, 255, 255, 190],
+                    );
+                }
+                hits.push((
+                    crate::app::types::HIT_CARD_PANEL,
+                    panel_x - 2,
+                    panel_y,
+                    panel_w as u32 + 4,
+                    panel_w as u32,
+                ));
 
                 // Register hit target for clicking the Dynamic Island pill
                 hits.push((

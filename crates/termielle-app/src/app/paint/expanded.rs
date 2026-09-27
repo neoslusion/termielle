@@ -38,7 +38,11 @@ impl Controller {
         if height >= 85 {
             // Authentic tall card layout dropping vertically downward.
             self.paint_card_header(frame, state, island, &ctx);
-            if self.media_available() && island.has_widget("music") {
+            if self.panel_open {
+                // The panel is a deliberate body: the user asked for it, and
+                // it yields to anything louder that arrives while it is open.
+                self.paint_control_panel(frame, island, &ctx);
+            } else if self.media_available() && island.has_widget("music") {
                 self.paint_media_card(frame, island, &ctx);
             } else if state != VisualState::Idle {
                 self.paint_agent_activity(frame, state, island, &ctx);

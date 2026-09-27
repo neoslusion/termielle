@@ -20,6 +20,10 @@ pub(crate) struct BarZoneCache {
 /// Transparent breathing room between the persistent strip and its popup.
 /// The popup is a separate island surface, not a continuation of the bar.
 pub(crate) const BAR_POPUP_GAP: u32 = 6;
+/// Logical pixels the left zone keeps clear of the center pill. The pill and
+/// the right zone are fixed, so left-side content is laid out up to this
+/// edge rather than painted past it and clipped.
+pub(crate) const BAR_ZONE_GAP: u32 = 8;
 /// Expanded-card geometry for the bar center painter: where the drop-down
 /// card lives plus whether this frame is expanded at all.
 pub(crate) struct BarCard {

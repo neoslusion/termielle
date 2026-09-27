@@ -8,6 +8,9 @@ impl Controller {
         if !self.alerts.is_empty() {
             return 124;
         }
+        if self.panel_open {
+            return crate::app::cards::panel::panel_height();
+        }
         let tasks =
             self.island.has_widget("tasks") && self.island.show_tasks && !self.tasks.is_empty();
         match (self.media_available(), tasks) {

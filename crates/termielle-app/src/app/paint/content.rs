@@ -27,7 +27,10 @@ impl Controller {
         // Each arm is a focused painter below; shared setup (glass, frame
         // size) stays with the callers.
         self.icon_hits.clear();
-        if self.paint_alert_banner(frame, island, width, height, now_ms) {
+        // The countdown tick repaints only while a banner with a live timeout
+        // is actually on screen, so record what this frame showed.
+        self.alert_visible = self.paint_alert_banner(frame, island, width, height, now_ms);
+        if self.alert_visible {
             return;
         }
         match presentation {
