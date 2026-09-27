@@ -51,16 +51,6 @@ impl Controller {
                     face_size as u32,
                     face_size as u32,
                 );
-                if state == VisualState::Working {
-                    // Worker orbit: three dots circle the face while
-                    // tools run.
-                    let (wc, _) = crate::animation::notch::accent_colors(state);
-                    let ocx = face_x + face_size / 2;
-                    for i in 0..3u32 {
-                        let (odx, ody) = Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
-                        crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
-                    }
-                }
             }
             if state != VisualState::Idle || self.reducer.session_count() > 0 {
                 let (dot, _) = crate::animation::notch::accent_colors(state);
@@ -80,16 +70,11 @@ impl Controller {
             let art_size = (height.saturating_sub(12)).min(22) as i32;
             let art_x = media_blob.x + 10;
             if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                crate::animation::notch::blit_rounded(
+                crate::animation::notch::blit_rounded_pixels(
                     frame,
-                    &crate::animation::FrameBuffer {
-                        width: thumb.width,
-                        height: thumb.height,
-                        pixels_pbgra: thumb.pixels_pbgra.clone(),
-                        delay_ms: 0,
-                        loop_index: 0,
-                        scale: 1.0,
-                    },
+                    &thumb.pixels_pbgra,
+                    thumb.width,
+                    thumb.height,
                     art_x,
                     cy - art_size / 2,
                     art_size as u32,
@@ -144,34 +129,21 @@ impl Controller {
                     face_size as u32,
                     face_size as u32,
                 );
-                if state == VisualState::Working {
-                    let (wc, _) = crate::animation::notch::accent_colors(state);
-                    let ocx = face_x + face_size / 2;
-                    for i in 0..3u32 {
-                        let (odx, ody) = Self::orbit_dot(ocx, cy, face_size / 2 + 7, i, now);
-                        crate::animation::notch::draw_disc(frame, odx, ody, 2, wc);
-                    }
-                }
             }
 
             let mut right_cursor = width as i32 - 14;
 
             // Media equalizer, with the album art leading it
-            if self.media_playing() && island.has_widget("music") {
+            if self.media_available() && island.has_widget("music") {
                 let bx = right_cursor - 14;
                 let art_size = (height.saturating_sub(12)).min(22) as i32;
                 let art_x = bx - art_size - 6;
                 if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                    crate::animation::notch::blit_rounded(
+                    crate::animation::notch::blit_rounded_pixels(
                         frame,
-                        &crate::animation::FrameBuffer {
-                            width: thumb.width,
-                            height: thumb.height,
-                            pixels_pbgra: thumb.pixels_pbgra.clone(),
-                            delay_ms: 0,
-                            loop_index: 0,
-                            scale: 1.0,
-                        },
+                        &thumb.pixels_pbgra,
+                        thumb.width,
+                        thumb.height,
                         art_x,
                         cy - art_size / 2,
                         art_size as u32,
@@ -201,7 +173,8 @@ impl Controller {
                         accent,
                     );
                 }
-                self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
+                self.icon_hits
+                    .push((HIT_MEDIA_PLAY_PAUSE, art_x - 2, cy - 10, 44, 20));
                 right_cursor -= 22;
             }
 
@@ -214,8 +187,8 @@ impl Controller {
                     1
                 };
                 for i in 0..count {
-                    right_cursor -= 10;
                     let dy = Self::think_bob(state, i, now);
+                    right_cursor -= 10;
                     crate::animation::notch::draw_disc(
                         frame,
                         right_cursor + 4,
@@ -224,7 +197,7 @@ impl Controller {
                         [dot[0], dot[1], dot[2], dot[3]],
                     );
                 }
-            } else if state == VisualState::Idle && !self.media_playing() {
+            } else if state == VisualState::Idle && !self.media_available() {
                 let text_x = if island.has_widget("face") { 46 } else { 16 };
                 let text_w = width.saturating_sub((text_x as u32) + 18);
                 crate::animation::notch::draw_text(
@@ -235,7 +208,7 @@ impl Controller {
                     text_w,
                     11,
                     true,
-                    [220, 225, 235, 210],
+                    self.ink_dim(),
                 );
                 crate::animation::notch::draw_disc(
                     frame,

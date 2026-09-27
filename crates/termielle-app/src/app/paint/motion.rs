@@ -1,4 +1,4 @@
-//! Motion signatures: shake, think-bob, worker orbit, ready sparkles, morph content-motion.
+//! Motion signatures: shake, think-bob, ready sparkles, and morph content-motion.
 
 use super::super::controller::Controller;
 use crate::animation::spring::Spring2D;
@@ -22,7 +22,16 @@ impl Controller {
         };
         let p = spring.progress();
         let dip = (1.0 - 0.45 * (p * std::f32::consts::PI).sin()).clamp(0.0, 1.0);
-        let alpha = (255.0 * dip).round() as u8;
+        // Gate expanded copy on available space rather than elapsed progress:
+        // interrupted springs and the small press swell must not restart a fade.
+        let opacity = if presentation == Presentation::Expanded {
+            let fit =
+                (spring.x / spring.target_x.max(1.0)).min(spring.y / spring.target_y.max(1.0));
+            crate::animation::notch::smoothstep(0.80, 0.98, fit)
+        } else {
+            dip
+        };
+        let alpha = (255.0 * opacity).round() as u8;
         let dy = match presentation {
             Presentation::Expanded => ((1.0 - p) * 6.0).round() as i32,
             _ => 0,
@@ -46,17 +55,10 @@ impl Controller {
         if state != VisualState::Thinking {
             return 0;
         }
-        (2.0 * ((now_ms as f32 / 240.0) + index as f32 * 2.1).sin()).round() as i32
-    }
-
-    /// Worker orbit position: dots circle the face while tools run.
-    /// Positions only; the caller gates on Working and paints.
-    pub(crate) fn orbit_dot(cx: i32, cy: i32, radius: i32, index: u32, now_ms: u64) -> (i32, i32) {
-        let a = now_ms as f32 / 600.0 * std::f32::consts::TAU + index as f32 * 2.094;
-        (
-            cx + (radius as f32 * a.cos()).round() as i32,
-            cy + (radius as f32 * a.sin()).round() as i32,
-        )
+        // Epoch milliseconds lose minutes of precision in f32. Reduce the
+        // phase in f64 before handing a small angle to the rasterizer.
+        let phase = (now_ms as f64 / 240.0).rem_euclid(std::f64::consts::TAU) as f32;
+        (2.0 * (phase + index as f32 * 2.1).sin()).round() as i32
     }
 
     /// Celebration sparkle after a turn completes: one of 8 dots flying out
@@ -89,6 +91,34 @@ fn think_bob_bounces_only_while_thinking() {
 }
 
 #[test]
+fn thinking_motion_advances_at_real_epoch_timestamps() {
+    let epoch = 1_790_000_000_000;
+    let positions: Vec<_> = (0..60)
+        .map(|frame| Controller::think_bob(VisualState::Thinking, 0, epoch + frame * 16))
+        .collect();
+    assert!(positions.iter().any(|position| *position != positions[0]));
+}
+
+#[test]
+fn expanded_copy_waits_for_space_but_press_feedback_keeps_it_visible() {
+    use crate::animation::notch::Presentation;
+    let params = termielle_core::spring_params(350, 0.18);
+    let mut spring = Spring2D::new(72, 36, 18.0, 320, 154, 24.0, params);
+    let opacity = |s: &Spring2D| {
+        Controller::content_motion(Some(s), Presentation::Expanded, VisualState::Working, 0).0
+    };
+    assert_eq!(opacity(&spring), 0);
+    spring.x = 300.0;
+    spring.y = 145.0;
+    assert!(opacity(&spring) > 0 && opacity(&spring) < 255);
+    spring.x = 320.0;
+    spring.y = 154.0;
+    assert_eq!(opacity(&spring), 255);
+    let pressed = Spring2D::new(320, 154, 24.0, 330, 159, 25.0, params);
+    assert!(opacity(&pressed) > 240);
+}
+
+#[test]
 fn shake_fires_briefly_then_locks_to_zero() {
     use termielle_core::VisualState;
     assert_eq!(Controller::shake_dx(VisualState::Failed, 0), 0);
@@ -106,16 +136,4 @@ fn sparkle_flies_out_then_vanishes() {
     assert!(mid.2 < start.2, "alpha must fade with age");
     assert_eq!(Controller::sparkle_dot(100, 100, 0, 600), None);
     assert_eq!(Controller::sparkle_dot(100, 100, 0, 5000), None);
-}
-
-#[test]
-fn orbit_circles_with_time() {
-    let a = Controller::orbit_dot(50, 50, 10, 0, 0);
-    let b = Controller::orbit_dot(50, 50, 10, 0, 150);
-    assert_ne!(a, b);
-    for t in [0, 100, 250, 599] {
-        let (x, y) = Controller::orbit_dot(50, 50, 10, 1, t);
-        let d = (((x - 50) * (x - 50) + (y - 50) * (y - 50)) as f32).sqrt();
-        assert!((d - 10.0).abs() <= 1.5, "off circle: {d}");
-    }
 }

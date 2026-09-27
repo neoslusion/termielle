@@ -9,6 +9,9 @@ event protocol, transport, and emitter are platform-neutral and covered by a
 Linux CI job. The events are small and content-free: no prompts or terminal
 output are ever captured.
 
+The bar is a native Windows surface inspired by Waybar's information layout;
+Termielle does not run Waybar, parse Waybar JSON/CSS, or use GTK/Wayland.
+
 Any other agent CLI works too: the emitter's `--source` accepts any short
 lowercase identifier and its session extraction recognizes every common
 identifier key, so wiring up a new agent is pure configuration, following the
@@ -23,24 +26,23 @@ boot races, plus restarts on failure), and wires up whichever agent
 integrations are present:
 
 ```powershell
-irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
+pwsh -NoProfile -Command "irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex"
 ```
 
 The installer is safe to re-run: it upgrades the binaries in place and
-refreshes only the Termielle-owned configuration. Before it first modifies a
-user config it saves the original once to
-`%LOCALAPPDATA%\Termielle\backups`, every write is atomic and validated, and
-what it installed is recorded in `installed.json`.
+refreshes only the Termielle-owned configuration. Before its first config
+change it saves the original once to `%LOCALAPPDATA%\Termielle\backups`;
+every write is atomic and validated. Ownership flags carry across upgrades.
 
 ```powershell
-pwsh -File scripts\uninstall.ps1          # reverse the install
-pwsh -File scripts\uninstall.ps1 -RemoveData   # also delete ~/.termielle
+pwsh -File "$env:LOCALAPPDATA\Termielle\bin\uninstall.ps1"
+pwsh -File "$env:LOCALAPPDATA\Termielle\bin\uninstall.ps1" -RemoveData
 ```
 
-Uninstall restores the pre-install configs from the backups (or removes only
-the Termielle-owned entries when no backup exists), stops the overlay,
-unregisters the task, and removes the PATH entry — whatever the install
-record says was done, and nothing else.
+Uninstall surgically removes Termielle-owned entries so newer user edits
+survive, falling back to the first-run backup only if surgical cleanup fails.
+It stops the overlay, restores the taskbar, removes only resources recorded as
+Termielle-owned, and optionally deletes `~\.termielle`.
 
 Manual install: unpack the `termielle-windows-x64.zip` release asset into
 `%LOCALAPPDATA%\Termielle\bin`, add that directory to `PATH`, and run
@@ -132,12 +134,19 @@ asset is missing or undecodable.
 
 ## Rendering and tray
 
+The default surface is a Waybar-style persistent system bar with a compact
+Termielle module. The module is click-only: clicking it opens a focused popup
+for agent and media detail; hovering never changes the bar height. Workspace
+buttons and the speaker are controls; CPU, memory, battery, clock, and the
+window title are passive status modules.
+
 The overlay composites its layered window with per-pixel alpha via
 `UpdateLayeredWindow` by default. `--render color-key` (or
 `{"render": "color_key"}` in the config file) falls back to GDI color-keying
-for display drivers whose layered DIB redirection renders black. The tray icon
-shows the current face and offers `Restart` and `Exit`; `Exit` terminates with
-code 0 so the external watchdog does not relaunch it.
+for display drivers whose layered DIB redirection renders black. The tray menu
+switches layout, theme, position, and widget state; it marks the active choices
+and offers `Restart` and `Exit`. `Exit` terminates with code 0 so the external
+watchdog does not relaunch it.
 
 Animation playback is paced by a dedicated clock thread (not `WM_TIMER`, whose
 message-queue latency cannot hold a 16 ms cadence), with the measured present

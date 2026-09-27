@@ -8,6 +8,7 @@ pub struct SystemStats {
     pub time: String,        // "14:30"
     pub battery: Option<u8>, // 0-100
     pub battery_charging: bool,
+    pub battery_on_ac: bool,
     pub mem_percent: u8, // 0-100
     pub mem_used_gb: f32,
     pub mem_total_gb: f32,
@@ -29,19 +30,20 @@ pub fn current_time_text() -> String {
     format!("{:02}:{:02}", st.wHour, st.wMinute)
 }
 
-pub fn battery_status() -> (Option<u8>, bool) {
+pub fn battery_status() -> (Option<u8>, bool, bool) {
     unsafe {
-        let mut s = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
-        if windows::Win32::System::Power::GetSystemPowerStatus(&mut s).is_ok() {
-            let pct = if s.BatteryLifePercent == 255 {
+        let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
+        if windows::Win32::System::Power::GetSystemPowerStatus(&mut status).is_ok() {
+            let level = if status.BatteryLifePercent == 255 {
                 None
             } else {
-                Some(s.BatteryLifePercent)
+                Some(status.BatteryLifePercent)
             };
-            let charging = (s.BatteryFlag & 8) != 0 || s.ACLineStatus == 1;
-            (pct, charging)
+            let charging = level.is_some() && (status.BatteryFlag & 8) != 0;
+            let on_ac = level.is_some() && status.ACLineStatus == 1;
+            (level, charging, on_ac)
         } else {
-            (None, false)
+            (None, false, false)
         }
     }
 }
@@ -285,12 +287,13 @@ pub fn auto_theme_name() -> &'static str {
 }
 
 pub fn collect() -> SystemStats {
-    let (bat, charging) = battery_status();
+    let (battery, battery_charging, battery_on_ac) = battery_status();
     let (mem_pct, mem_used, mem_total) = memory_info();
     SystemStats {
         time: current_time_text(),
-        battery: bat,
-        battery_charging: charging,
+        battery,
+        battery_charging,
+        battery_on_ac,
         mem_percent: mem_pct,
         mem_used_gb: mem_used,
         mem_total_gb: mem_total,

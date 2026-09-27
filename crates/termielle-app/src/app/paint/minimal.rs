@@ -19,20 +19,15 @@ impl Controller {
         let now = now_ms;
         // A paused equalizer holds its pose instead of performing playback.
         let eq_now = if self.media_playing() { now } else { 0 };
-        if self.media_playing() && island.has_widget("music") {
+        if self.media_available() && island.has_widget("music") {
             let art_size = (height.saturating_sub(12)).min(22) as i32;
             let art_x = (width as i32 / 2) - 22;
             if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                crate::animation::notch::blit_rounded(
+                crate::animation::notch::blit_rounded_pixels(
                     frame,
-                    &crate::animation::FrameBuffer {
-                        width: thumb.width,
-                        height: thumb.height,
-                        pixels_pbgra: thumb.pixels_pbgra.clone(),
-                        delay_ms: 0,
-                        loop_index: 0,
-                        scale: 1.0,
-                    },
+                    &thumb.pixels_pbgra,
+                    thumb.width,
+                    thumb.height,
                     art_x,
                     cy - art_size / 2,
                     art_size as u32,
@@ -63,9 +58,12 @@ impl Controller {
                     accent,
                 );
             }
-            self.icon_hits.push((0, art_x - 2, cy - 10, 44, 20));
+            self.icon_hits
+                .push((crate::app::HIT_MEDIA_PLAY_PAUSE, art_x - 2, cy - 10, 44, 20));
         } else if island.has_widget("face") {
-            let face_size = (height.saturating_sub(8)).min(32) as i32;
+            // Keep the standalone pet visually lighter than the island shell;
+            // logical pixels are multiplied by monitor DPI during rasterization.
+            let face_size = (height.saturating_sub(16)).min(24) as i32;
             crate::animation::notch::blit_scaled(
                 frame,
                 &self.face_frame,

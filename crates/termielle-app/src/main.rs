@@ -8,6 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -47,33 +48,6 @@ const ALL_STATES: [VisualState; 6] = [
     VisualState::Failed,
 ];
 
-/// Raises the process-wide timer resolution to 1 ms for the process lifetime.
-/// The animation cadence is 20-40 ms per frame; the default 15.6 ms system
-/// timer makes such short deadlines fire irregularly (a 20 ms frame can land
-/// at 31 ms), which reads as shutter. `timeBeginPeriod(1)` removes that
-/// jitter for as long as the overlay lives.
-struct PreciseTimer;
-
-impl PreciseTimer {
-    fn enable() -> Self {
-        // SAFETY: the call has no pointers and cannot fail; the matching
-        // `timeEndPeriod` runs when the guard drops.
-        unsafe {
-            let _ = windows::Win32::Media::timeBeginPeriod(1);
-        }
-        Self
-    }
-}
-
-impl Drop for PreciseTimer {
-    fn drop(&mut self) {
-        // SAFETY: balances the matching `timeBeginPeriod` from `enable`.
-        unsafe {
-            let _ = windows::Win32::Media::timeEndPeriod(1);
-        }
-    }
-}
-
 /// How long the smoke test waits for its in-process pipe event.
 const SMOKE_TIMEOUT_MS: u32 = 5_000;
 
@@ -84,6 +58,7 @@ struct Cli {
     pipe: String,
     ack_file: Option<PathBuf>,
     render: Option<RenderMode>,
+    config_path: Option<PathBuf>,
     layout: Option<IslandLayout>,
     bar_pos: Option<BarPosition>,
     replace_taskbar: Option<bool>,
@@ -99,6 +74,7 @@ impl Cli {
         let mut render = None;
         let mut layout = None;
         let mut bar_pos = None;
+        let mut config_path = None;
         let mut replace_taskbar = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
@@ -106,6 +82,7 @@ impl Cli {
                 "--smoke-test" => smoke_test = true,
                 "--pipe" => pipe = iter.next().unwrap_or_else(|| DEFAULT_PIPE_NAME.to_string()),
                 "--ack-file" => ack_file = iter.next().map(PathBuf::from),
+                "--config" => config_path = iter.next().map(PathBuf::from),
                 "--render" => {
                     render = match iter.next().as_deref() {
                         Some("per-pixel") | Some("per_pixel") => Some(RenderMode::PerPixel),
@@ -145,6 +122,7 @@ impl Cli {
             pipe,
             ack_file,
             render,
+            config_path,
             layout,
             bar_pos,
             replace_taskbar,
@@ -153,9 +131,9 @@ impl Cli {
 }
 
 fn main() {
-    // The frame timer needs millisecond precision; enable it before any
-    // timing path runs, including the smoke test.
-    let _precise_timer = PreciseTimer::enable();
+    if let Some(directory) = data_dir() {
+        let _ = std::fs::create_dir_all(directory);
+    }
 
     // GUI-subsystem panics vanish silently; route them to a file so a hover
     // crash is diagnosable instead of looking like "it disappeared".
@@ -210,7 +188,7 @@ fn main() {
 
     let log = Arc::new(Mutex::new(BoundedLog::new(log_path(), 1_048_576, 3)));
 
-    let mut config = load_config_with_log(&log);
+    let mut config = load_config_with_log(&log, cli.config_path.as_deref());
 
     // The command line wins over the persisted file:
     if let Some(render) = cli.render {
@@ -290,7 +268,7 @@ fn main() {
     } else {
         let _ = window.update_active_monitor();
     }
-    controller.set_dpi_scale(window.dpi_scale());
+    controller.set_dpi_scale(window.anchor_dpi_scale());
     if config.island.is_bar() {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
         controller.set_bar_width(logical_w);
@@ -320,40 +298,24 @@ fn main() {
         None
     };
 
-    // Rebuild the pre-restart state from the journal before any live event can
-    // arrive. The fold is absolute-time driven, so a restart that happened
-    // after the ready-hold or busy-stall expired replays straight into Idle,
-    // and a restart mid-turn picks up exactly where the crash left off.
+    // Claim the endpoint before replay. A short retry absorbs the previous
+    // process's pipe handle during an in-process tray restart.
+    let Some(server) = bind_server_with_retry(&cli.pipe, &log) else {
+        termielle_app::bar::appbar::leave_bar_shell();
+        return;
+    };
+
+    let (sender, receiver) = channel();
+    spawn_pipe_thread(server, wake, sender, log.clone());
+
+    // Rebuild pre-restart state after the endpoint is live. Newly emitted
+    // events queue behind replay and are folded in arrival order. Absolute-time
+    // deadlines still make expired holds/stalls replay straight into Idle.
     if let Some(journal) = &journal {
         for event in journal.read_all() {
             controller.handle_event(event, now_ms());
         }
     }
-
-    // Claim the pipe on the main thread so a name squatter is rejected at
-    // startup, then hand the server to the pipe thread.
-    let server = match EventServer::bind(&cli.pipe) {
-        Ok(server) => server,
-        Err(IpcError::PipeNameOwned) => {
-            log_error(&log, LogComponent::Ipc, LogEvent::InvalidEvent, 3);
-            // Bar shell state was claimed before the pipe; leave it behind.
-            termielle_app::bar::appbar::leave_bar_shell();
-            return;
-        }
-        Err(error) => {
-            log_error(
-                &log,
-                LogComponent::Ipc,
-                LogEvent::InvalidEvent,
-                ipc_error_code(&error),
-            );
-            termielle_app::bar::appbar::leave_bar_shell();
-            return;
-        }
-    };
-
-    let (sender, receiver) = channel();
-    spawn_pipe_thread(server, wake, sender, log.clone());
 
     if cli.smoke_test {
         let builtin_event = cli.pipe == DEFAULT_PIPE_NAME;
@@ -368,6 +330,7 @@ fn main() {
     // exits when its receiver is dropped at shutdown.
     let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
         config.island.is_enabled(),
+        config.island.has_widget("music"),
         config.island.has_widget("tasks") && config.island.show_tasks,
     ));
     let (thumb_sender, thumb_receiver) = channel();
@@ -398,6 +361,11 @@ fn main() {
                 None
             }
         });
+    let config_watcher = if cli.config_path.is_none() {
+        data_dir().map(|dir| ConfigWatcher::spawn(dir.join("config.json"), wake))
+    } else {
+        None
+    };
 
     present_current(
         &mut window,
@@ -416,6 +384,7 @@ fn main() {
         &log,
         &mut ack,
         journal.as_ref(),
+        config_watcher.as_ref(),
         &mut config,
     );
     drop(instance);
@@ -512,10 +481,80 @@ fn asset_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Watches the user config and posts a debounced wake after the file settles.
+/// Validation happens on the GUI thread; the watcher never applies config.
+struct ConfigWatcher {
+    path: PathBuf,
+    receiver: Receiver<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl ConfigWatcher {
+    fn spawn(path: PathBuf, wake: WakeHandle) -> Self {
+        let (sender, receiver) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread_path = path.clone();
+        std::thread::spawn(move || {
+            let mut last = config_signature(&thread_path);
+            while !thread_stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(200));
+                let current = config_signature(&thread_path);
+                if current == last {
+                    continue;
+                }
+                // Editors commonly write in several steps. Wait for a quiet
+                // window so a half-written JSON document is never applied.
+                std::thread::sleep(Duration::from_millis(400));
+                let settled = config_signature(&thread_path);
+                if settled == current {
+                    last = settled;
+                    if sender.send(()).is_err() || wake.post().is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            path,
+            receiver,
+            stop,
+        }
+    }
+
+    fn take_pending(&self) -> bool {
+        let mut pending = false;
+        while self.receiver.try_recv().is_ok() {
+            pending = true;
+        }
+        pending
+    }
+}
+
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+fn config_signature(path: &Path) -> Option<(u64, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((modified, metadata.len()))
+}
+
 /// Reads the config, falling back to defaults and one bounded record when the
 /// file cannot be used.
-fn load_config_with_log(log: &Arc<Mutex<BoundedLog>>) -> AppConfig {
-    let Some(path) = data_dir().map(|dir| dir.join("config.json")) else {
+fn load_config_with_log(log: &Arc<Mutex<BoundedLog>>, override_path: Option<&Path>) -> AppConfig {
+    let path = override_path
+        .map(Path::to_path_buf)
+        .or_else(|| data_dir().map(|dir| dir.join("config.json")));
+    let Some(path) = path else {
         return AppConfig::default();
     };
     match load_config(&path) {
@@ -530,6 +569,101 @@ fn load_config_with_log(log: &Arc<Mutex<BoundedLog>>) -> AppConfig {
             AppConfig::default()
         }
     }
+}
+
+/// Applies a validated config file on the GUI thread. A bad or partially
+/// written file leaves the running surface untouched.
+fn reload_config(
+    path: &Path,
+    config: &mut AppConfig,
+    controller: &mut Controller,
+    window: &mut OverlayWindow,
+    thumb_cfg: &Arc<termielle_app::tasks::WorkerConfig>,
+    log: &Arc<Mutex<BoundedLog>>,
+) -> bool {
+    let mut next = match load_config(path) {
+        Ok(next) => next,
+        Err(error) => {
+            log_error(
+                log,
+                LogComponent::Config,
+                LogEvent::ReadFailed,
+                config_error_code(&error),
+            );
+            return false;
+        }
+    };
+    next.island.clamp();
+    theme::resolve_theme(&mut next.island);
+    if next.island == config.island {
+        return false;
+    }
+
+    let was_bar = config.island.is_bar();
+    let next_bar = next.island.is_bar();
+    config.island = next.island;
+
+    if was_bar && !next_bar {
+        termielle_app::bar::appbar::leave_bar_shell();
+    } else if !was_bar && next_bar {
+        if !config.island.bar.follow_active_monitor {
+            window.pin_primary_monitor();
+            controller.set_dpi_scale(window.anchor_dpi_scale());
+        }
+        if config.island.bar.replace_taskbar {
+            termielle_app::bar::appbar::hide_taskbar();
+        }
+    }
+    if next_bar {
+        let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
+        controller.set_bar_width(logical_w);
+        if config.island.bar.reserve_space {
+            let is_top = config.island.bar.position == BarPosition::Top;
+            let height_px =
+                (config.island.bar.height as f32 * controller.render_scale()).round() as u32;
+            termielle_app::bar::appbar::ensure_appbar(
+                window.hwnd(),
+                is_top,
+                height_px,
+                window.monitor_bounds(),
+            );
+        }
+    }
+
+    controller.set_island_config(config.island.clone(), now_ms());
+    window.set_island(config.island.is_enabled());
+    window.set_bar(config.island.is_bar());
+    window.set_glass(&config.island.glass);
+    thumb_cfg.enabled.store(
+        config.island.is_enabled(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    thumb_cfg.poll_media.store(
+        config.island.has_widget("music"),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    thumb_cfg.poll_tasks.store(
+        config.island.has_widget("tasks") && config.island.show_tasks,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    true
+}
+
+fn drain_config_reload(
+    watcher: Option<&ConfigWatcher>,
+    config: &mut AppConfig,
+    controller: &mut Controller,
+    window: &mut OverlayWindow,
+    thumb_cfg: &Arc<termielle_app::tasks::WorkerConfig>,
+    log: &Arc<Mutex<BoundedLog>>,
+) -> bool {
+    let Some(watcher) = watcher else {
+        return false;
+    };
+    if !watcher.take_pending() {
+        return false;
+    }
+    reload_config(&watcher.path, config, controller, window, thumb_cfg, log)
 }
 
 /// Whether the user's reduced-motion preference turns off GIF animation.
@@ -727,6 +861,32 @@ impl AckWriter {
     }
 }
 
+/// Binds the event endpoint, briefly retrying a just-exiting restart owner.
+fn bind_server_with_retry(pipe: &str, log: &Arc<Mutex<BoundedLog>>) -> Option<EventServer> {
+    for attempt in 0..8 {
+        match EventServer::bind(pipe) {
+            Ok(server) => return Some(server),
+            Err(IpcError::PipeNameOwned) if attempt < 7 => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(IpcError::PipeNameOwned) => {
+                log_error(log, LogComponent::Ipc, LogEvent::InvalidEvent, 3);
+                return None;
+            }
+            Err(error) => {
+                log_error(
+                    log,
+                    LogComponent::Ipc,
+                    LogEvent::InvalidEvent,
+                    ipc_error_code(&error),
+                );
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// One blocking server thread: decode accepted lines, queue valid events,
 /// and wake the GUI thread out of `GetMessageW`.
 fn spawn_pipe_thread(
@@ -780,7 +940,12 @@ fn present_current(
     // Fresh DPI on every present: dragging the pill across monitors with
     // different DPIs tracks without an invalidation path (the DisplayChanged
     // repaint covers the transition frame).
-    controller.set_dpi_scale(window.dpi_scale());
+    let target_dpi = if controller.is_island() {
+        window.anchor_dpi_scale()
+    } else {
+        window.dpi_scale()
+    };
+    controller.set_dpi_scale(target_dpi);
     if controller.island_config().is_bar() {
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
         controller.set_bar_width(logical_w);
@@ -812,9 +977,19 @@ fn present_current(
     // Publish the glass capture request: the rect the pill was just drawn
     // at. The worker owns the (potentially slow) capture and blur.
     if let Some(request) = backdrop_request {
-        let (x, y, w, h) = window.last_dest();
+        let (x, mut y, w, mut h) = window.last_dest();
         if w > 1 {
             let cfg = controller.island_config();
+            if cfg.is_bar() {
+                // Capture the complete expansion envelope up front. The bar's
+                // blur kernel and screen origin then stay fixed through a morph.
+                let envelope =
+                    ((cfg.bar.height + 320) as f32 * controller.render_scale()).ceil() as u32;
+                if cfg.bar.position == termielle_core::BarPosition::Bottom {
+                    y -= envelope.saturating_sub(h) as i32;
+                }
+                h = envelope.max(h);
+            }
             *request.lock().unwrap() = Some(termielle_app::tasks::BackdropRequest {
                 x,
                 y,
@@ -822,6 +997,7 @@ fn present_current(
                 h,
                 radius: cfg.glass.blur_radius,
                 tint: cfg.glass.tint,
+                blur: cfg.glass.blur_radius > 0 && !(cfg.is_attached() && cfg.glass.notch_black),
             });
         }
     }
@@ -896,7 +1072,7 @@ fn poll_hover(
         && controller.island_config().bar.follow_active_monitor
         && window.update_active_monitor()
     {
-        let new_dpi = window.dpi_scale();
+        let new_dpi = window.anchor_dpi_scale();
         controller.set_dpi_scale(new_dpi);
         let logical_w = (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
         controller.set_bar_width(logical_w);
@@ -904,7 +1080,9 @@ fn poll_hover(
         // also covers DPI/zoom changes without an anchor flip.
         actions.present_frame = true;
     }
-    controller.set_hover_point(window.cursor_client_pos());
+    if controller.set_hover_point(window.cursor_client_pos()) {
+        actions.present_frame = true;
+    }
     let over = window.cursor_over_pill();
     if controller.set_hover(over, now) {
         actions.present_frame = true;
@@ -961,7 +1139,7 @@ fn drain_thumbs(
             // backdrop actually reaches the screen.
             present = true;
         }
-        if controller.set_task_update(batch) {
+        if controller.set_task_update_at(batch, now_ms()) {
             present = true;
         }
     }
@@ -977,14 +1155,16 @@ fn drain_toasts(
     let mut present = false;
     while let Ok(batch) = receiver.try_recv() {
         for event in batch.events {
-            controller.trigger_alert(
+            let key = format!("toast:{}", event.id);
+            present |= controller.trigger_alert(
+                termielle_app::app::AlertKind::System,
                 event.display_title(),
                 event.display_subtitle(),
                 termielle_app::system::accent_color_bgra(),
                 6000,
                 now_ms(),
+                key,
             );
-            present = true;
         }
     }
     present
@@ -992,8 +1172,9 @@ fn drain_toasts(
 
 /// Drains every queued pipe event into the controller, merging the actions.
 ///
-/// Each event is journaled before it is folded: a crash between the two loses
-/// the event, and replaying from the journal is exactly what restores it.
+/// The IPC endpoint is already live while events are folded, so startup work
+/// cannot create a fail-open emitter race. Each event is still journaled before
+/// application, making a crash between those steps recoverable.
 fn drain_pipe(
     controller: &mut Controller,
     receiver: &Receiver<EventMessage>,
@@ -1057,11 +1238,15 @@ fn run_gui(
     log: &Arc<Mutex<BoundedLog>>,
     ack: &mut Option<AckWriter>,
     journal: Option<&EventLog>,
+    config_watcher: Option<&ConfigWatcher>,
     config: &mut AppConfig,
 ) -> bool {
     // The animation clock thread paces frames; the smoke test's timeout timer
     // is separate and unaffected.
     let clock = AnimationClock::spawn(window.wake_handle());
+    let mut bar_service =
+        termielle_app::bar::metrics::Service::spawn(window.wake_handle(), config.island.clone());
+    controller.enable_display_pacing();
     // Windows toast forwarding: own STA thread plus channel. Gated on
     // config only — smoke runs never reach run_gui, so diagnostics stays
     // free of consent prompts.
@@ -1075,31 +1260,20 @@ fn run_gui(
         None
     };
     loop {
-        // Catch up on deadlines that became due while we were blocked.
-        loop {
-            let now = now_ms();
-            let Some(at) = controller.next_deadline_ms() else {
-                break;
-            };
-            if at > now {
-                break;
+        // Only the display clock advances animation. Unrelated window/worker
+        // messages must not bypass vertical-blank pacing.
+        bar_service.configure(&config.island);
+        if let Some(snapshot) = bar_service.take_snapshot() {
+            if controller.set_bar_metrics(snapshot, now_ms()) {
+                present_current(
+                    window,
+                    controller,
+                    log,
+                    ack.as_mut(),
+                    Some(backdrop_request),
+                );
             }
-            let actions = controller.on_timer(now);
-            let mut actions = actions;
-            poll_hover(window, controller, &mut actions);
-            apply_timed(
-                window,
-                controller,
-                log,
-                actions,
-                ack,
-                Some(backdrop_request),
-            );
         }
-
-        // Arm the clock for the nearest deadline; disarming when none. The
-        // clock thread wakes the loop out of `next_event`, which lands here
-        // via the `Ok(None)` path and re-runs the catch-up above.
         clock.arm(controller.next_deadline_ms());
 
         let event = match window.next_event() {
@@ -1117,6 +1291,14 @@ fn run_gui(
                         .unwrap_or(false);
                     let mut actions = actions;
                     actions.present_frame = actions.present_frame || thumb_present || toast_present;
+                    actions.present_frame |= drain_config_reload(
+                        config_watcher,
+                        config,
+                        controller,
+                        window,
+                        thumb_cfg,
+                        log,
+                    );
                     poll_hover(window, controller, &mut actions);
                     actions.next_deadline_ms = controller.next_deadline_ms();
                     apply_timed(
@@ -1150,12 +1332,13 @@ fn run_gui(
                     LogEvent::PresentFailed,
                     window_error_code(&error),
                 );
+                std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
         };
 
         let mut actions = match event {
-            WindowEvent::Timer => controller.on_timer(now_ms()),
+            WindowEvent::Timer | WindowEvent::AnimationFrame => controller.on_timer(now_ms()),
             WindowEvent::DisplayChanged => {
                 if controller.island_config().is_bar()
                     && !controller.island_config().bar.follow_active_monitor
@@ -1171,7 +1354,7 @@ fn run_gui(
                 }
                 // A monitor change can move the pill across DPIs: re-author
                 // the frame at the new scale before presenting it.
-                controller.set_dpi_scale(window.dpi_scale());
+                controller.set_dpi_scale(window.anchor_dpi_scale());
                 controller.refresh_scale(now_ms());
                 ControllerActions {
                     present_frame: true,
@@ -1197,7 +1380,7 @@ fn run_gui(
                 } else if !was_bar && config.island.is_bar() {
                     if !config.island.bar.follow_active_monitor {
                         window.pin_primary_monitor();
-                        controller.set_dpi_scale(window.dpi_scale());
+                        controller.set_dpi_scale(window.anchor_dpi_scale());
                     }
                     let logical_w =
                         (window.monitor_width() as f32 / controller.render_scale()).round() as u32;
@@ -1227,9 +1410,14 @@ fn run_gui(
                 theme::resolve_theme(&mut config.island);
                 controller.set_island_config(config.island.clone(), now_ms());
                 window.set_island(config.island.is_enabled());
+                window.set_bar(config.island.is_bar());
                 window.set_glass(&config.island.glass);
                 thumb_cfg.enabled.store(
                     config.island.is_enabled(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                thumb_cfg.poll_media.store(
+                    config.island.has_widget("music"),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 thumb_cfg.poll_tasks.store(
@@ -1242,9 +1430,22 @@ fn run_gui(
                 }
             }
             WindowEvent::ThemeChanged(theme) => {
-                config.island.theme = theme;
-                theme::resolve_theme(&mut config.island);
+                theme::select_theme(&mut config.island, &theme);
                 window.set_glass(&config.island.glass);
+                let _ = save_config_atomic(
+                    &data_dir()
+                        .map(|d| d.join("config.json"))
+                        .unwrap_or_else(|| PathBuf::from("config.json")),
+                    config,
+                );
+                controller.set_island_config(config.island.clone(), now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::BarPositionChanged(position) => {
+                config.island.bar.position = position;
                 let _ = save_config_atomic(
                     &data_dir()
                         .map(|d| d.join("config.json"))
@@ -1271,6 +1472,12 @@ fn run_gui(
                     present_frame: true,
                     ..Default::default()
                 }
+            }
+            WindowEvent::ScrollAt(x, y, delta) => {
+                if delta != 0 && controller.volume_at(x, y) {
+                    bar_service.send(termielle_app::bar::metrics::Command::VolumeWheel(delta));
+                }
+                ControllerActions::default()
             }
             WindowEvent::ClickAt(x, y) => match controller.handle_click(x, y, now_ms()) {
                 termielle_app::app::ClickOutcome::MediaToggle => {
@@ -1302,18 +1509,14 @@ fn run_gui(
                     }
                 }
                 termielle_app::app::ClickOutcome::WorkspaceSwitch(idx) => {
-                    termielle_app::bar::workspaces::switch_workspace(idx as usize);
-                    ControllerActions {
-                        present_frame: true,
-                        ..Default::default()
-                    }
+                    bar_service.send(termielle_app::bar::metrics::Command::Workspace(
+                        idx as usize,
+                    ));
+                    ControllerActions::default()
                 }
                 termielle_app::app::ClickOutcome::VolumeToggle => {
-                    termielle_app::bar::volume::toggle_mute();
-                    ControllerActions {
-                        present_frame: true,
-                        ..Default::default()
-                    }
+                    bar_service.send(termielle_app::bar::metrics::Command::ToggleMute);
+                    ControllerActions::default()
                 }
                 termielle_app::app::ClickOutcome::AlertDismiss
                 | termielle_app::app::ClickOutcome::Expanded
@@ -1337,12 +1540,16 @@ fn run_gui(
                     ..Default::default()
                 }
             }
-            WindowEvent::ToggleTasks => {
+            WindowEvent::ToggleMusic => {
                 if config.island.has_widget("music") {
                     config.island.widgets.retain(|w| w != "music");
                 } else {
                     config.island.widgets.push("music".to_string());
                 }
+                thumb_cfg.poll_media.store(
+                    config.island.has_widget("music"),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 let _ = save_config_atomic(
                     &data_dir()
                         .map(|d| d.join("config.json"))
@@ -1400,6 +1607,7 @@ fn run_gui(
                 }
             }
         };
+        window.set_tray_state(termielle_app::tray::MenuState::from_island(&config.island));
         actions = merge(actions, drain_pipe(controller, receiver, journal));
         let thumbs = drain_thumbs(window, controller, thumb_receiver);
         let toasts = toast_receiver
@@ -1410,6 +1618,8 @@ fn run_gui(
             actions.present_frame = true;
             actions.next_deadline_ms = controller.next_deadline_ms();
         }
+        actions.present_frame |=
+            drain_config_reload(config_watcher, config, controller, window, thumb_cfg, log);
         poll_hover(window, controller, &mut actions);
         let iteration = || {
             apply_timed(
@@ -1482,7 +1692,7 @@ fn run_smoke(
     let _ = window.set_timer(Some(SMOKE_TIMEOUT_MS));
     loop {
         match window.next_event() {
-            Ok(Some(WindowEvent::Timer)) => {
+            Ok(Some(WindowEvent::Timer | WindowEvent::AnimationFrame)) => {
                 window.destroy();
                 return 1;
             }
@@ -1492,11 +1702,13 @@ fn run_smoke(
                 WindowEvent::LayoutChanged(_)
                 | WindowEvent::ThemeChanged(_)
                 | WindowEvent::YOffsetChanged(_)
+                | WindowEvent::BarPositionChanged(_)
                 | WindowEvent::SystemThemeChanged
                 | WindowEvent::ClickAt(..)
+                | WindowEvent::ScrollAt(..)
                 | WindowEvent::PressChanged(_)
                 | WindowEvent::HoverChanged(_)
-                | WindowEvent::ToggleTasks
+                | WindowEvent::ToggleMusic
                 | WindowEvent::ToggleHoverExpand
                 | WindowEvent::ToggleFace,
             )) => {}

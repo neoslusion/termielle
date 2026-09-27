@@ -21,6 +21,11 @@ impl Controller {
         let now = now_ms;
         // 0. Active Notification Alert Banner
         if let Some(alert) = self.alerts.front() {
+            // The entire visible notification is a dismiss target. The close
+            // glyph remains a visual affordance, but a click anywhere on the
+            // banner quickly returns the surface to the compact bar/island.
+            self.icon_hits
+                .push((super::super::types::HIT_ALERT_DISMISS, 0, 0, width, height));
             let pad = 18i32;
 
             if height >= 85 {
@@ -54,7 +59,7 @@ impl Controller {
                 };
                 crate::animation::notch::draw_text(
                     frame,
-                    "System Notification",
+                    alert.kind.label(),
                     tag_x,
                     15,
                     width.saturating_sub((tag_x as u32) + 40),
@@ -72,6 +77,19 @@ impl Controller {
                     [alert.accent[0], alert.accent[1], alert.accent[2], 50],
                 );
                 crate::animation::notch::draw_disc(frame, width as i32 - 24, 22, 4, alert.accent);
+                let close_x = width as i32 - 48;
+                crate::animation::notch::draw_text(
+                    frame,
+                    "×",
+                    close_x,
+                    10,
+                    24,
+                    18,
+                    false,
+                    self.ink_dim(),
+                );
+                self.icon_hits
+                    .push((super::super::types::HIT_ALERT_DISMISS, close_x, 6, 28, 28));
 
                 // Hairline glass separator
                 crate::animation::notch::fill_rect_pub(
@@ -80,7 +98,7 @@ impl Controller {
                     38,
                     width.saturating_sub((pad as u32) * 2),
                     1,
-                    [255, 255, 255, 22],
+                    [22, 22, 22, 22],
                 );
 
                 // Main headline and detail text
@@ -108,10 +126,11 @@ impl Controller {
 
                 // Timeout hairline: the banner's remaining life, so the
                 // auto-dismiss reads as intentional rather than a flicker.
-                let frac = if alert.duration_ms == 0 {
-                    0.0
-                } else {
-                    alert.expires_at_ms.saturating_sub(now) as f32 / alert.duration_ms as f32
+                let frac = match (alert.duration_ms, alert.expires_at_ms) {
+                    (0, _) | (_, None) => 0.0,
+                    (duration, Some(expires_at)) => {
+                        expires_at.saturating_sub(now) as f32 / duration as f32
+                    }
                 }
                 .clamp(0.0, 1.0);
                 let hair_w =
@@ -123,21 +142,12 @@ impl Controller {
                         height as i32 - 4,
                         hair_w,
                         2,
-                        [alert.accent[0], alert.accent[1], alert.accent[2], 200],
-                    );
-                }
-
-                // Bottom accent pill bar
-                if height >= 105 {
-                    let bar_w = 44u32;
-                    let bar_x = (width as i32 - bar_w as i32) / 2;
-                    crate::animation::notch::fill_rect_pub(
-                        frame,
-                        bar_x,
-                        height as i32 - 10,
-                        bar_w,
-                        3,
-                        alert.accent,
+                        [
+                            (u32::from(alert.accent[0]) * 200 / 255) as u8,
+                            (u32::from(alert.accent[1]) * 200 / 255) as u8,
+                            (u32::from(alert.accent[2]) * 200 / 255) as u8,
+                            200,
+                        ],
                     );
                 }
             } else {
@@ -179,7 +189,7 @@ impl Controller {
                     text_w,
                     12,
                     true,
-                    [255, 255, 255, 245],
+                    self.ink(),
                 );
 
                 // Trailing beacon badge

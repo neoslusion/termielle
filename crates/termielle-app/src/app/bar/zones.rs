@@ -14,7 +14,7 @@ impl Controller {
         &self,
         frame: &mut FrameBuffer,
         metrics: &BarMetricsCache,
-        accent: [u8; 4],
+        _accent: [u8; 4],
         bar_x: i32,
         pill_y: i32,
         pill_h: u32,
@@ -22,6 +22,7 @@ impl Controller {
         let mut hits = Vec::new();
         // 2. Modules Left: Workspaces + Window Title
         let mut cur_x = bar_x + 12;
+        let (primary, secondary) = crate::animation::notch::ink_pair(&self.island.glass);
 
         if self.bar_module("left", "workspaces") {
             // Workspaces
@@ -31,16 +32,12 @@ impl Controller {
                 let active = i == ws.active;
                 let (bg, border, text_col) = if active {
                     (
-                        [accent[0], accent[1], accent[2], 190],
-                        [255, 255, 255, 140],
-                        [255, 255, 255, 255],
+                        [primary[0], primary[1], primary[2], 28],
+                        [0, 0, 0, 0],
+                        primary,
                     )
                 } else {
-                    (
-                        [255, 255, 255, 24],
-                        [255, 255, 255, 36],
-                        [190, 190, 190, 220],
-                    )
+                    ([0, 0, 0, 0], [0, 0, 0, 0], secondary)
                 };
                 crate::animation::notch::draw_rounded_rect(
                     frame,
@@ -53,10 +50,14 @@ impl Controller {
                     border,
                 );
                 let num_str = format!("{}", i);
-                let text_x = cur_x + ((ws_w - 8) / 2) as i32;
-                let text_y = pill_y + ((pill_h - 12) / 2) as i32;
-                crate::animation::notch::draw_text(
-                    frame, &num_str, text_x, text_y, 16, 11, true, text_col,
+                crate::animation::notch::draw_text_in_rect(
+                    frame,
+                    &num_str,
+                    (cur_x, pill_y, ws_w, pill_h),
+                    12,
+                    active,
+                    text_col,
+                    true,
                 );
 
                 // Register hit target for workspace switching
@@ -93,27 +94,24 @@ impl Controller {
                 title_w,
                 pill_h,
                 pill_h / 2,
-                [255, 255, 255, 18],
-                [255, 255, 255, 30],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
             );
-            crate::animation::notch::draw_text(
+            crate::animation::notch::draw_text_in_rect(
                 frame,
                 &truncated,
-                cur_x + 10,
-                pill_y + ((pill_h - 12) / 2) as i32,
-                title_w - 16,
-                11,
+                (cur_x + 10, pill_y, title_w - 16, pill_h),
+                12,
                 false,
-                [230, 230, 230, 230],
+                primary,
+                false,
             );
         }
 
         hits
     }
 
-    /// Bar zone 3 (right): clock, battery, volume, RAM, and CPU pills.
-    /// Pure painter: draws into `frame` and returns its hit targets
-    /// for the orchestrator to install.
+    /// Status items use a shared baseline without permanent button chrome.
     pub(crate) fn paint_bar_right(
         &self,
         frame: &mut FrameBuffer,
@@ -123,179 +121,97 @@ impl Controller {
         pill_y: i32,
         pill_h: u32,
     ) -> Vec<BarHit> {
-        let mut hits: Vec<BarHit> = Vec::new();
-        let mut cur_right = (width as i32) - bar_x - 12;
-
+        use crate::animation::notch::{draw_rounded_rect, draw_text_in_rect, ink_pair};
+        let mut hits = Vec::new();
+        let (primary, secondary) = ink_pair(&self.island.glass);
+        let mut right = width as i32 - bar_x - 12;
         if self.bar_module("right", "clock") {
-            // Clock
-            let clock_w = 84u32;
-            cur_right -= clock_w as i32;
-            crate::animation::notch::draw_rounded_rect(
-                frame,
-                cur_right,
-                pill_y,
-                clock_w,
-                pill_h,
-                pill_h / 2,
-                [255, 255, 255, 24],
-                [255, 255, 255, 36],
-            );
-            crate::animation::notch::draw_text(
+            right -= 84;
+            draw_text_in_rect(
                 frame,
                 &metrics.time_str,
-                cur_right + 8,
-                pill_y + ((pill_h - 12) / 2) as i32,
-                clock_w - 12,
-                11,
+                (right, pill_y, 84, pill_h),
+                12,
+                false,
+                primary,
                 true,
-                [240, 240, 240, 255],
             );
+            right -= 16;
         }
-
         if self.bar_module("right", "battery") {
-            // Battery
-            let (bat_opt, is_charging) = metrics.battery;
-            if let Some(bat_pct) = bat_opt {
-                cur_right -= 8;
-                let bat_w = 78u32;
-                cur_right -= bat_w as i32;
-                let (bat_label, bat_label_w, bat_value) = if is_charging {
-                    ("⚡ ", 20, format!("{}%", bat_pct))
+            if let Some(percent) = metrics.battery.0 {
+                right -= 72;
+                draw_text_in_rect(
+                    frame,
+                    &format!("{percent}%"),
+                    (right, pill_y, 38, pill_h),
+                    12,
+                    false,
+                    primary,
+                    true,
+                );
+                let x = right + 44;
+                let y = pill_y + (pill_h as i32 - 10) / 2;
+                let color = if percent <= 20 && !metrics.battery.1 {
+                    [85, 85, 240, 255]
                 } else {
-                    ("BAT ", 32, format!("{}%", bat_pct))
+                    primary
                 };
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    cur_right,
-                    pill_y,
-                    bat_w,
-                    pill_h,
-                    pill_h / 2,
-                    [255, 255, 255, 20],
-                    [255, 255, 255, 32],
-                );
-                paint_metric_text(
-                    frame,
-                    cur_right + 8,
-                    pill_y + ((pill_h - 12) / 2) as i32,
-                    bat_w - 12,
-                    bat_label,
-                    bat_label_w,
-                    &bat_value,
-                );
+                draw_rounded_rect(frame, x, y, 22, 10, 2, [0; 4], color);
+                draw_rounded_rect(frame, x + 23, y + 3, 2, 4, 1, color, [0; 4]);
+                if percent > 0 {
+                    let fill = (18 * u32::from(percent.min(100)) / 100).max(1);
+                    draw_rounded_rect(frame, x + 2, y + 2, fill, 6, 1, color, [0; 4]);
+                }
+                if metrics.battery.1 {
+                    draw_text_in_rect(
+                        frame,
+                        "ϟ",
+                        (x + 5, y - 3, 12, 16),
+                        14,
+                        true,
+                        self.island.glass.tint,
+                        true,
+                    );
+                }
+                right -= 16;
             }
         }
-
         if self.bar_module("right", "volume") {
-            // Volume
-            cur_right -= 8;
-            let vol = metrics.volume;
-            let vol_w = 78u32;
-            cur_right -= vol_w as i32;
-            let vol_muted = vol.muted;
-            let vol_value = format!("{}%", vol.level);
-            let vol_bg = if vol.muted {
-                [160, 40, 40, 60]
-            } else {
-                [255, 255, 255, 20]
-            };
-            crate::animation::notch::draw_rounded_rect(
+            right -= 24;
+            super::text::paint_speaker(
                 frame,
-                cur_right,
-                pill_y,
-                vol_w,
-                pill_h,
-                pill_h / 2,
-                vol_bg,
-                [255, 255, 255, 32],
+                right,
+                pill_y + (pill_h as i32 - 16) / 2,
+                metrics.volume.muted,
+                primary,
             );
-            if vol_muted {
-                crate::animation::notch::draw_text(
-                    frame,
-                    "MUTED",
-                    cur_right + 8,
-                    pill_y + ((pill_h - 12) / 2) as i32,
-                    vol_w - 12,
-                    11,
-                    false,
-                    [220, 220, 220, 230],
-                );
-            } else {
-                paint_metric_text(
-                    frame,
-                    cur_right + 8,
-                    pill_y + ((pill_h - 12) / 2) as i32,
-                    vol_w - 12,
-                    "VOL ",
-                    32,
-                    &vol_value,
-                );
-            }
             hits.push((
                 crate::bar::HIT_BAR_VOLUME_TOGGLE,
-                cur_right,
+                right - 4,
                 pill_y,
-                vol_w,
+                32,
                 pill_h,
             ));
+            right -= 16;
         }
-
-        if self.bar_module("right", "memory") {
-            // RAM
-            cur_right -= 8;
-            let mem_pct = metrics.memory_pct;
-            let mem_w = 78u32;
-            cur_right -= mem_w as i32;
-            let mem_value = format!("{}%", mem_pct);
-            crate::animation::notch::draw_rounded_rect(
-                frame,
-                cur_right,
-                pill_y,
-                mem_w,
-                pill_h,
-                pill_h / 2,
-                [255, 255, 255, 20],
-                [255, 255, 255, 32],
-            );
-            paint_metric_text(
-                frame,
-                cur_right + 8,
-                pill_y + ((pill_h - 12) / 2) as i32,
-                mem_w - 12,
-                "RAM ",
-                32,
-                &mem_value,
-            );
+        for (module, label, value) in [
+            ("memory", "RAM", metrics.memory_pct),
+            ("cpu", "CPU", metrics.cpu_pct),
+        ] {
+            if self.bar_module("right", module) {
+                right -= 74;
+                paint_metric_text(
+                    frame,
+                    (right, pill_y, 74, pill_h),
+                    label,
+                    &format!("{value}%"),
+                    primary,
+                    secondary,
+                );
+                right -= 16;
+            }
         }
-
-        if self.bar_module("right", "cpu") {
-            // CPU
-            cur_right -= 8;
-            let cpu_pct = metrics.cpu_pct;
-            let cpu_w = 78u32;
-            cur_right -= cpu_w as i32;
-            let cpu_value = format!("{}%", cpu_pct);
-            crate::animation::notch::draw_rounded_rect(
-                frame,
-                cur_right,
-                pill_y,
-                cpu_w,
-                pill_h,
-                pill_h / 2,
-                [255, 255, 255, 20],
-                [255, 255, 255, 32],
-            );
-            paint_metric_text(
-                frame,
-                cur_right + 8,
-                pill_y + ((pill_h - 12) / 2) as i32,
-                cpu_w - 12,
-                "CPU ",
-                32,
-                &cpu_value,
-            );
-        }
-
         hits
     }
 
@@ -312,158 +228,185 @@ impl Controller {
         mut hits: Vec<BarHit>,
     ) {
         // 4. Center Module: Dynamic Island
-        if !card.expanded {
-            if self.bar_module("center", "island") {
+        if card.progress < 0.35 {
+            let (primary, _) = crate::animation::notch::ink_pair(&self.island.glass);
+            let mut compact = self.blank_frame(width, self.island.bar.height);
+            let compact_frame = &mut compact;
+            if self.bar_module("center", "termielle") {
                 // Resting Dynamic Island pill flush in the center of the bar.
                 // Shared with the hover sensor via bar_pill_rect: same rect here,
                 // in the hit target below, and in set_hover.
-                let (pill_cx, pill_y, pill_w, pill_h) = self.bar_pill_rect(width);
+                let (pill_cx, local_pill_y, pill_w, pill_h) = self.bar_pill_rect(width);
+                let pill_y = card.bar_y + local_pill_y;
 
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    pill_cx,
-                    pill_y,
-                    pill_w,
-                    pill_h,
-                    pill_h / 2,
-                    [10, 10, 10, 190],
-                    [255, 255, 255, 45],
-                );
-
-                // Mini face on the left of the pill
-                let face_sz = (pill_h - 4).min(22);
-                let face_x = pill_cx + 4;
-                let face_y = pill_y + ((pill_h - face_sz) / 2) as i32;
-                crate::animation::notch::blit_rounded(
-                    frame,
-                    &self.face_frame,
-                    face_x,
-                    face_y,
-                    face_sz,
-                    face_sz,
-                    face_sz / 2,
-                );
+                // The face is an optional Termielle widget. Bar mode follows
+                // the same widget contract as standalone Island mode.
+                let face_sz = if self.island.has_widget("face") {
+                    let face_sz = (pill_h - 4).min(22);
+                    let face_x = pill_cx + 4;
+                    let face_y = pill_y + ((pill_h - face_sz) / 2) as i32;
+                    crate::animation::notch::blit_rounded(
+                        compact_frame,
+                        &self.face_frame,
+                        face_x,
+                        face_y,
+                        face_sz,
+                        face_sz,
+                        face_sz / 2,
+                    );
+                    face_sz
+                } else {
+                    0
+                };
 
                 // Status label or media wave inside the pill
-                let label_x = face_x + face_sz as i32 + 6;
+                let label_x = if face_sz == 0 {
+                    pill_cx + 10
+                } else {
+                    pill_cx + 4 + face_sz as i32 + 6
+                };
                 let label_max_w = pill_w.saturating_sub((label_x - pill_cx) as u32 + 6);
-                if self.media_playing() && self.island.has_widget("music") {
+                if self.media_available() && self.island.has_widget("music") {
                     if let Some(media) = &self.media {
-                        let track = format!("{} — {}", media.title, media.artist);
-                        crate::animation::notch::draw_text(
-                            frame,
-                            &track,
-                            label_x,
-                            pill_y + ((pill_h - 12) / 2) as i32,
-                            label_max_w,
-                            11,
+                        let track = media.title.as_str();
+                        crate::animation::notch::draw_text_in_rect(
+                            compact_frame,
+                            track,
+                            (label_x, pill_y, label_max_w, pill_h),
+                            12,
                             false,
-                            [220, 220, 220, 240],
+                            primary,
+                            false,
                         );
                     } else {
-                        crate::animation::notch::draw_text(
-                            frame,
-                            "Now Playing",
-                            label_x,
-                            pill_y + ((pill_h - 12) / 2) as i32,
-                            label_max_w,
-                            11,
+                        crate::animation::notch::draw_text_in_rect(
+                            compact_frame,
+                            "Media",
+                            (label_x, pill_y, label_max_w, pill_h),
+                            12,
                             false,
-                            [220, 220, 220, 240],
+                            primary,
+                            false,
                         );
                     }
                 } else if state != VisualState::Idle {
                     let (sc, _) = crate::animation::notch::accent_colors(state);
-                    let dot_r = 3u32;
                     crate::animation::notch::draw_disc(
-                        frame,
+                        compact_frame,
                         label_x + 4,
                         pill_y + (pill_h / 2) as i32,
-                        dot_r,
+                        3,
                         sc,
                     );
-                    let state_name = format!("{:?}", state);
-                    crate::animation::notch::draw_text(
-                        frame,
-                        &state_name,
-                        label_x + 12,
-                        pill_y + ((pill_h - 12) / 2) as i32,
-                        label_max_w.saturating_sub(14),
-                        11,
+                    crate::animation::notch::draw_text_in_rect(
+                        compact_frame,
+                        state.display_name(),
+                        (label_x + 12, pill_y, label_max_w.saturating_sub(14), pill_h),
+                        12,
                         false,
-                        [220, 220, 220, 240],
+                        primary,
+                        false,
                     );
                 } else {
-                    crate::animation::notch::draw_text(
-                        frame,
+                    crate::animation::notch::draw_text_in_rect(
+                        compact_frame,
                         "Termielle",
-                        label_x,
-                        pill_y + ((pill_h - 12) / 2) as i32,
-                        label_max_w,
-                        11,
+                        (label_x, pill_y, label_max_w, pill_h),
+                        12,
                         true,
-                        [220, 220, 220, 220],
+                        primary,
+                        false,
                     );
                 }
 
                 // Register hit target for clicking the Dynamic Island pill
                 hits.push((
-                    crate::bar::HIT_BAR_ISLAND_PILL,
+                    crate::bar::HIT_BAR_TERMIELLE_MODULE,
                     pill_cx,
                     pill_y,
                     pill_w,
                     pill_h,
                 ));
             }
+            let alpha = (255.0
+                * (1.0 - crate::animation::notch::smoothstep(0.0, 0.35, card.progress)))
+            .round() as u8;
+            let bar_y = card.bar_y;
+            crate::animation::notch::blend_frame_over(frame, &compact, 0, bar_y, alpha);
+        }
+        if card.expanded && self.bar_module("center", "termielle") {
+            let (pill_cx, local_pill_y, pill_w, pill_h) = self.bar_pill_rect(width);
+            let pill_y = card.bar_y + local_pill_y;
+            hits.push((
+                crate::bar::HIT_BAR_TERMIELLE_MODULE,
+                pill_cx,
+                pill_y,
+                pill_w,
+                pill_h,
+            ));
+        }
+        if !card.expanded {
             self.icon_hits = hits;
         } else {
             // Expanded Dynamic Island card dropping organically below the bar!
             // Island content only renders when the center module is listed;
             // the glass card and module hits below stay unconditional.
-            let mut content = self.blank_frame(card.island_w, card.exp_h);
-            if self.bar_module("center", "island") {
+            let mut content = self.blank_frame(card.content_w, card.content_h);
+            if self.bar_module("center", "termielle") {
                 let sub_blobs = [crate::animation::notch::BlobRect {
                     x: 0,
                     y: 0,
-                    w: card.island_w,
-                    h: card.exp_h,
+                    w: card.content_w,
+                    h: card.content_h,
                     r: 18,
                     attached: true,
                 }];
 
                 let island_cfg = self.island.clone();
+                let saved_hover = self.hover_point;
+                let content_x = (width.saturating_sub(card.content_w) / 2) as i32;
+                self.hover_point = saved_hover.map(|(x, y)| (x - content_x, y - card.island_y));
                 self.render_content(
                     &mut content,
                     state,
                     &island_cfg,
                     crate::animation::notch::Presentation::Expanded,
-                    card.island_w,
-                    card.exp_h,
+                    card.content_w,
+                    card.content_h,
                     &sub_blobs,
                     now_ms,
                 );
+                self.hover_point = saved_hover;
             }
 
             // Offset hit targets recorded in sub-frame by (island_x, island_y)
+            let content_x = (width.saturating_sub(card.content_w) / 2) as i32;
             for hit in &mut self.icon_hits {
-                hit.1 += card.island_x;
+                hit.1 += content_x;
                 hit.2 += card.island_y;
+            }
+            // A fading or clipped control must not intercept clicks before it is visible.
+            if card.progress < 0.98 {
+                self.icon_hits.clear();
             }
             self.icon_hits.extend(hits);
 
-            if self.bar_module("center", "island") {
-                let age_ms = now_ms.saturating_sub(self.state_since_ms);
-                let (alpha, dx, dy) = Self::content_motion(
-                    self.spring.as_ref(),
-                    crate::animation::notch::Presentation::Expanded,
-                    state,
-                    age_ms,
+            if self.bar_module("center", "termielle") {
+                let alpha = (255.0 * crate::animation::notch::smoothstep(0.65, 0.98, card.progress))
+                    .round() as u8;
+                let mut clipped = self.blank_frame(card.island_w, card.exp_h);
+                crate::animation::notch::blend_frame_over(
+                    &mut clipped,
+                    &content,
+                    content_x - card.island_x,
+                    0,
+                    255,
                 );
                 crate::animation::notch::blend_frame_over(
                     frame,
-                    &content,
-                    card.island_x + dx,
-                    card.island_y + dy,
+                    &clipped,
+                    card.island_x,
+                    card.island_y,
                     alpha,
                 );
             }

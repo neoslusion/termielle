@@ -5,12 +5,12 @@
     30,
     30,
     30,
-    90
+    70
   ],
-  "blur_radius": 12,
+  "blur_radius": 0,
   "border_alpha": 20,
-  "highlight_alpha": 30,
-  "shadow_alpha": 30,
+  "highlight_alpha": 24,
+  "shadow_alpha": 18,
   "corner_radius": 18,
   "description": "Barely-there glass \u00e2\u20ac\u201d shows wallpaper through."
 }

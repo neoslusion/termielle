@@ -49,11 +49,15 @@ export const TermiellePlugin = async ({ $ }) => {
     }
     return candidates.find((path) => existsSync(path)) ?? "termielle-emit.exe"
   }
+  const lastKind = new Map()
 
-  const emit = (kind, sessionID) =>
-    $`${emitter()} --source opencode2 --event ${kind} --input argv ${JSON.stringify({ session_id: sessionID })}`
+  const emit = async (kind, sessionID) => {
+    if (lastKind.get(sessionID) === kind) return
+    lastKind.set(sessionID, kind)
+    await $`${emitter()} --source opencode2 --event ${kind} --input argv ${JSON.stringify({ session_id: sessionID })}`
       .quiet()
       .catch(() => {})
+  }
 
   return {
     event: async ({ event }) => {
@@ -101,6 +105,7 @@ export const TermiellePlugin = async ({ $ }) => {
           // A deleted conversation ends at once: the overlay must not hold a
           // busy state until its stall timeout.
           await emit("session_ended", sessionID)
+          lastKind.delete(sessionID)
           return
         default:
           return

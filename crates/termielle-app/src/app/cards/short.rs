@@ -38,21 +38,16 @@ impl Controller {
             );
         }
 
-        if self.media_playing() && island.has_widget("music") {
+        if self.media_available() && island.has_widget("music") {
             let art_size = 28i32;
             let media_start_x = ctx.pad + face_size + 14;
             let art_y = ctx.cy - art_size / 2;
             if let Some(thumb) = self.media.as_ref().and_then(|m| m.thumbnail.as_ref()) {
-                crate::animation::notch::blit_rounded(
+                crate::animation::notch::blit_rounded_pixels(
                     frame,
-                    &crate::animation::FrameBuffer {
-                        width: thumb.width,
-                        height: thumb.height,
-                        pixels_pbgra: thumb.pixels_pbgra.clone(),
-                        delay_ms: 0,
-                        loop_index: 0,
-                        scale: 1.0,
-                    },
+                    &thumb.pixels_pbgra,
+                    thumb.width,
+                    thumb.height,
                     media_start_x,
                     art_y,
                     art_size as u32,
@@ -83,19 +78,12 @@ impl Controller {
                 text_w,
                 11,
                 true,
-                [255, 255, 255, 245],
+                self.ink(),
             );
         } else {
             let left_edge = ctx.pad + face_size + 14;
             let text_w = (ctx.width as i32 - ctx.pad - left_edge).max(40) as u32;
-            let title = match state {
-                VisualState::Idle => "Termielle",
-                VisualState::Thinking => "Reasoning",
-                VisualState::Working => "Working",
-                VisualState::NeedsInput => "Needs Input",
-                VisualState::Ready => "Turn Complete",
-                VisualState::Failed => "Turn Failed",
-            };
+            let title = state.display_name();
             crate::animation::notch::draw_text(
                 frame,
                 title,
@@ -104,7 +92,7 @@ impl Controller {
                 text_w,
                 12,
                 true,
-                [255, 255, 255, 240],
+                self.ink(),
             );
         }
     }

@@ -10,6 +10,12 @@ const THINKING_HOLD_MS: u64 = 1_000;
 /// Milliseconds without an accepted event after which a session is dropped.
 const STALE_SESSION_MS: u64 = 14_400_000;
 
+/// Maximum accepted difference between an emitter clock and the overlay
+/// clock. Local hooks normally share the system clock; a small allowance
+/// absorbs scheduler jitter without letting a far-future event park a
+/// session or its deadlines years away.
+pub const MAX_FUTURE_SKEW_MS: u64 = 60_000;
+
 /// What the overlay should render for the busiest tracked session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VisualState {
@@ -33,7 +39,18 @@ impl VisualState {
         }
     }
 
-    /// The protocol's wire name, used by diagnostics acknowledgement files.
+    /// Stable user-facing label for tray, bar, and detail surfaces.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Thinking => "Thinking",
+            Self::Working => "Working",
+            Self::NeedsInput => "Input needed",
+            Self::Ready => "Ready",
+            Self::Failed => "Failed",
+        }
+    }
+
     pub fn wire_name(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -57,6 +74,9 @@ pub enum ApplyOutcome {
     Duplicate,
     /// Older than the last accepted event for the session.
     Stale,
+    /// Outside the wall-clock acceptance window. The event never enters the
+    /// fold, so an ancient journal line cannot recreate an expired session.
+    Rejected,
 }
 
 type SessionKey = (Source, String);
@@ -163,6 +183,22 @@ impl SessionReducer {
         } else {
             ApplyOutcome::Changed
         }
+    }
+
+    /// Applies an event only when its timestamp is plausible relative to the
+    /// consuming overlay's wall clock.
+    ///
+    /// Journal replay needs this boundary in addition to per-session ordering:
+    /// once `advance` removes a stale session, ordering alone no longer has a
+    /// tombstone to compare against and would accept the next old line as a
+    /// brand-new session.
+    pub fn apply_at(&mut self, event: EventMessage, now_ms: u64) -> ApplyOutcome {
+        let oldest = now_ms.saturating_sub(STALE_SESSION_MS);
+        let newest = now_ms.saturating_add(MAX_FUTURE_SKEW_MS);
+        if event.timestamp_ms <= oldest || event.timestamp_ms > newest {
+            return ApplyOutcome::Rejected;
+        }
+        self.apply(event)
     }
 
     /// Fires every deadline due at `now_ms`, decays busy sessions that have

@@ -66,7 +66,7 @@ impl Default for BarConfig {
             replace_taskbar: false,
             follow_active_monitor: true,
             modules_left: vec!["workspaces".to_string(), "window".to_string()],
-            modules_center: vec!["island".to_string()],
+            modules_center: vec!["termielle".to_string()],
             modules_right: vec![
                 "cpu".to_string(),
                 "memory".to_string(),
@@ -88,7 +88,8 @@ impl Default for BarConfig {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GlassConfig {
-    /// Tint color as BGRA bytes. Default `[26,26,26,180]` ~ `#1a1a1a` at 0.70.
+    /// Tint color as BGRA bytes. Default `[30,22,18,190]` is a cool neutral
+    /// near-black at roughly 75% opacity.
     pub tint: [u8; 4],
     /// Backdrop blur radius in pixels for the frosted-glass effect: the
     /// live wallpaper behind the pill is captured (layered windows excluded)
@@ -109,11 +110,11 @@ pub struct GlassConfig {
 impl Default for GlassConfig {
     fn default() -> Self {
         Self {
-            tint: [26, 26, 26, 180],
+            tint: [30, 22, 18, 190],
             blur_radius: 12,
-            border_alpha: 38,
-            highlight_alpha: 70,
-            shadow_alpha: 60,
+            border_alpha: 24,
+            highlight_alpha: 42,
+            shadow_alpha: 48,
             notch_black: true,
         }
     }
@@ -243,7 +244,7 @@ pub struct IslandConfig {
 impl Default for IslandConfig {
     fn default() -> Self {
         Self {
-            layout: IslandLayout::Classic,
+            layout: IslandLayout::Bar,
             collapsed_width: DEFAULT_COLLAPSED_W,
             expanded_width: DEFAULT_EXPANDED_W,
             animation_ms: DEFAULT_ANIM_MS,
@@ -271,11 +272,10 @@ impl Default for IslandConfig {
 }
 
 impl IslandConfig {
-    /// The stock widget set: animated face, session dots,
-    /// media indicator, and progress ring. Purely visual — the pill renders
-    /// no text at all.
+    /// The stock Waybar module set: optional face, agent session dots, and
+    /// media activity. The bar keeps these compact; details open only on click.
     pub fn default_widgets() -> Vec<String> {
-        ["face", "agents", "music", "ring"]
+        ["face", "agents", "music"]
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -314,14 +314,32 @@ impl IslandConfig {
         }
         // Truncate theme to sane length.
         if self.theme.len() > 64 {
-            self.theme.truncate(64);
+            let mut boundary = 64;
+            while !self.theme.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            self.theme.truncate(boundary);
         }
         self.max_thumbnails = self.max_thumbnails.min(6);
         if !matches!(self.ring_metric.as_str(), "battery" | "cpu" | "mem") {
             self.ring_metric = "battery".to_string();
         }
+        self.bar.modules_center = self
+            .bar
+            .modules_center
+            .iter()
+            .map(|module| {
+                if module == "island" {
+                    "termielle"
+                } else {
+                    module.as_str()
+                }
+            })
+            .filter(|module| *module == "termielle")
+            .map(str::to_owned)
+            .collect();
         self.widgets
-            .retain(|w| matches!(w.as_str(), "face" | "tasks" | "agents" | "music" | "ring"));
+            .retain(|w| matches!(w.as_str(), "face" | "tasks" | "agents" | "music"));
         self.widgets.truncate(16);
         self.glass.clamp();
         // Bar geometry must stay renderable: pill rows need ~18px, and an
@@ -457,13 +475,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_include_widgets_and_hover_expand() {
+    fn theme_limit_is_utf8_safe() {
+        let mut config = IslandConfig {
+            theme: "界".repeat(30),
+            ..Default::default()
+        };
+        config.clamp();
+        assert_eq!(config.theme, "界".repeat(21));
+    }
+
+    #[test]
+    fn defaults_are_waybar_ready() {
         let c = IslandConfig::default();
+        assert_eq!(c.layout, IslandLayout::Bar);
         assert!(c.expand_on_hover);
         assert!(c.face_animated);
-        for w in ["face", "agents", "music", "ring"] {
+        for w in ["face", "agents", "music"] {
             assert!(c.has_widget(w), "missing widget {w}");
         }
+        assert!(!c.has_widget("ring"));
         assert!(!c.show_tasks);
         assert_eq!(c.glass.blur_radius, 12);
     }
@@ -498,9 +528,9 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = IslandConfig::default();
-        assert_eq!(c.layout, IslandLayout::Classic);
+        assert_eq!(c.layout, IslandLayout::Bar);
         assert!(c.collapsed_width < c.expanded_width);
-        assert_eq!(c.glass.tint[3], 180);
+        assert_eq!(c.glass.tint[3], 190);
     }
 
     #[test]

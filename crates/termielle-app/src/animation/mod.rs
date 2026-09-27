@@ -8,6 +8,7 @@
 mod fallback;
 mod gif;
 pub mod notch;
+mod text_cache;
 
 pub use fallback::fallback_frame;
 pub(crate) mod spring;

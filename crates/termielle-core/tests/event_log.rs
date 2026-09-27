@@ -51,6 +51,19 @@ fn a_missing_journal_replays_as_empty_and_append_creates_it() {
 }
 
 #[test]
+fn append_creates_a_missing_parent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let nested = dir.path().join("fresh").join("state");
+    let log = EventLog::new(nested.join("events.log"), 1_048_576);
+    let event = event(source("claude"), "session", EventKind::PromptSubmitted, 1);
+
+    log.append(&event).unwrap();
+
+    assert!(nested.join("events.log").is_file());
+    assert_eq!(log.read_all(), vec![event]);
+}
+
+#[test]
 fn the_journal_stores_the_same_wire_form_the_pipe_carries() {
     let dir = tempfile::tempdir().unwrap();
     let log = journal(dir.path(), "events.log", 1_048_576);

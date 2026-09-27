@@ -15,6 +15,26 @@ use termielle_ipc::{EventClient, EventServer, IpcError, test_endpoint};
 const MAX_EVENT_BYTES: usize = 4096;
 
 #[test]
+fn reads_buffered_event_after_client_closes_before_accept() {
+    let name = test_endpoint("closed-before-accept");
+    let server = EventServer::bind(&name).unwrap();
+    let line = b"{\"event\":\"already-sent\"}\n";
+    EventClient::new(&name, Duration::from_secs(1))
+        .send(line)
+        .unwrap();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(server.receive_one());
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("buffered event was discarded")
+            .unwrap(),
+        line
+    );
+}
+
+#[test]
 fn sends_exactly_one_bounded_event_to_the_server() {
     let name = test_endpoint("roundtrip");
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -104,22 +124,13 @@ fn serves_two_sequential_clients() {
         .unwrap();
     assert_eq!(line_rx.recv().unwrap(), first_line);
 
-    // A client that connects and closes before the server serves the
-    // connection is a ghost: the server discards it and waits for the next
-    // client. Retry the delivery until the server confirms receipt, then
-    // verify both lines in the expected order.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        EventClient::new(&name, Duration::from_millis(20))
-            .send(second_line)
-            .unwrap();
-        match line_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(line) if line == second_line => break,
-            Ok(line) => panic!("unexpected line: {line:?}"),
-            Err(_) if Instant::now() < deadline => {}
-            Err(error) => panic!("second line was never delivered: {error}"),
-        }
-    }
+    EventClient::new(&name, Duration::from_millis(20))
+        .send(second_line)
+        .unwrap();
+    assert_eq!(
+        line_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        second_line
+    );
 
     server.join().unwrap();
 }

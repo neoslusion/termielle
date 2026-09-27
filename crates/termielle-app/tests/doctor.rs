@@ -2,8 +2,8 @@
 //! exit 0 on a healthy install and nonzero when a required binary is missing.
 //! The staged copy keeps the checks honest without touching the built tree.
 //!
-//! These tests spawn the overlay on the default pipe, so a live overlay on
-//! the host makes them fail loudly rather than pass falsely.
+//! Every smoke run uses a unique pipe, so validation never contends with or
+//! disturbs a user's live overlay.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;

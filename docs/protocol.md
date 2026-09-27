@@ -61,7 +61,7 @@ enforces this by extracting only a session identifier from the hook document.
 | `source` | string | Any short lowercase agent identifier: `[a-z0-9_-]+`, at most 32 bytes — `claude`, `codex`, `opencode`, and `agy` are conventions, not an exhaustive list. The overlay uses it only to distinguish sessions from different agents; a well-formed but unknown source is accepted, and a malformed one is rejected (`invalid source`). |
 | `session_id` | string | See the rules above. Duplicate delivery detection and the visual reducer both key on `(source, session_id)`. |
 | `event` | string | One of the eight kinds below. |
-| `timestamp_ms` | integer | Unix epoch milliseconds, nonzero. The reducer never reads a clock; time enters only through these stamps and the overlay's own clock at fire time. |
+| `timestamp_ms` | integer | Unix epoch milliseconds, nonzero. The overlay additionally rejects timestamps more than four hours old or over 60 seconds in the future when applying them to live state; this keeps old journal lines and malformed future clocks from creating immortal sessions. |
 
 Unknown fields are rejected (`deny_unknown_fields`), so a newer integration
 cannot silently smuggle meaning past an older overlay.
@@ -87,11 +87,13 @@ cannot silently smuggle meaning past an older overlay.
 - **Priority.** When several sessions are busy at once, the most attention-
   demanding state wins: needs_input > failed > ready > thinking/working > idle.
   Ties go to the most recently active session.
-- **Staleness.** A session that hears nothing for four hours is forgotten, and
-  a thinking/working session that goes silent for the busy-stall window
-  (default 5 minutes, configurable 1–60) decays back to idle. An integration
-  does not need to send `session_ended`; the overlay will retire a dead session
-  on its own.
+- **Staleness and clock bounds.**
+  - An event for that session only arrives once and its timestamp is not older than four hours.
+  - The timestamp is no more than 60 seconds ahead of the overlay clock.
+  - A `thinking`/`working` session that goes silent for the busy-stall window
+    (default 5 minutes, configurable 1–60) decays back to idle. An integration
+    does not need to send `session_ended`; the overlay retires a dead session
+    on its own.
 - **Missing reasoning boundary.** Agents that expose no reasoning step (Claude
   Code, Codex) can only offer `prompt_submitted`, and the one-second hold is
   their best approximation. Agents whose only boundary is a model invocation

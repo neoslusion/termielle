@@ -1,13 +1,15 @@
 //! Notch/island geometry, presentation state, morph springs, and pointer interaction.
 
+use super::bar::modules::{BarDamage, metrics_damage};
+use super::bar::types::BAR_POPUP_GAP;
 use super::controller::Controller;
 use super::types::ClickOutcome;
 use super::types::HIT_ALERT_DISMISS;
 use super::types::HIT_MEDIA_NEXT;
 use super::types::HIT_MEDIA_PLAY_PAUSE;
 use super::types::HIT_MEDIA_PREV;
+use crate::animation::FrameBuffer;
 use crate::animation::spring::{BLOB_GAP_PX, Spring1, Spring2D};
-use crate::animation::{AnimationSource, FrameBuffer};
 use crate::window::scaled_size;
 use termielle_core::{IslandConfig, VisualState, spring_params};
 
@@ -43,7 +45,7 @@ impl Controller {
         }
         let island = self.island.clone();
         let attached = island.is_attached();
-        let radius = (self.radius.round() as u32).max(1).min(height / 2);
+        let radius = (self.radius.round() as u32).min(height / 2);
         let blobs = self.blob_rects(width, height, radius, attached);
         let black = island.glass.notch_black && attached;
         let mut frame = self.glass_layer_blobs(width, height, radius, attached, &blobs, black);
@@ -64,9 +66,42 @@ impl Controller {
             now_ms,
         );
         let age_ms = now_ms.saturating_sub(self.state_since_ms);
-        let (alpha, dx, dy) =
+        let (motion_alpha, dx, dy) =
             Self::content_motion(self.spring.as_ref(), presentation, state, age_ms);
-        crate::animation::notch::blend_frame_over(&mut frame, &content, dx, dy, alpha);
+        let swap = self.content_transition.as_ref().map(|transition| {
+            let elapsed = now_ms.saturating_sub(transition.started_ms);
+            let linear = (elapsed as f32 / transition.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+            (
+                transition.previous.clone(),
+                crate::animation::notch::smoothstep(0.0, 1.0, linear),
+                elapsed >= transition.duration_ms,
+            )
+        });
+        let mut visible_content = self.blank_frame(width, height);
+        crate::animation::notch::blend_frame_over(
+            &mut visible_content,
+            &content,
+            dx,
+            dy,
+            motion_alpha,
+        );
+        if let Some((previous, eased, complete)) = swap {
+            crate::animation::notch::crossfade_content(
+                &mut visible_content,
+                &previous,
+                (eased * 255.0).round() as u8,
+            );
+            if complete {
+                self.content_transition = None;
+            }
+        }
+        let bridge_k = crate::animation::notch::BRIDGE_K_MAX
+            * (1.0 - self.separation_now().clamp(0.0, BLOB_GAP_PX) / BLOB_GAP_PX);
+        crate::animation::notch::clip_content(&mut visible_content, &blobs, bridge_k);
+        crate::animation::notch::blend_frame_over(&mut frame, &visible_content, 0, 0, 255);
+        // An interruption starts from the composite the user actually saw,
+        // including a partially completed content swap.
+        self.content_layer = Some(std::rc::Rc::new(visible_content));
 
         // Accent strip: agent state color; accent color while media plays.
         // Part of the silhouette, so it never fades with the content.
@@ -81,8 +116,8 @@ impl Controller {
         // Awaiting input breathes: the strip pulses slowly so "waiting"
         // never reads as dead.
         let strip = if state == VisualState::NeedsInput {
-            let pulse =
-                (0.5 + 0.5 * (now_ms as f32 / 450.0 * std::f32::consts::TAU).sin()).clamp(0.0, 1.0);
+            let pulse = (0.5 + 0.5 * ((now_ms % 450) as f32 / 450.0 * std::f32::consts::TAU).sin())
+                .clamp(0.0, 1.0);
             let mut lit = strip;
             lit[3] = (140.0 + 115.0 * pulse).round() as u8;
             lit
@@ -91,11 +126,6 @@ impl Controller {
         };
         crate::animation::notch::draw_accent_strip(&mut frame, attached, radius, strip);
         frame
-    }
-
-    /// Whether the idle pill is currently expanded by user click.
-    pub(crate) fn is_expanded_idle(&self) -> bool {
-        self.manually_expanded
     }
 
     /// The iOS/macOS presentation the pill should rest in right now:
@@ -113,11 +143,15 @@ impl Controller {
             return Presentation::Expanded;
         }
         if self.manually_expanded {
-            // Click to extend it vertical and horizontal
+            // Waybar mode is a persistent status surface: only an explicit
+            // click on the Termielle module opens its focused popup.
             return Presentation::Expanded;
         }
         let agent_live = !matches!(self.state, VisualState::Idle);
-        if agent_live || self.media_playing() || self.hover_expanded {
+        if self.hover_expanded && !self.island.is_bar() {
+            return Presentation::Compact;
+        }
+        if agent_live || self.media_available() {
             return Presentation::Compact;
         }
         if self.island.auto_hide {
@@ -143,6 +177,11 @@ impl Controller {
     pub(crate) fn media_playing(&self) -> bool {
         self.island.has_widget("music") && self.media.as_ref().is_some_and(|m| m.playing)
     }
+    /// Whether a media session is available for the module, including a
+    /// paused session. Playback animation still uses [`Self::media_playing`].
+    pub(crate) fn media_available(&self) -> bool {
+        self.island.has_widget("music") && self.media.is_some()
+    }
 
     /// Target (width, height) for the current visual and presentation state.
     pub fn target_size(&self, _state: VisualState) -> (u32, u32) {
@@ -150,23 +189,11 @@ impl Controller {
             let w = self.bar_width;
             let base_h = self.island.bar.height;
             if !self.alerts.is_empty() {
-                return (w, base_h + 124);
+                return (w, base_h + 124 + BAR_POPUP_GAP);
             }
             return match self.presentation() {
                 crate::animation::notch::Presentation::Expanded => {
-                    let tasks_active = self.island.has_widget("tasks")
-                        && self.island.show_tasks
-                        && !self.tasks.is_empty();
-                    let exp_h = if self.media_playing() && tasks_active {
-                        210u32
-                    } else if self.media_playing() {
-                        175u32
-                    } else if tasks_active {
-                        180u32
-                    } else {
-                        154u32
-                    };
-                    (w, base_h + exp_h)
+                    (w, base_h + self.bar_expanded_height() + BAR_POPUP_GAP)
                 }
                 _ => (w, base_h),
             };
@@ -181,9 +208,9 @@ impl Controller {
                 let tasks_active = self.island.has_widget("tasks")
                     && self.island.show_tasks
                     && !self.tasks.is_empty();
-                let exp_h = if self.media_playing() && tasks_active {
+                let exp_h = if self.media_available() && tasks_active {
                     210u32
-                } else if self.media_playing() {
+                } else if self.media_available() {
                     175u32
                 } else if tasks_active {
                     180u32
@@ -199,7 +226,7 @@ impl Controller {
                 let primary = self.compact_primary_width();
                 let width = if self.split_active() {
                     primary + BLOB_GAP_PX as u32 + self.compact_media_width()
-                } else if self.media_playing() && self.island.has_widget("music") {
+                } else if self.media_available() && self.island.has_widget("music") {
                     primary + self.compact_media_width() - 8
                 } else {
                     primary
@@ -208,7 +235,7 @@ impl Controller {
             }
             crate::animation::notch::Presentation::Minimal => {
                 let mut w = self.island.minimal_width;
-                if self.media_playing() && self.island.has_widget("music") {
+                if self.media_available() && self.island.has_widget("music") {
                     w = w.max(72);
                 }
                 (w, self.island.height)
@@ -250,7 +277,7 @@ impl Controller {
     pub(crate) fn split_active(&self) -> bool {
         self.island.is_enabled()
             && self.presentation() == crate::animation::notch::Presentation::Compact
-            && self.media_playing()
+            && self.media_available()
             && self.island.has_widget("music")
             && (self.state != VisualState::Idle || self.reducer.session_count() > 0)
     }
@@ -319,6 +346,13 @@ impl Controller {
         } else {
             0.0
         };
+        if self
+            .separation
+            .as_ref()
+            .is_some_and(|s| s.target == sep_target)
+        {
+            return;
+        }
         let previous = self.separation.take();
         let sep_from = previous.as_ref().map_or(0.0, |s| s.x);
         let sep_vel = previous.as_ref().map_or(0.0, |s| s.v);
@@ -329,16 +363,14 @@ impl Controller {
         }
     }
 
-    /// The settled corner radius for the current presentation. The pill
-    /// keeps near-semicircular ends; the expanded card is rounder than a
-    /// pill but still generous, like iOS.
+    /// The settled corner radius for the current presentation. Compact and
+    /// minimal surfaces remain pills; expanded geometry honors the user's
+    /// radius, bounded by half the current height.
     pub(crate) fn target_radius(&self) -> f32 {
         match self.presentation() {
             crate::animation::notch::Presentation::Expanded => {
                 let max_r = self.target_size(self.state).1 as f32 / 2.0;
-                (self.island.corner_radius as f32)
-                    .clamp(24.0, 34.0)
-                    .min(max_r)
+                (self.island.corner_radius as f32).min(max_r)
             }
             _ => self.island.height as f32 / 2.0,
         }
@@ -366,11 +398,12 @@ impl Controller {
             return Some((true, 0));
         }
         let attached = self.island.is_attached();
-        let y_offset = if attached {
-            0
-        } else {
-            (self.island.y_offset as f32 * self.render_scale()).round() as i32
-        };
+        let y_offset =
+            if attached || self.presentation() == crate::animation::notch::Presentation::Hidden {
+                0
+            } else {
+                (self.island.y_offset as f32 * self.render_scale()).round() as i32
+            };
         Some((attached, y_offset))
     }
 
@@ -395,9 +428,13 @@ impl Controller {
         if width_logical > 0 && self.bar_width != width_logical {
             self.bar_width = width_logical;
             if self.island.is_bar() {
-                let (_, h) = self.target_size(self.state);
-                self.current = self.render_island(self.state, width_logical, h, self.clock_ms);
-                self.animation = AnimationSource::Still(self.current.clone());
+                let (_, current_h) = self.current_logical_size();
+                let (_, target_h) = self.target_size(self.state);
+                self.current =
+                    self.render_island(self.state, width_logical, current_h, self.clock_ms);
+                if current_h != target_h {
+                    self.morph_to_target(self.clock_ms);
+                }
             }
         }
     }
@@ -466,13 +503,16 @@ impl Controller {
         if (want_w, want_h) == (self.current.width, self.current.height) {
             return false;
         }
+        // The outgoing snapshot is rasterized at the old DPI. Retire it
+        // rather than mixing physically different text sizes in one frame.
+        self.content_transition = None;
+        self.content_layer = None;
         if self.island.is_enabled() {
             self.current = self.render_island(self.state, logical_w, logical_h, now_ms);
         } else {
             let _ = self.load_animation_classic(self.state, now_ms);
             return true;
         }
-        self.animation = AnimationSource::Still(self.current.clone());
         true
     }
 
@@ -505,6 +545,45 @@ impl Controller {
     /// to frame space before hit-testing, then —
     /// - over interactive buttons (media control, window switcher, notification dismiss)
     /// - over the pill otherwise: toggles expansion and returns the outcome.
+    pub fn volume_at(&self, x: i32, y: i32) -> bool {
+        let (x, y) = (self.to_logical(x), self.to_logical(y));
+        self.icon_hits.iter().any(|&(id, hx, hy, hw, hh)| {
+            id == crate::bar::HIT_BAR_VOLUME_TOGGLE
+                && x >= hx
+                && x < hx + hw as i32
+                && y >= hy
+                && y < hy + hh as i32
+        })
+    }
+
+    pub fn refresh_bar_metrics(&mut self, now_ms: u64) {
+        if self.island.is_bar() {
+            self.bar_deadline = Some(now_ms);
+        }
+    }
+
+    pub fn set_bar_metrics(
+        &mut self,
+        snapshot: crate::bar::metrics::Snapshot,
+        now_ms: u64,
+    ) -> bool {
+        let damage = metrics_damage(self.bar_metrics_cache.as_ref(), &snapshot);
+        if damage == BarDamage::NONE {
+            return false;
+        }
+        self.bar_metrics_cache = Some(snapshot);
+        if !self.island.is_bar() {
+            return false;
+        }
+        if damage.contains(BarDamage::CENTER) {
+            self.bar_left_cache = None;
+            self.bar_right_cache = None;
+        }
+        let (width, height) = self.current_logical_size();
+        self.current = self.render_bar_with_damage(self.state, width, height, now_ms, damage);
+        true
+    }
+
     pub fn handle_click(&mut self, x: i32, y: i32, now_ms: u64) -> ClickOutcome {
         let (x, y) = (self.to_logical(x), self.to_logical(y));
         let hit_id = self
@@ -518,18 +597,21 @@ impl Controller {
         if let Some(id) = hit_id {
             match id {
                 HIT_MEDIA_PLAY_PAUSE => return ClickOutcome::MediaToggle,
-                HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
-                HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
                 HIT_ALERT_DISMISS => {
+                    let previous_geometry = self.current_logical_size();
                     self.alerts.pop_front();
-                    let _ = self.morph_to_target(now_ms);
+                    self.arm_front_alert(now_ms);
+                    if !self.island.is_bar() && previous_geometry == self.target_size(self.state) {
+                        self.begin_content_transition(now_ms);
+                    }
+                    self.morph_to_target(now_ms);
                     return ClickOutcome::AlertDismiss;
                 }
+                HIT_MEDIA_PREV => return ClickOutcome::MediaPrev,
+                HIT_MEDIA_NEXT => return ClickOutcome::MediaNext,
                 crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
-                crate::bar::HIT_BAR_ISLAND_PILL => {
-                    if self.manually_expanded {
-                        self.manually_expanded = false;
-                        let _ = self.morph_to_target(now_ms);
+                crate::bar::HIT_BAR_TERMIELLE_MODULE => {
+                    if self.collapse_if_expanded(now_ms) {
                         return ClickOutcome::Collapsed;
                     } else if self.toggle_expand(now_ms) {
                         return ClickOutcome::Expanded;
@@ -545,9 +627,13 @@ impl Controller {
                 _ => {}
             }
         }
-        if self.manually_expanded {
-            self.manually_expanded = false;
-            let _ = self.morph_to_target(now_ms);
+        if self.island.is_bar() {
+            // Passive status modules are not hidden popup triggers in the
+            // persistent Waybar surface. Only the explicit center module hit
+            // above may open or close the Termielle popup.
+            return ClickOutcome::None;
+        }
+        if self.collapse_if_expanded(now_ms) {
             return ClickOutcome::Collapsed;
         }
         if self.toggle_expand(now_ms) {
@@ -565,23 +651,34 @@ impl Controller {
         if self.hover_point == point {
             return false;
         }
-        self.hover_point = point;
         // Repaint only when the point moved across an icon hit-rect boundary.
         let on_icon = |pt: &Option<(i32, i32)>| {
-            pt.is_some_and(|(px, py)| {
-                self.icon_hits.iter().any(|(_, hx, hy, hw, hh)| {
+            pt.and_then(|(px, py)| {
+                self.icon_hits.iter().position(|(_, hx, hy, hw, hh)| {
                     px >= *hx && px < hx + *hw as i32 && py >= *hy && py < hy + *hh as i32
                 })
             })
         };
-        on_icon(&self.hover_point) != on_icon(&point)
+        let changed = on_icon(&self.hover_point) != on_icon(&point);
+        self.hover_point = point;
+        if changed && self.island.is_enabled() {
+            let (width, height) = self.current_logical_size();
+            self.current = self.render_island(self.state, width, height, self.clock_ms);
+        }
+        changed
     }
 
     pub fn toggle_expand(&mut self, now_ms: u64) -> bool {
         if !self.island.is_enabled() {
             return false;
         }
-        self.manually_expanded = !self.manually_expanded;
+        if self.collapse_if_expanded(now_ms) {
+            return true;
+        }
+        self.manually_expanded = true;
+        self.interaction_deadline = Some(now_ms.saturating_add(100));
+        self.hover_deadline = None;
+        self.hover_suppressed = false;
         self.morph_to_target(now_ms)
     }
 
@@ -596,37 +693,30 @@ impl Controller {
             return false;
         }
         self.manually_expanded = false;
+        self.interaction_deadline = None;
+        self.hover_deadline = None;
+        if self.island.is_bar() {
+            self.hover_expanded = false;
+            self.hover_suppressed = true;
+        }
         self.morph_to_target(now_ms)
     }
 
-    /// Tracks the cursor entering (`inside = true`) or leaving the pill.
-    /// Hover expands the idle pill when `expand_on_hover` is set; leaving
-    /// collapses it again unless it was manually toggled open.
+    /// Tracks the cursor without opening the persistent bar. Bar expansion is
+    /// click-only; standalone Island keeps the existing hover affordance.
     pub fn set_hover(&mut self, inside: bool, now_ms: u64) -> bool {
-        if !self.island.is_enabled() || !self.island.expand_on_hover {
+        if !self.island.is_enabled() {
             return false;
         }
-        let inside = if self.island.is_bar() {
-            if let Some((hx, hy)) = self.hover_point {
-                let (ix, iy, iw, ih) = if self.is_expanded_idle() {
-                    self.bar_card_rect()
-                } else if !self.bar_module("center", "island") {
-                    // Hidden center module: no pill to hover.
-                    (0, 0, 0, 0)
-                } else {
-                    let (px, py, pw, ph) = self.bar_pill_rect(self.bar_width);
-                    (px, py, pw as i32, ph as i32)
-                };
-                hx >= ix && hx < ix + iw && hy >= iy && hy < iy + ih
-            } else {
-                false
-            }
-        } else {
-            inside
-        };
+        if self.island.is_bar() {
+            self.hover_expanded = false;
+            self.hover_deadline = None;
+            return false;
+        }
+        if !self.island.expand_on_hover {
+            return false;
+        }
         if self.state != VisualState::Idle || self.manually_expanded {
-            // Still track the flag so a leave during an agent turn can't
-            // collapse anything afterwards.
             self.hover_expanded = inside;
             return false;
         }
@@ -641,7 +731,7 @@ impl Controller {
     /// The island swells ~3% under the pointer, like the Dynamic Island
     /// under the fingertip, and settles back on release.
     pub fn set_pressed(&mut self, pressed: bool, now_ms: u64) -> bool {
-        if !self.island.is_enabled() || self.pressed == pressed {
+        if !self.island.is_enabled() || self.island.is_bar() || self.pressed == pressed {
             return false;
         }
         self.pressed = pressed;
@@ -684,12 +774,26 @@ impl Controller {
         let (from_w, from_h) = self.current_logical_size();
         let params = self.morph_params(from_w, from_h, target_w, target_h);
         self.retarget_separation(params);
+        let carried_progress = self.spring.as_ref().map(Spring2D::progress);
+
+        // Metadata and queued alerts do not restart an already-correct morph
+        // or discard elapsed time since the last animation frame.
+        if !self.reduced_motion
+            && self.spring.as_ref().is_some_and(|s| {
+                s.target_x == target_w as f32
+                    && s.target_y == target_h as f32
+                    && s.target_radius() == target_r
+            })
+        {
+            self.current = self.render_island(self.state, from_w, from_h, now_ms);
+            return true;
+        }
 
         if self.reduced_motion {
             self.spring = None;
+            self.separation = None;
             self.radius = target_r;
             self.current = self.render_island(self.state, target_w, target_h, now_ms);
-            self.animation = AnimationSource::Still(self.current.clone());
             self.frame_deadline = None;
             return true;
         }
@@ -717,7 +821,6 @@ impl Controller {
             self.spring = None;
             self.radius = target_r;
             self.current = self.render_island(self.state, target_w, target_h, now_ms);
-            self.animation = AnimationSource::Still(self.current.clone());
             self.frame_deadline = None;
             return true;
         }
@@ -730,16 +833,29 @@ impl Controller {
             target_r,
             params,
         );
+        spring.preserve_position(from_w, from_h);
+        if let Some(progress) = carried_progress {
+            spring.preserve_progress(progress);
+        }
         spring.vx = vel_x;
         spring.vy = vel_y;
         spring.vz = vel_z;
         self.spring = Some(spring);
         self.spring_last_ms = now_ms;
-        let interval = self.frame_interval_ms.unwrap_or(16);
+        let interval = self.motion_interval_ms;
         let next = now_ms
             .saturating_add(interval)
             .saturating_sub(self.present_cost_ms.min(interval.saturating_sub(1)));
         self.frame_deadline = Some(next);
+        // State ownership and pixels change together. Otherwise the event
+        // path acknowledges the new state while presenting the previous glyph
+        // until the first display-clock wake.
+        self.current = self.render_island(
+            self.state,
+            from_w.round().max(1.0) as u32,
+            from_h.round().max(1.0) as u32,
+            now_ms,
+        );
         true
     }
 }

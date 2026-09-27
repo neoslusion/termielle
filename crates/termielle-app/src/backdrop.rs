@@ -26,9 +26,23 @@ pub const BACKDROP_CACHE_MS: u64 = 1000;
 /// Captured backdrop in straight (non-premultiplied) opaque BGRA, row-major.
 #[derive(Clone, Debug, Default)]
 pub struct Backdrop {
+    pub origin: (i32, i32),
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+}
+
+impl Backdrop {
+    /// Screen-anchored sampling never stretches a cached image during a morph.
+    pub fn sample(&self, x: i32, y: i32) -> Option<&[u8]> {
+        let bx = i64::from(x) - i64::from(self.origin.0);
+        let by = i64::from(y) - i64::from(self.origin.1);
+        if bx < 0 || by < 0 || bx >= i64::from(self.width) || by >= i64::from(self.height) {
+            return None;
+        }
+        let offset = (by as usize * self.width as usize + bx as usize) * 4;
+        self.pixels.get(offset..offset + 4)
+    }
 }
 
 /// Captures the virtual-screen region `(x, y, w, h)` in physical pixels.
@@ -117,6 +131,7 @@ pub fn capture_backdrop(x: i32, y: i32, w: u32, h: u32, fill: [u8; 4]) -> Option
         let _ = ReleaseDC(None, screen);
     }
     Some(Backdrop {
+        origin: (x, y),
         width: w,
         height: h,
         pixels,
@@ -243,8 +258,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_capture_stays_anchored_when_window_resizes_or_moves() {
+        let bg = Backdrop {
+            origin: (-10, 20),
+            width: 2,
+            height: 2,
+            pixels: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+        };
+        assert_eq!(bg.sample(-9, 21), Some(&[10, 11, 12, 255][..]));
+        assert_eq!(bg.sample(-10, 20), Some(&[1, 2, 3, 255][..]));
+        assert_eq!(bg.sample(-11, 20), None);
+        assert_eq!(bg.sample(-9, 22), None);
+    }
+
+    #[test]
     fn blur_of_uniform_image_is_identity() {
         let mut bg = Backdrop {
+            origin: (0, 0),
             width: 16,
             height: 16,
             pixels: vec![77u8; 16 * 16 * 4],
@@ -256,6 +286,7 @@ mod tests {
     #[test]
     fn blur_radius_zero_is_noop() {
         let mut bg = Backdrop {
+            origin: (0, 0),
             width: 8,
             height: 8,
             pixels: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
@@ -273,6 +304,7 @@ mod tests {
         let w = 32u32;
         let h = 32u32;
         let mut bg = Backdrop {
+            origin: (0, 0),
             width: w,
             height: h,
             pixels: vec![0u8; (w * h * 4) as usize],
@@ -316,6 +348,7 @@ mod tests {
             }
         }
         let mut bg = Backdrop {
+            origin: (0, 0),
             width: w,
             height: h,
             pixels,
@@ -335,6 +368,7 @@ mod tests {
     fn desaturate_pulls_hue_without_touching_alpha_or_gray() {
         // Pure orange pixel: channels must converge, alpha stays.
         let mut bg = Backdrop {
+            origin: (0, 0),
             width: 2,
             height: 1,
             pixels: vec![0, 120, 212, 255, 128, 128, 128, 255],
@@ -353,6 +387,7 @@ mod tests {
         assert_eq!(&bg.pixels[4..8], &[128, 128, 128, 255]);
         // Zero amount is a no-op.
         let mut flat = Backdrop {
+            origin: (0, 0),
             width: 1,
             height: 1,
             pixels: vec![10, 200, 30, 255],

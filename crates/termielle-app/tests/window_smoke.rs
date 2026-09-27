@@ -4,6 +4,7 @@ use std::time::Duration;
 use termielle_app::animation::FrameBuffer;
 use termielle_app::window::OverlayWindow;
 use termielle_core::{AppConfig, WindowPosition};
+use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongW, WS_EX_NOACTIVATE};
 
 const RED_PIXEL: [u8; 4] = [0, 0, 255, 255];
 
@@ -25,6 +26,12 @@ fn red_frame(width: u32, height: u32) -> FrameBuffer {
 #[test]
 fn window_smoke_present_and_destroy() {
     let mut window = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
+    let style = unsafe { GetWindowLongW(window.hwnd(), GWL_EXSTYLE) };
+    assert_ne!(
+        style as u32 & WS_EX_NOACTIVATE.0,
+        0,
+        "overlay must not steal terminal focus"
+    );
     window.present(&red_frame(2, 2)).expect("present frame");
     thread::sleep(Duration::from_millis(1));
     let (rect, monitor) = window.position();

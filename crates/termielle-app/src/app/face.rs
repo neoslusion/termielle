@@ -2,7 +2,7 @@
 
 use super::controller::Controller;
 use super::types::FACE_SIZE;
-use crate::animation::{AnimationSource, FrameBuffer, GifAnimation, fallback_frame};
+use crate::animation::{FrameBuffer, GifAnimation, fallback_frame};
 use termielle_core::VisualState;
 
 impl Controller {
@@ -18,6 +18,9 @@ impl Controller {
         self.face_deadline = None;
         self.face_decoder = None;
         self.face_frame = fallback_frame(state, FACE_SIZE, 1.0);
+        if !self.island.has_widget("face") {
+            return;
+        }
         let Some(path) = self.assets.resolve(state) else {
             return;
         };
@@ -40,23 +43,46 @@ impl Controller {
         }
     }
 
+    /// Idle faces remain alive but at a restrained 10 fps; active/playing
+    /// surfaces retain the asset cadence because another animation already
+    /// keeps the compositor active there.
+    fn face_min_delay_ms(&self) -> u64 {
+        if self.state == termielle_core::VisualState::Idle && !self.media_playing() {
+            100
+        } else {
+            20
+        }
+    }
+
     /// Arms the next face-animation tick when the face can advance: island
-    /// mode, animated faces, motion allowed, and either frames still filling
-    /// or 2+ frames decoded.
+    /// mode, animation allowed, and either frames are filling or 2+ are cached.
     pub(crate) fn arm_face_deadline(&mut self, now_ms: u64) {
         self.face_deadline = None;
         if !self.island.is_enabled() || self.reduced_motion || !self.island.face_animated {
             return;
         }
+        if self.presentation() == crate::animation::notch::Presentation::Hidden {
+            return;
+        }
+        // A full-width bar repaint is far more expensive than the small island
+        // surface. Keep its resting face as a polished still; active agent or
+        // media states still animate normally.
+        if self.island.is_bar()
+            && self.state == termielle_core::VisualState::Idle
+            && !self.media_playing()
+        {
+            return;
+        }
         if self.face_decoder.is_none() && self.face_frames.len() < 2 {
             return;
         }
+        let minimum = self.face_min_delay_ms();
         let delay = self
             .face_delays
             .get(self.face_idx)
             .copied()
             .unwrap_or(40)
-            .max(20);
+            .max(minimum as u32);
         self.face_deadline = Some(now_ms.saturating_add(delay as u64));
     }
 
@@ -83,32 +109,20 @@ impl Controller {
             }
         }
         if self.face_frames.len() < 2 {
-            // Single-frame face: nothing to cycle; re-arm only while filling.
-            if self.face_decoder.is_none() {
-                self.face_deadline = None;
-            } else {
-                let delay = self
-                    .face_delays
-                    .get(self.face_idx)
-                    .copied()
-                    .unwrap_or(40)
-                    .max(20);
-                self.face_deadline = Some(now_ms.saturating_add(delay as u64));
-            }
+            self.arm_face_deadline(now_ms);
             return;
         }
         self.face_idx = (self.face_idx + 1) % self.face_frames.len();
-        self.face_frame = self.face_frames[self.face_idx].clone();
+        let minimum = self.face_min_delay_ms();
         let delay = self
             .face_delays
             .get(self.face_idx)
             .copied()
             .unwrap_or(40)
-            .max(20);
+            .max(minimum as u32);
         self.face_deadline = Some(now_ms.saturating_add(delay as u64));
         let (w, h) = self.current_logical_size();
         self.current = self.render_island(self.state, w, h, now_ms);
-        self.animation = AnimationSource::Still(self.current.clone());
     }
 }
 /// Box-downscales a premultiplied BGRA frame to `size x size`.

@@ -14,29 +14,82 @@ pub(crate) fn ellipsize_middle(text: &str, max_chars: usize) -> String {
     let tail_str: String = text.chars().skip(count - tail).collect();
     format!("{head_str}…{tail_str}")
 }
-/// Draws one `LABEL value` metric run: dim label, bright value. `label_w`
-/// is the label advance in px (8/char at this size; pass wider for glyphs
-/// like `⚡`).
+/// Draws a secondary label and primary value on the same control baseline.
 pub(crate) fn paint_metric_text(
+    frame: &mut crate::animation::FrameBuffer,
+    rect: (i32, i32, u32, u32),
+    label: &str,
+    value: &str,
+    primary: [u8; 4],
+    secondary: [u8; 4],
+) {
+    let (x, y, width, height) = rect;
+    crate::animation::notch::draw_text_in_rect(
+        frame,
+        label,
+        (x, y, 30, height),
+        11,
+        false,
+        secondary,
+        false,
+    );
+    crate::animation::notch::draw_text_in_rect(
+        frame,
+        value,
+        (x + 30, y, width.saturating_sub(30), height),
+        12,
+        false,
+        primary,
+        true,
+    );
+}
+
+/// Supersampled monochrome speaker with a wave or mute slash.
+pub(crate) fn paint_speaker(
     frame: &mut crate::animation::FrameBuffer,
     x: i32,
     y: i32,
-    max_w: u32,
-    label: &str,
-    label_w: i32,
-    value: &str,
+    muted: bool,
+    color: [u8; 4],
 ) {
-    crate::animation::notch::draw_text(frame, label, x, y, max_w, 11, false, [165, 165, 165, 205]);
-    crate::animation::notch::draw_text(
-        frame,
-        value,
-        x + label_w,
-        y,
-        max_w.saturating_sub(label_w as u32),
-        11,
-        false,
-        [245, 245, 245, 255],
-    );
+    let scale = frame.scale;
+    let size = (24.0 * scale).ceil() as i32;
+    for py in 0..size {
+        for px in 0..size {
+            let mut coverage = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let u = (px as f32 + (sx as f32 + 0.5) / 4.0) / scale;
+                    let v = (py as f32 + (sy as f32 + 0.5) / 4.0) / scale - 8.0;
+                    let body = (2.0..=6.0).contains(&u) && v.abs() <= 3.0;
+                    let cone = (6.0..=11.0).contains(&u) && v.abs() <= u - 3.0;
+                    let radius = ((u - 10.0).powi(2) + v * v).sqrt();
+                    let wave = u >= 13.0 && (radius - 7.0).abs() <= 0.75 && v.abs() <= 5.5;
+                    let slash = (13.0..=21.0).contains(&u) && (v - (u - 17.0)).abs() < 1.0;
+                    coverage += u32::from(body || cone || if muted { slash } else { wave });
+                }
+            }
+            let tx = (x as f32 * scale).round() as i32 + px;
+            let ty = (y as f32 * scale).round() as i32 + py;
+            if coverage == 0
+                || tx < 0
+                || ty < 0
+                || tx >= frame.width as i32
+                || ty >= frame.height as i32
+            {
+                continue;
+            }
+            let alpha = color[3] as u32 * coverage / 16;
+            let i = (ty as usize * frame.width as usize + tx as usize) * 4;
+            for (channel, source) in color.iter().enumerate().take(3) {
+                frame.pixels_pbgra[i + channel] = ((*source as u32 * alpha
+                    + frame.pixels_pbgra[i + channel] as u32 * (255 - alpha))
+                    / 255) as u8;
+            }
+            frame.pixels_pbgra[i + 3] =
+                (alpha + frame.pixels_pbgra[i + 3] as u32 * (255 - alpha) / 255) as u8;
+        }
+    }
 }
 
 #[test]

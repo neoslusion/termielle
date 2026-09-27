@@ -141,9 +141,12 @@ pub fn spawn_toast_watcher(
     wake: crate::window::WakeHandle,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        use windows::Win32::System::WinRT::{RO_INIT_SINGLETHREADED, RoInitialize};
+        use windows::Win32::System::WinRT::RO_INIT_SINGLETHREADED;
         // STA: the listener rejects MTA callers with RPC_E_WRONG_THREAD.
-        let _ = unsafe { RoInitialize(RO_INIT_SINGLETHREADED) };
+        let Ok(_apartment) = crate::apartment::Apartment::new(RO_INIT_SINGLETHREADED) else {
+            eprintln!("toast watcher: Windows Runtime initialization failed");
+            return;
+        };
         let listener = match UserNotificationListener::Current() {
             Ok(l) => l,
             Err(_) => return,

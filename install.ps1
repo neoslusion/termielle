@@ -27,6 +27,8 @@
 .EXAMPLE
     irm https://github.com/neoslusion/termielle/releases/latest/download/install.ps1 | iex
 #>
+#Requires -Version 7
+
 [CmdletBinding()]
 param(
     [string]$Repo = 'neoslusion/termielle',
@@ -100,9 +102,29 @@ function Backup-Once {
     return $backup
 }
 
-# Merges the Termielle hooks fragment into ~/.claude/settings.json.
-# Termielle-owned keys are refreshed on every run; user-owned keys are
-# preserved. The result is validated before it replaces the file.
+function Get-ClaudeEntriesWithoutTermielle {
+    param([object[]]$Entries)
+    $kept = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        if ($entry -isnot [System.Collections.IDictionary]) {
+            $kept.Add($entry)
+            continue
+        }
+        $entryHooks = @($entry['hooks'] | Where-Object {
+            -not ($_['type'] -eq 'command' -and $_['command'] -match 'termielle-emit(?:\.exe)?')
+        })
+        if ($entryHooks.Count -eq 0) { continue }
+        $copy = @{}
+        foreach ($key in $entry.Keys) { $copy[$key] = $entry[$key] }
+        $copy['hooks'] = $entryHooks
+        $kept.Add($copy)
+    }
+    return $kept.ToArray()
+}
+
+# Refreshes only Termielle command entries while preserving every other hook
+# registered under the same Claude event.
 function Merge-ClaudeSettings {
     param([string]$SettingsPath, [string]$FragmentPath)
     $fragment = Read-Json $FragmentPath
@@ -115,10 +137,14 @@ function Merge-ClaudeSettings {
         throw 'the hooks key in settings.json is not an object; refusing to modify'
     }
     foreach ($key in $fragment['hooks'].Keys) {
-        $settings['hooks'][$key] = $fragment['hooks'][$key]
+        $existing = if ($settings['hooks'].ContainsKey($key)) {
+            @(Get-ClaudeEntriesWithoutTermielle @($settings['hooks'][$key]))
+        } else {
+            @()
+        }
+        $settings['hooks'][$key] = @($existing) + @($fragment['hooks'][$key])
     }
     $json = $settings | ConvertTo-Json -Depth 20
-    # The serialized result must parse before it may replace the file.
     $null = $json | ConvertFrom-Json -AsHashtable
     Write-Atomic $SettingsPath $json
 }
@@ -144,9 +170,10 @@ function Merge-CodexConfig {
         # consume the trailing newline so no blank line is left behind.
         $endAt = $existing.IndexOf($endMarker, $start)
         $end = if ($endAt -ge 0) { $endAt + $endMarker.Length } else { $existing.Length }
-        if ($end -lt $existing.Length -and $existing[$end] -eq "`r") { $end++ }
-        if ($end -lt $existing.Length -and $existing[$end] -eq "`n") { $end++ }
-        $existing = $existing.Substring(0, $start).TrimEnd() + "`r`n`r`n$block"
+        $prefix = $existing.Substring(0, $start).TrimEnd()
+        $suffix = $existing.Substring($end).TrimStart("`r", "`n")
+        $existing = $prefix + "`r`n`r`n$block" +
+            $(if ($suffix) { "`r`n$suffix" } else { '' })
     } else {
         $existing = $existing.TrimEnd() + "`r`n`r`n$block"
     }
@@ -164,7 +191,7 @@ function Merge-AgyHooks {
     # placeholder becomes the installed emitter's absolute path here; a bare
     # PATH name would fail with exit 127. Backslashes double first because
     # the path lands inside a JSON string.
-    $escaped = $EmitterPath.Replace('\', '\\')
+    $escaped = $EmitterPath.Replace('\', '\\').Replace('"', '\"')
     $text = $template.Replace('{{TERMIELLE_EMIT}}', $escaped)
     $ours = $text | ConvertFrom-Json -AsHashtable
     if (-not $ours.ContainsKey('termielle')) {
@@ -228,22 +255,27 @@ try {
     } else { 'unknown' }
     Write-Good "Termielle $version installed"
 
+    $prior = Read-Json $recordPath
     $record = @{
-        version = 1
-        bin     = $bin
-        task    = $false
-        path    = $false
-        claude  = $null
-        codex   = $null
-        opencode = $null
-        opencode2 = $null
-        agy     = $null
+        version   = 1
+        bin       = $bin
+        task      = [bool]$prior['task']
+        path      = [bool]$prior['path']
+        claude    = $prior['claude']
+        codex     = $prior['codex']
+        opencode  = $prior['opencode']
+        opencode2 = $prior['opencode2']
+        agy       = $prior['agy']
     }
 
     if (-not $NoPath) {
         Write-Step 'Adding emitter to PATH'
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-        if ($userPath -notlike "*$bin*") {
+        $pathEntries = @($userPath -split ';' | Where-Object { $_ })
+        $alreadyPresent = $pathEntries | Where-Object {
+            $_.Trim().TrimEnd('\') -ieq $bin.TrimEnd('\')
+        }
+        if (-not $alreadyPresent) {
             [Environment]::SetEnvironmentVariable(
                 'Path',
                 (($userPath.TrimEnd(';') + ';' + $bin).TrimStart(';')),
@@ -267,7 +299,8 @@ try {
         $settings = New-ScheduledTaskSettingsSet -RestartCount 3 `
             -RestartInterval (New-TimeSpan -Minutes 1) `
             -ExecutionTimeLimit (New-TimeSpan -Days 3650) `
-            -MultipleInstances IgnoreNew -StartWhenAvailable
+            -MultipleInstances IgnoreNew -StartWhenAvailable `
+            -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         $task = Get-ScheduledTask -TaskName 'Termielle' -ErrorAction SilentlyContinue
         if (-not $task) {
             Register-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
@@ -278,15 +311,21 @@ try {
             Write-Good 'Task left disabled (deliberate opt-out untouched)'
         } else {
             $logon = @($task.Triggers | Where-Object { $_.CimClass.CimClassName -match 'Logon' })
-            if ($logon.Count -eq 0 -or $logon[0].Delay -notmatch '^PT1M') {
+            $needsDelay = $logon.Count -eq 0 -or $logon[0].Delay -notmatch '^PT1M'
+            $needsPowerPolicy = $task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries
+            if ($needsDelay -or $needsPowerPolicy) {
                 Set-ScheduledTask -TaskName 'Termielle' -Action $action -Trigger $trigger `
                     -Settings $settings | Out-Null
-                Write-Good 'Task upgraded with logon delay'
+                Write-Good 'Task upgraded with current power and logon settings'
             } else {
                 Write-Good 'Task already registered'
             }
+            $record.task = [bool]$prior['task']
         }
     }
+
+# The overlay is a user-facing status surface, not a background maintenance
+# job. It must remain available after AC power is disconnected.
 
     # The release archive extracts its payload (including integrations/) into
     # the bin directory.
@@ -347,8 +386,9 @@ try {
             $record.agy = @{ hooks = $agyHooks; backup = $agyBackup }
         }
 
-        Write-Atomic $recordPath ($record | ConvertTo-Json -Depth 10)
     }
+
+    Write-Atomic $recordPath ($record | ConvertTo-Json -Depth 10)
 
     if (-not $NoStart -and -not (Get-Process 'termielle-app' -ErrorAction SilentlyContinue)) {
         Write-Step 'Starting the overlay'
@@ -359,7 +399,7 @@ try {
         }
         Write-Good 'Overlay is running; look for the character and the tray icon'
     }
-
+    Write-Host "  - Uninstall:   pwsh -File $(Join-Path $bin 'uninstall.ps1')"
     Write-Host ''
     Write-Host 'Termielle installed.' -ForegroundColor Green
     Write-Host "  - Binaries:    $bin"

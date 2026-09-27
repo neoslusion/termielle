@@ -79,9 +79,8 @@ pub struct AppConfig {
     /// overlay presents animation frames at this rate instead of the GIF's
     /// own delays; the loop duration becomes frame count / rate.
     pub frame_rate: Option<u32>,
-    /// Top-center notch / island configuration. When `layout` is `Classic`
-    /// (the default) the overlay behaves exactly as before — a free-dragging
-    /// corner pet. `Notch` attaches to the top edge; `Island` floats below it.
+    /// Surface configuration. The default `island.layout` is the native Bar;
+    /// Classic, Notch, and Island remain explicit alternate layouts.
     pub island: IslandConfig,
 }
 

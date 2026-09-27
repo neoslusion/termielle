@@ -15,7 +15,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::protocol::{EventMessage, decode_event_line, encode_event_line};
 
@@ -24,6 +24,35 @@ use crate::protocol::{EventMessage, decode_event_line, encode_event_line};
 /// reducer drops a session four hours after its last event, and the busy-stall
 /// decay usually retires it long before that.
 pub const DEFAULT_EVENT_LOG_MAX_BYTES: usize = 1_048_576;
+
+#[cfg(windows)]
+fn replace_atomically(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    use windows::core::PCWSTR;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+    let source = wide(temporary);
+    let target = wide(destination);
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(source.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(windows))]
+fn replace_atomically(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(temporary, destination)
+}
 
 /// Appends accepted events to one bounded JSON-lines file and replays it.
 #[derive(Debug)]
@@ -49,6 +78,9 @@ impl EventLog {
         // `encode_event_line` already terminates the line; the journal stores
         // the same canonical wire form the pipe carries.
         let line = encode_event_line(event)?;
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
 
         let file = OpenOptions::new()
             .create(true)
@@ -57,6 +89,7 @@ impl EventLog {
         let mut writer = BufWriter::new(file);
         writer.write_all(&line)?;
         writer.flush()?;
+        writer.get_ref().sync_data()?;
         drop(writer);
 
         let _ = self.trim();
@@ -122,7 +155,7 @@ impl EventLog {
                 }
                 writer.flush()?;
             }
-            fs::rename(&temporary, &self.path)?;
+            replace_atomically(&temporary, &self.path)?;
             Ok(())
         })();
         if result.is_err() {

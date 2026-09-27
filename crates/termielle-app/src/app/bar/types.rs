@@ -1,48 +1,34 @@
 //! Bar shared types: metrics cache, hit targets, card geometry.
 
-/// Cached system metrics for Waybar mode, refreshed on a 1-second cadence
-/// instead of blocking the render loop on every frame.
-#[derive(Clone, Debug)]
-pub(crate) struct BarMetricsCache {
-    pub last_query_ms: u64,
-    pub workspaces: crate::bar::workspaces::WorkspaceSnapshot,
-    pub window_title: String,
-    pub time_str: String,
-    pub battery: (Option<u8>, bool),
-    pub volume: crate::bar::volume::VolumeSnapshot,
-    pub memory_pct: u8,
-    pub cpu_pct: u8,
-}
-impl BarMetricsCache {
-    /// Empty snapshot for fully-hidden bars: renders nothing and performs
-    /// no system queries. `last_query_ms` is zero so re-showing a module
-    /// refetches immediately instead of serving stale emptiness for 900ms.
-    pub(crate) fn empty() -> Self {
-        Self {
-            last_query_ms: 0,
-            workspaces: crate::bar::workspaces::WorkspaceSnapshot {
-                total: 0,
-                active: 0,
-            },
-            window_title: String::new(),
-            time_str: String::new(),
-            battery: (None, false),
-            volume: crate::bar::volume::VolumeSnapshot {
-                level: 0,
-                muted: true,
-            },
-            memory_pct: 0,
-            cpu_pct: 0,
-        }
-    }
-}
+use crate::animation::FrameBuffer;
+pub(crate) use crate::bar::metrics::Snapshot as BarMetricsCache;
+use std::rc::Rc;
+
 /// One bar-module hit target: (id, x, y, w, h) in frame coordinates.
 /// Collected per zone and installed as [`Controller::icon_hits`] by the
 /// center painter, which owns the island interaction state.
 pub(crate) type BarHit = (isize, i32, i32, u32, u32);
+/// Cached transparent module layer for one bar zone. The frame is full
+/// monitor width so zone compositing keeps one coordinate system; only the
+/// configured side range is copied into the destination.
+pub(crate) struct BarZoneCache {
+    pub(crate) key: (u32, u32, f32, u32),
+    pub(crate) frame: Rc<FrameBuffer>,
+    pub(crate) hits: Vec<BarHit>,
+}
+
+/// Transparent breathing room between the persistent strip and its popup.
+/// The popup is a separate island surface, not a continuation of the bar.
+pub(crate) const BAR_POPUP_GAP: u32 = 6;
 /// Expanded-card geometry for the bar center painter: where the drop-down
 /// card lives plus whether this frame is expanded at all.
 pub(crate) struct BarCard {
+    pub(crate) content_w: u32,
+    pub(crate) content_h: u32,
+    /// Strip offset inside the current full frame; bottom-bar popups shift
+    /// the strip down by the expanded height.
+    pub(crate) bar_y: i32,
+    pub(crate) progress: f32,
     pub(crate) island_x: i32,
     pub(crate) island_y: i32,
     pub(crate) island_w: u32,

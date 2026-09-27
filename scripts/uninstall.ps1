@@ -69,8 +69,29 @@ $TermielleHookKeys = @(
     'Stop', 'StopFailure', 'SessionEnd'
 )
 
-# Removes the Termielle-owned hook keys from ~/.claude/settings.json when no
-# pre-Termielle backup exists, validating the result before writing.
+function Get-ClaudeEntriesWithoutTermielle {
+    param([object[]]$Entries)
+    $kept = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($Entries)) {
+        if ($null -eq $entry) { continue }
+        if ($entry -isnot [System.Collections.IDictionary]) {
+            $kept.Add($entry)
+            continue
+        }
+        $entryHooks = @($entry['hooks'] | Where-Object {
+            -not ($_['type'] -eq 'command' -and $_['command'] -match 'termielle-emit(?:\.exe)?')
+        })
+        if ($entryHooks.Count -eq 0) { continue }
+        $copy = @{}
+        foreach ($key in $entry.Keys) { $copy[$key] = $entry[$key] }
+        $copy['hooks'] = $entryHooks
+        $kept.Add($copy)
+    }
+    return $kept.ToArray()
+}
+
+# Removes only Termielle command entries, retaining user hooks registered on
+# the same Claude events.
 function Remove-ClaudeHooks {
     param([string]$SettingsPath, [string]$FragmentPath)
     $keys = $TermielleHookKeys
@@ -90,7 +111,13 @@ function Remove-ClaudeHooks {
         return
     }
     foreach ($key in $keys) {
-        $null = $settings['hooks'].Remove($key)
+        if (-not $settings['hooks'].ContainsKey($key)) { continue }
+        $kept = @(Get-ClaudeEntriesWithoutTermielle @($settings['hooks'][$key]))
+        if ($kept.Count -eq 0) {
+            $null = $settings['hooks'].Remove($key)
+        } else {
+            $settings['hooks'][$key] = $kept
+        }
     }
     if ($settings['hooks'].Count -eq 0) {
         $null = $settings.Remove('hooks')
@@ -113,8 +140,10 @@ function Remove-CodexBlock {
     $end = if ($endAt -ge 0) { $endAt + $endMarker.Length } else { $existing.Length }
     if ($end -lt $existing.Length -and $existing[$end] -eq "`r") { $end++ }
     if ($end -lt $existing.Length -and $existing[$end] -eq "`n") { $end++ }
-    $kept = $existing.Substring(0, $start).TrimEnd()
-    Write-Atomic $ConfigPath ($kept + "`r`n")
+    $prefix = $existing.Substring(0, $start).TrimEnd()
+    $suffix = $existing.Substring($end).TrimStart("`r", "`n")
+    $kept = $prefix + $(if ($suffix) { "`r`n`r`n$suffix`r`n" } else { "`r`n" })
+    Write-Atomic $ConfigPath $kept
 }
 
 # Removes the Termielle handler from ~/.gemini/config/hooks.json when no
@@ -133,8 +162,8 @@ function Remove-AgyHook {
     }
 }
 
-# Reverses one configuration using its pre-Termielle backup, or the
-# surgical removal when no backup exists.
+# Prefer surgical removal so edits made after installation survive. Restore the
+# first-run backup only when the current file cannot be cleaned safely.
 function Restore-Config {
     param(
         [string]$ConfigPath,
@@ -142,16 +171,20 @@ function Restore-Config {
         [scriptblock]$Surgical,
         [string]$Label
     )
-    if (Test-Path -LiteralPath $ConfigPath) {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+        Write-Good "$Label had no config file"
+        return
+    }
+    try {
+        & $Surgical
+        Write-Good "$Label cleaned without discarding newer user edits"
+    } catch {
         if ($Backup -and (Test-Path -LiteralPath $Backup)) {
             Copy-Item -LiteralPath $Backup -Destination $ConfigPath -Force
-            Write-Good "$Label restored from backup"
+            Write-Good "$Label restored from backup after surgical cleanup failed"
         } else {
-            & $Surgical
-            Write-Good "$Label cleaned (no backup was available)"
+            throw
         }
-    } else {
-        Write-Good "$Label had no config file"
     }
 }
 

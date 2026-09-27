@@ -72,31 +72,25 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
                 90,
                 if transparency { 40 } else { 0 },
             ),
-            "transparent" => ([30, 30, 30, 90], 16, 20, 30, 30),
+            "transparent" => ([30, 30, 30, 70], 0, 20, 24, 18),
             "midnight" => ([12, 18, 32, 205], 28, 28, 50, 80),
             _ => (
-                [32, 32, 32, if transparency { 205 } else { 255 }],
+                [30, 22, 18, if transparency { 190 } else { 255 }],
+                12,
                 24,
-                38,
-                70,
-                if transparency { 60 } else { 0 },
+                42,
+                if transparency { 48 } else { 0 },
             ),
         };
-    // System-following dark mode matches the Windows 11 taskbar acrylic:
-    // Windows 11 taskbar acrylic naturally infuses a subtle undertone (~16%)
-    // of the active accent / colorization color (e.g. Windows blue),
-    // giving that signature luminous slate-blue acrylic look.
-    // When "Show accent color on Start and taskbar" is enabled, it uses
-    // a richer 40% accent blend.
+    // Only opt into wallpaper-independent accent tinting when the user
+    // requests it in Windows. Otherwise activity colors sit on neutral glass.
     if name == "auto" {
         config.glass.notch_black = false;
         if resolved != "light" {
-            let base_tint = [30, 30, 30, if transparency { 180 } else { 255 }];
+            let base_tint = tint;
             let accent = crate::system::accent_color_bgra();
             let mix = if crate::system::taskbar_shows_accent() {
                 ACCENT_MIX_VIVID
-            } else if transparency {
-                ACCENT_MIX_SUBTLE
             } else {
                 0.0
             };
@@ -116,9 +110,6 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
 
 /// Vivid accent mix when "Show accent color on Start and taskbar" is enabled (40%).
 pub const ACCENT_MIX_VIVID: f32 = 0.40;
-/// Subtle accent infusion for Windows 11 acrylic (~16%), giving the dark acrylic
-/// its signature cool blue / accent luminous undertone.
-pub const ACCENT_MIX_SUBTLE: f32 = 0.16;
 
 /// Linear blend of a BGRA tint toward the accent color. Alpha is preserved:
 /// translucency stays the theme's decision, only the hue follows.
@@ -172,6 +163,15 @@ pub fn theme_roots() -> Vec<PathBuf> {
 pub fn resolve_theme(config: &mut IslandConfig) {
     let roots = theme_roots();
     resolve_theme_with_roots(config, &roots);
+}
+/// Select a theme from a user-facing control. Unlike startup resolution,
+/// this intentionally clears the previous glass overrides so selecting
+/// Liquid Dark, Light, Midnight, or Transparent actually changes the bar.
+/// Direct config edits still retain their explicit glass values.
+pub fn select_theme(config: &mut IslandConfig, name: &str) {
+    config.theme = name.to_owned();
+    config.glass = GlassConfig::default();
+    resolve_theme(config);
 }
 
 /// [`resolve_theme`] with explicit search roots, for hermetic tests.
@@ -256,7 +256,33 @@ mod tests {
         // Windows 11 taskbar light material: #F3F3F3.
         assert_eq!(c.glass.tint, [243, 243, 243, 230]);
     }
+    #[test]
+    fn tray_selection_clears_stale_explicit_glass() {
+        let mut c = IslandConfig {
+            theme: "transparent".into(),
+            glass: GlassConfig {
+                tint: [200, 100, 50, 20],
+                blur_radius: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        select_theme(&mut c, "midnight");
+        assert_eq!(c.theme, "midnight");
+        assert_eq!(c.glass.tint, [12, 18, 32, 205]);
+        assert_eq!(c.glass.blur_radius, 28);
+    }
 
+    #[test]
+    fn transparent_theme_disables_backdrop_blur() {
+        let mut c = IslandConfig {
+            theme: "transparent".into(),
+            ..Default::default()
+        };
+        apply_theme(&mut c, "transparent");
+        assert_eq!(c.glass.tint, [30, 30, 30, 70]);
+        assert_eq!(c.glass.blur_radius, 0);
+    }
     #[test]
     fn auto_theme_resolves_to_the_taskbar_material() {
         let mut c = IslandConfig {
@@ -279,18 +305,16 @@ mod tests {
         } else {
             let base = [
                 30,
-                30,
-                30,
+                22,
+                18,
                 if crate::system::transparency_enabled() {
-                    180
+                    190
                 } else {
                     255
                 },
             ];
             let mix = if crate::system::taskbar_shows_accent() {
                 ACCENT_MIX_VIVID
-            } else if crate::system::transparency_enabled() {
-                ACCENT_MIX_SUBTLE
             } else {
                 0.0
             };
@@ -331,7 +355,7 @@ mod tests {
         let mut c = IslandConfig::default();
         // Unknown names resolve to the dark taskbar default.
         apply_theme(&mut c, "nope");
-        assert_eq!(c.glass.tint, [32, 32, 32, 205]);
+        assert_eq!(c.glass.tint, [30, 22, 18, 190]);
     }
 
     #[test]

@@ -52,25 +52,65 @@ pub const TRAY_THEME_LIQUID_DARK: u32 = 110;
 pub const TRAY_THEME_MIDNIGHT: u32 = 111;
 pub const TRAY_THEME_LIGHT: u32 = 112;
 pub const TRAY_THEME_TRANSPARENT: u32 = 113;
+pub const TRAY_THEME_AUTO: u32 = 114;
 
-/// Y-offset presets
+/// Y-offset presets for standalone Island/Notch layouts.
 pub const TRAY_YOFFSET_0: u32 = 120;
 pub const TRAY_YOFFSET_12: u32 = 121;
 pub const TRAY_YOFFSET_80: u32 = 122;
 pub const TRAY_YOFFSET_150: u32 = 123;
 pub const TRAY_YOFFSET_300: u32 = 124;
 
+/// Bar position commands.
+pub const TRAY_BAR_TOP: u32 = 125;
+pub const TRAY_BAR_BOTTOM: u32 = 126;
+
 /// Widget toggles
-pub const TRAY_TOGGLE_TASKS: u32 = 130;
+pub const TRAY_TOGGLE_MUSIC: u32 = 130;
 pub const TRAY_TOGGLE_HOVER: u32 = 131;
 pub const TRAY_TOGGLE_FACE: u32 = 132;
 
+/// Current user-visible settings used to mark tray menu choices.
+#[derive(Clone, Debug, Default)]
+pub struct MenuState {
+    pub layout: String,
+    pub theme: String,
+    pub bar_position: String,
+    pub y_offset: i32,
+    pub music: bool,
+    pub face: bool,
+    pub hover: bool,
+}
+
+impl MenuState {
+    pub fn from_island(island: &termielle_core::IslandConfig) -> Self {
+        Self {
+            layout: match island.layout {
+                termielle_core::IslandLayout::Classic => "classic",
+                termielle_core::IslandLayout::Notch => "notch",
+                termielle_core::IslandLayout::Island => "island",
+                termielle_core::IslandLayout::Bar => "bar",
+            }
+            .to_string(),
+            theme: island.theme.clone(),
+            bar_position: match island.bar.position {
+                termielle_core::BarPosition::Top => "top",
+                termielle_core::BarPosition::Bottom => "bottom",
+            }
+            .to_string(),
+            y_offset: island.y_offset,
+            music: island.has_widget("music"),
+            face: island.has_widget("face"),
+            hover: island.expand_on_hover,
+        }
+    }
+}
 /// Edge length of the notification icon, in pixels.
 const ICON_SIZE: u32 = 32;
 
 /// The icon currently installed, destroyed on [`remove`]. Stored as a raw
 /// handle value so the static stays `Send`.
-static CURRENT_ICON: Mutex<Option<isize>> = Mutex::new(None);
+static CURRENT_ICON: Mutex<Option<(isize, bool)>> = Mutex::new(None);
 
 /// Tooltip for the tray icon, showing the current face.
 pub fn state_tooltip(state: &str) -> String {
@@ -92,12 +132,15 @@ pub fn state_tooltip(state: &str) -> String {
 /// icon is used. Returns the Win32 error code when the shell rejects the
 /// icon.
 pub fn add(hwnd: HWND, character_path: Option<&Path>) -> Result<(), u32> {
-    let icon = character_path
+    let (icon, owned) = character_path
         .and_then(character_icon)
-        .unwrap_or_else(|| unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default());
-    if let Ok(mut current) = CURRENT_ICON.lock() {
-        *current = Some(icon.0 as isize);
-    }
+        .map(|icon| (icon, true))
+        .unwrap_or_else(|| {
+            (
+                unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+                false,
+            )
+        });
     let data = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
         hWnd: hwnd,
@@ -109,9 +152,18 @@ pub fn add(hwnd: HWND, character_path: Option<&Path>) -> Result<(), u32> {
         ..Default::default()
     };
     if unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+        if let Ok(mut current) = CURRENT_ICON.lock() {
+            if let Some((raw, true)) = current.replace((icon.0 as isize, owned)) {
+                let _ = unsafe { DestroyIcon(HICON(raw as *mut core::ffi::c_void)) };
+            }
+        }
         Ok(())
     } else {
-        Err(unsafe { GetLastError().0 })
+        let error = unsafe { GetLastError().0 };
+        if owned {
+            let _ = unsafe { DestroyIcon(icon) };
+        }
+        Err(error)
     }
 }
 
@@ -138,9 +190,9 @@ pub fn remove(hwnd: HWND) -> bool {
     };
     let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) }.as_bool();
     if let Ok(mut current) = CURRENT_ICON.lock() {
-        if let Some(raw) = current.take() {
-            // SAFETY: the icon was created by `character_icon` or `LoadIconW`
-            // and is no longer referenced by the shell.
+        if let Some((raw, true)) = current.take() {
+            // Only CreateIconIndirect transfers ownership. LoadIconW's
+            // shared fallback belongs to Windows and must not be destroyed.
             unsafe {
                 let _ = DestroyIcon(HICON(raw as *mut core::ffi::c_void));
             }
@@ -152,7 +204,7 @@ pub fn remove(hwnd: HWND) -> bool {
 /// Shows the tray context menu at the cursor and returns the chosen command
 /// id, or 0 when nothing was chosen. The shell owns the message pump while
 /// the menu is up, so this call blocks.
-pub fn show_menu(hwnd: HWND) -> u32 {
+pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
     let Ok(menu) = (unsafe { CreatePopupMenu() }) else {
         return 0;
     };
@@ -161,13 +213,34 @@ pub fn show_menu(hwnd: HWND) -> u32 {
         let _ = unsafe { DestroyMenu(menu) };
         return 0;
     };
-    for (id, label) in [
-        (TRAY_LAYOUT_CLASSIC, "Layout: Classic (pet)"),
-        (TRAY_LAYOUT_NOTCH, "Layout: Notch (macOS)"),
-        (TRAY_LAYOUT_ISLAND, "Layout: Island (floating)"),
-        (TRAY_LAYOUT_BAR, "Layout: Bar (Waybar)"),
+    for (id, label, active) in [
+        (
+            TRAY_LAYOUT_CLASSIC,
+            "Layout: Classic (pet)",
+            state.layout == "classic",
+        ),
+        (
+            TRAY_LAYOUT_NOTCH,
+            "Layout: Notch (macOS)",
+            state.layout == "notch",
+        ),
+        (
+            TRAY_LAYOUT_ISLAND,
+            "Layout: Island (floating)",
+            state.layout == "island",
+        ),
+        (
+            TRAY_LAYOUT_BAR,
+            "Layout: Bar (native)",
+            state.layout == "bar",
+        ),
     ] {
-        let w = crate::window::encode_wide(label);
+        let label = if active {
+            format!("[x] {label}")
+        } else {
+            format!("[ ] {label}")
+        };
+        let w = crate::window::encode_wide(&label);
         let _ = unsafe { AppendMenuW(layout_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
     }
     let layout_label = crate::window::encode_wide("Layout");
@@ -186,13 +259,31 @@ pub fn show_menu(hwnd: HWND) -> u32 {
         let _ = unsafe { DestroyMenu(menu) };
         return 0;
     };
-    for (id, label) in [
-        (TRAY_THEME_LIQUID_DARK, "Theme: Liquid Dark"),
-        (TRAY_THEME_MIDNIGHT, "Theme: Midnight"),
-        (TRAY_THEME_LIGHT, "Theme: Light"),
-        (TRAY_THEME_TRANSPARENT, "Theme: Transparent"),
+    for (id, label, active) in [
+        (
+            TRAY_THEME_LIQUID_DARK,
+            "Theme: Liquid Dark",
+            state.theme == "liquid-dark",
+        ),
+        (
+            TRAY_THEME_MIDNIGHT,
+            "Theme: Midnight",
+            state.theme == "midnight",
+        ),
+        (TRAY_THEME_LIGHT, "Theme: Light", state.theme == "light"),
+        (
+            TRAY_THEME_TRANSPARENT,
+            "Theme: Transparent",
+            state.theme == "transparent",
+        ),
+        (TRAY_THEME_AUTO, "Theme: Auto", state.theme == "auto"),
     ] {
-        let w = crate::window::encode_wide(label);
+        let label = if active {
+            format!("[x] {label}")
+        } else {
+            format!("[ ] {label}")
+        };
+        let w = crate::window::encode_wide(&label);
         let _ = unsafe { AppendMenuW(theme_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
     }
     let theme_label = crate::window::encode_wide("Theme");
@@ -205,47 +296,82 @@ pub fn show_menu(hwnd: HWND) -> u32 {
         )
     };
 
-    // Y-offset submenu
-    let Ok(y_menu) = (unsafe { CreatePopupMenu() }) else {
+    // Position submenu: Bar has top/bottom placement; Island/Notch retain
+    // their floating Y-offset presets.
+    let Ok(position_menu) = (unsafe { CreatePopupMenu() }) else {
         let _ = unsafe { DestroyMenu(theme_menu) };
         let _ = unsafe { DestroyMenu(layout_menu) };
         let _ = unsafe { DestroyMenu(menu) };
         return 0;
     };
-    for (id, label) in [
-        (TRAY_YOFFSET_0, "Y Offset: 0 (flush)"),
-        (TRAY_YOFFSET_12, "Y Offset: 12"),
-        (TRAY_YOFFSET_80, "Y Offset: 80"),
-        (TRAY_YOFFSET_150, "Y Offset: 150"),
-        (TRAY_YOFFSET_300, "Y Offset: 300 (center)"),
-    ] {
-        let w = crate::window::encode_wide(label);
-        let _ = unsafe { AppendMenuW(y_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+    if state.layout == "bar" {
+        for (id, label, active) in [
+            (TRAY_BAR_TOP, "Position: Top", state.bar_position == "top"),
+            (
+                TRAY_BAR_BOTTOM,
+                "Position: Bottom",
+                state.bar_position == "bottom",
+            ),
+        ] {
+            let label = if active {
+                format!("[x] {label}")
+            } else {
+                format!("[ ] {label}")
+            };
+            let w = crate::window::encode_wide(&label);
+            let _ =
+                unsafe { AppendMenuW(position_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+        }
+    } else {
+        for (id, label, active) in [
+            (TRAY_YOFFSET_0, "Y Offset: 0 (flush)", state.y_offset == 0),
+            (TRAY_YOFFSET_12, "Y Offset: 12", state.y_offset == 12),
+            (TRAY_YOFFSET_80, "Y Offset: 80", state.y_offset == 80),
+            (TRAY_YOFFSET_150, "Y Offset: 150", state.y_offset == 150),
+            (
+                TRAY_YOFFSET_300,
+                "Y Offset: 300 (center)",
+                state.y_offset == 300,
+            ),
+        ] {
+            let label = if active {
+                format!("[x] {label}")
+            } else {
+                format!("[ ] {label}")
+            };
+            let w = crate::window::encode_wide(&label);
+            let _ =
+                unsafe { AppendMenuW(position_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
+        }
     }
-    let y_label = crate::window::encode_wide("Position");
+    let position_label = crate::window::encode_wide("Position");
     let _ = unsafe {
         AppendMenuW(
             menu,
             windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
-            y_menu.0 as usize,
-            PCWSTR(y_label.as_ptr()),
+            position_menu.0 as usize,
+            PCWSTR(position_label.as_ptr()),
         )
     };
 
-    // Widgets submenu: live toggles, no restart needed.
     let Ok(widgets_menu) = (unsafe { CreatePopupMenu() }) else {
-        let _ = unsafe { DestroyMenu(y_menu) };
+        let _ = unsafe { DestroyMenu(position_menu) };
         let _ = unsafe { DestroyMenu(theme_menu) };
         let _ = unsafe { DestroyMenu(layout_menu) };
         let _ = unsafe { DestroyMenu(menu) };
         return 0;
     };
-    for (id, label) in [
-        (TRAY_TOGGLE_TASKS, "Widgets: live media on/off"),
-        (TRAY_TOGGLE_HOVER, "Widgets: hover to expand on/off"),
-        (TRAY_TOGGLE_FACE, "Widgets: termielle face on/off"),
+    for (id, label, active) in [
+        (TRAY_TOGGLE_MUSIC, "Media widget", state.music),
+        (TRAY_TOGGLE_HOVER, "Hover to expand", state.hover),
+        (TRAY_TOGGLE_FACE, "Termielle face", state.face),
     ] {
-        let w = crate::window::encode_wide(label);
+        let label = if active {
+            format!("[x] {label}")
+        } else {
+            format!("[ ] {label}")
+        };
+        let w = crate::window::encode_wide(&label);
         let _ = unsafe { AppendMenuW(widgets_menu, MF_STRING, id as usize, PCWSTR(w.as_ptr())) };
     }
     let widgets_label = crate::window::encode_wide("Widgets");
@@ -281,7 +407,7 @@ pub fn show_menu(hwnd: HWND) -> u32 {
     let mut point = POINT::default();
     if unsafe { GetCursorPos(&mut point) }.is_err() {
         let _ = unsafe { DestroyMenu(widgets_menu) };
-        let _ = unsafe { DestroyMenu(y_menu) };
+        let _ = unsafe { DestroyMenu(position_menu) };
         let _ = unsafe { DestroyMenu(theme_menu) };
         let _ = unsafe { DestroyMenu(layout_menu) };
         let _ = unsafe { DestroyMenu(menu) };
@@ -290,7 +416,7 @@ pub fn show_menu(hwnd: HWND) -> u32 {
     let flags = TRACK_POPUP_MENU_FLAGS(TPM_RETURNCMD.0 | TPM_LEFTALIGN.0 | TPM_RIGHTBUTTON.0);
     let choice = unsafe { TrackPopupMenu(menu, flags, point.x, point.y, None, hwnd, None) }.0;
     let _ = unsafe { DestroyMenu(widgets_menu) };
-    let _ = unsafe { DestroyMenu(y_menu) };
+    let _ = unsafe { DestroyMenu(position_menu) };
     let _ = unsafe { DestroyMenu(theme_menu) };
     let _ = unsafe { DestroyMenu(layout_menu) };
     let _ = unsafe { DestroyMenu(menu) };
@@ -456,6 +582,21 @@ mod tests {
         assert_eq!(state_tooltip("needs_input"), "Termielle — Needs input");
         assert_eq!(state_tooltip("ready"), "Termielle — Ready");
         assert_eq!(state_tooltip("failed"), "Termielle — Failed");
+    }
+    #[test]
+    fn menu_state_reports_bar_position_and_theme() {
+        let mut island = termielle_core::IslandConfig {
+            layout: termielle_core::IslandLayout::Bar,
+            theme: "midnight".into(),
+            ..Default::default()
+        };
+        island.bar.position = termielle_core::BarPosition::Bottom;
+        island.y_offset = 80;
+        let state = MenuState::from_island(&island);
+        assert_eq!(state.layout, "bar");
+        assert_eq!(state.theme, "midnight");
+        assert_eq!(state.bar_position, "bottom");
+        assert_eq!(state.y_offset, 80);
     }
 
     #[test]

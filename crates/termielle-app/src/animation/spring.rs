@@ -34,11 +34,43 @@ pub(crate) struct Spring2D {
     /// Params from `spring_params(animation_ms, spring_bounce)`.
     pub(crate) stiffness: f32,
     damping: f32,
+    /// High-water mark for content sequencing. Physical geometry may overshoot,
+    /// but opacity/offset must never rewind when a morph is interrupted.
+    max_progress: f32,
 }
 
 /// Below these the spring is considered settled and snaps to target.
 const SETTLE_PX: f32 = 0.5;
 const SETTLE_V: f32 = 2.0;
+
+/// Exact solution for the unit-mass damped oscillator. Unlike Euler steps,
+/// this preserves the same trajectory at every display refresh rate.
+fn integrate(x: &mut f32, v: &mut f32, target: f32, stiffness: f32, damping: f32, dt: f32) {
+    if !dt.is_finite() || dt <= 0.0 {
+        return;
+    }
+    let dt = f64::from(dt.min(0.2));
+    let a = f64::from(damping) / 2.0;
+    let k = f64::from(stiffness);
+    let offset = f64::from(*x - target);
+    let velocity = f64::from(*v);
+    let discriminant = k - a * a;
+    let (c, s) = if discriminant.abs() < k.max(1.0) * 1e-6 {
+        let decay = (-a * dt).exp();
+        (decay, decay * dt)
+    } else if discriminant > 0.0 {
+        let w = discriminant.sqrt();
+        let decay = (-a * dt).exp();
+        (decay * (w * dt).cos(), decay * (w * dt).sin() / w)
+    } else {
+        let w = (-discriminant).sqrt();
+        let slow = ((-a + w) * dt).exp();
+        let fast = ((-a - w) * dt).exp();
+        ((slow + fast) / 2.0, (slow - fast) / (2.0 * w))
+    };
+    *x = (f64::from(target) + offset * c + (velocity + a * offset) * s) as f32;
+    *v = (velocity * c - (a * velocity + k * offset) * s) as f32;
+}
 
 impl Spring2D {
     pub(crate) fn new(
@@ -65,12 +97,29 @@ impl Spring2D {
             start_z: from_r,
             stiffness: params.stiffness,
             damping: params.damping,
+            max_progress: 0.0,
         }
     }
 
-    /// Morph progress toward the target, 0-1, from the remaining
-    /// displacement fraction. Content fade/slide derives from this.
+    /// Morph progress toward the target, 0-1. `step` records the high-water
+    /// mark before `progress` reads it, keeping this method shareable with
+    /// immutable renderers.
     pub(crate) fn progress(&self) -> f32 {
+        self.max_progress
+    }
+
+    pub(crate) fn target_radius(&self) -> f32 {
+        self.target_z
+    }
+
+    pub(crate) fn preserve_position(&mut self, x: f32, y: f32) {
+        self.x = x;
+        self.y = y;
+        self.start_x = x;
+        self.start_y = y;
+    }
+
+    fn measured_progress(&self) -> f32 {
         let total = (self.start_x - self.target_x)
             .abs()
             .max((self.start_y - self.target_y).abs())
@@ -85,19 +134,39 @@ impl Spring2D {
         (1.0 - remaining / total).clamp(0.0, 1.0)
     }
 
+    /// Continues content sequencing when geometry is retargeted without
+    /// discarding the current physical position or velocity.
+    pub(crate) fn preserve_progress(&mut self, progress: f32) {
+        self.max_progress = self.max_progress.max(progress.clamp(0.0, 1.0));
+    }
+
     /// Integrates one step of `dt` seconds. Returns ((width, height, radius), settled).
     pub(crate) fn step(&mut self, dt: f32) -> ((u32, u32, u32), bool) {
-        let accel_x = -self.stiffness * (self.x - self.target_x) - self.damping * self.vx;
-        self.vx += accel_x * dt;
-        self.x += self.vx * dt;
-
-        let accel_y = -self.stiffness * (self.y - self.target_y) - self.damping * self.vy;
-        self.vy += accel_y * dt;
-        self.y += self.vy * dt;
-
-        let accel_z = -self.stiffness * (self.z - self.target_z) - self.damping * self.vz;
-        self.vz += accel_z * dt;
-        self.z += self.vz * dt;
+        integrate(
+            &mut self.x,
+            &mut self.vx,
+            self.target_x,
+            self.stiffness,
+            self.damping,
+            dt,
+        );
+        integrate(
+            &mut self.y,
+            &mut self.vy,
+            self.target_y,
+            self.stiffness,
+            self.damping,
+            dt,
+        );
+        integrate(
+            &mut self.z,
+            &mut self.vz,
+            self.target_z,
+            self.stiffness,
+            self.damping,
+            dt,
+        );
+        self.max_progress = self.max_progress.max(self.measured_progress());
 
         let settled_x = (self.x - self.target_x).abs() < SETTLE_PX && self.vx.abs() < SETTLE_V;
         let settled_y = (self.y - self.target_y).abs() < SETTLE_PX && self.vy.abs() < SETTLE_V;
@@ -121,7 +190,7 @@ impl Spring2D {
             (
                 self.x.round().max(1.0) as u32,
                 self.y.round().max(1.0) as u32,
-                self.z.round().max(1.0) as u32,
+                self.z.round().max(0.0) as u32,
             ),
             settled,
         )
@@ -152,9 +221,14 @@ impl Spring1 {
     }
 
     pub(crate) fn step(&mut self, dt: f32) {
-        let accel = -self.stiffness * (self.x - self.target) - self.damping * self.v;
-        self.v += accel * dt;
-        self.x += self.v * dt;
+        integrate(
+            &mut self.x,
+            &mut self.v,
+            self.target,
+            self.stiffness,
+            self.damping,
+            dt,
+        );
         if (self.x - self.target).abs() < SETTLE_PX && self.v.abs() < SETTLE_V {
             self.x = self.target;
             self.v = 0.0;
@@ -177,6 +251,41 @@ mod tests {
     use termielle_core::spring_params;
 
     #[test]
+    fn trajectory_is_independent_of_refresh_rate() {
+        for bounce in [0.0, 0.18, 0.5] {
+            let params = spring_params(350, bounce);
+            let mut reference = Spring1::new(72.0, 320.0, params);
+            reference.step(0.2);
+            for hz in [60, 75, 120, 144, 165, 240] {
+                let mut sampled = Spring1::new(72.0, 320.0, params);
+                let dt = 1.0 / hz as f32;
+                let steps = (0.2 / dt).floor() as usize;
+                for _ in 0..steps {
+                    sampled.step(dt);
+                }
+                sampled.step(0.2 - steps as f32 * dt);
+                assert!(
+                    (reference.x - sampled.x).abs() < 0.002,
+                    "{hz} Hz, bounce {bounce}"
+                );
+                assert!((reference.v - sampled.v).abs() < 0.02, "{hz} Hz velocity");
+            }
+        }
+    }
+
+    #[test]
+    fn pathological_deltas_cannot_explode_fast_springs() {
+        let mut spring = Spring1::new(72.0, 320.0, spring_params(100, 0.5));
+        for dt in [f32::NAN, f32::INFINITY, -1.0, 0.0] {
+            spring.step(dt);
+            assert_eq!(spring.x, 72.0);
+        }
+        spring.step(60.0);
+        assert!(spring.x.is_finite() && spring.v.is_finite());
+        assert!((spring.x - 320.0).abs() < 2.0);
+    }
+
+    #[test]
     fn radius_rides_the_same_spring_to_its_target() {
         let mut spring = Spring2D::new(140, 36, 18.0, 320, 154, 28.0, spring_params(500, 0.2));
         for _ in 0..2000 {
@@ -192,13 +301,22 @@ mod tests {
 
     #[test]
     fn progress_advances_monotonically_and_preserves_velocity_on_retarget() {
-        let mut spring = Spring2D::new(140, 36, 18.0, 320, 36, 18.0, spring_params(350, 0.18));
+        let mut trajectory = Spring2D::new(140, 36, 18.0, 320, 36, 18.0, spring_params(350, 0.18));
         let mut last = 0.0;
+        for _ in 0..2_000 {
+            let (_, settled) = trajectory.step(1.0 / 240.0);
+            let progress = trajectory.progress();
+            assert!(progress >= last - 1e-6, "progress must not regress");
+            last = progress;
+            if settled {
+                break;
+            }
+        }
+        assert!(last > 0.99, "full trajectory must settle perceptually");
+
+        let mut spring = Spring2D::new(140, 36, 18.0, 320, 36, 18.0, spring_params(350, 0.18));
         for _ in 0..20 {
             spring.step(1.0 / 60.0);
-            let p = spring.progress();
-            assert!(p >= last - 1e-6, "progress must not regress");
-            last = p;
         }
         assert!(spring.vx != 0.0, "spring must be moving mid-flight");
 
@@ -214,8 +332,10 @@ mod tests {
             spring_params(350, 0.18),
         );
         retargeted.vx = inherited;
+        retargeted.preserve_progress(spring.progress());
         let dt = 1.0 / 60.0;
         retargeted.step(dt);
+        assert!(retargeted.progress() >= spring.progress());
         let coasted = retargeted.x;
         let mut from_rest = Spring2D::new(
             spring.x.round() as u32,

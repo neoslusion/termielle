@@ -48,7 +48,7 @@ pub const WORKER_TICK_MS: u64 = 120;
 pub const BACKDROP_REFRESH_MS: u64 = 140;
 
 /// A small premultiplied-BGRA bitmap (media artwork or window icon), drawn rounded.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ThumbBitmap {
     pub width: u32,
     pub height: u32,
@@ -56,7 +56,7 @@ pub struct ThumbBitmap {
 }
 
 /// Open application window icon and title.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TaskIcon {
     pub hwnd: isize,
     pub title: String,
@@ -66,7 +66,7 @@ pub struct TaskIcon {
 }
 
 /// Now-playing media from the System Media Transport Controls.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct MediaInfo {
     pub title: String,
     pub artist: String,
@@ -135,7 +135,7 @@ pub struct WorkerUpdate {
 
 /// The pill rect the worker should capture behind, updated by the GUI thread
 /// on every present. Physical pixels.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackdropRequest {
     pub x: i32,
     pub y: i32,
@@ -143,6 +143,8 @@ pub struct BackdropRequest {
     pub h: u32,
     pub radius: u32,
     pub tint: [u8; 4],
+    /// Whether the current material actually consumes a live backdrop.
+    pub blur: bool,
 }
 
 /// Shared worker controls, owned by the GUI thread and read by the worker.
@@ -150,14 +152,17 @@ pub struct BackdropRequest {
 pub struct WorkerConfig {
     /// When false the worker sleeps instead of polling.
     pub enabled: AtomicBool,
+    /// When true, SMTC media metadata and artwork are refreshed.
+    pub poll_media: AtomicBool,
     /// When true, window tasks are enumerated for task switcher.
     pub poll_tasks: AtomicBool,
 }
 
 impl WorkerConfig {
-    pub fn new(enabled: bool, poll_tasks: bool) -> Self {
+    pub fn new(enabled: bool, poll_media: bool, poll_tasks: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
+            poll_media: AtomicBool::new(poll_media),
             poll_tasks: AtomicBool::new(poll_tasks),
         }
     }
@@ -175,13 +180,20 @@ pub fn spawn_worker(
         // WinRT media queries need a multithreaded apartment on THIS thread
         // (initializing on the spawner would leave `RequestAsync` failing
         // here, and media would stay empty forever).
-        ensure_winrt();
+        let Ok(_apartment) =
+            crate::apartment::Apartment::new(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED)
+        else {
+            eprintln!("dashboard worker: Windows Runtime initialization failed");
+            return;
+        };
         let mut last_sig: Option<(i32, i32, u32, u32, u32, [u8; 4])> = None;
+        let mut last_cpu_ms = 0u64;
         let mut last_capture_ms: u64 = 0;
         // Last pill rect the GUI thread published. Retained so a static pill
         // (no presents, no fresh requests) still gets a live backdrop
         // instead of a capture frozen from its last animation.
         let mut last_req: Option<BackdropRequest> = None;
+        let mut last_requested: Option<BackdropRequest> = None;
         let mut last_req_ms: u64 = 0;
         let mut last_media_ms: u64 = 0;
         let mut last_tasks_ms: u64 = 0;
@@ -203,11 +215,17 @@ pub fn spawn_worker(
                     .ok()
                     .and_then(|mut guard| guard.take())
                 {
-                    last_req = Some(req);
-                    last_req_ms = now_ms;
-                } else if now_ms.saturating_sub(last_req_ms) > 5_000 {
-                    // The GUI went quiet (idle hidden sensor): stop capturing
-                    // until it presents again instead of burning laptop CPU.
+                    // Routine bar/metric republishes do not reactivate an
+                    // unchanged capture forever. Geometry/material changes do.
+                    if last_requested != Some(req) {
+                        last_requested = Some(req);
+                        last_req = Some(req);
+                        last_req_ms = now_ms;
+                    }
+                }
+                if now_ms.saturating_sub(last_req_ms) > 5_000 {
+                    // Routine republishes do not reset the quiet window.
+                    // Geometry/material changes above explicitly re-arm it.
                     last_req = None;
                 }
                 let mut backdrop = None;
@@ -215,7 +233,7 @@ pub fn spawn_worker(
                     let sig = (req.x, req.y, req.w, req.h, req.radius, req.tint);
                     let due = last_sig != Some(sig)
                         || now_ms.saturating_sub(last_capture_ms) > BACKDROP_REFRESH_MS;
-                    if req.w > 0 && req.h > 0 && due {
+                    if req.w > 0 && req.h > 0 && req.blur && due {
                         let mut bg = crate::backdrop::capture_backdrop(
                             req.x,
                             req.y,
@@ -235,28 +253,49 @@ pub fn spawn_worker(
                     }
                 }
 
-                // Keep CPU sampler primed and smooth in the background.
-                let _ = crate::system::cpu_percent();
+                // Prime and smooth the CPU sampler at its useful 2.5 Hz rate,
+                // not once per worker tick.
+                if now_ms.saturating_sub(last_cpu_ms) >= 400 {
+                    last_cpu_ms = now_ms;
+                    let _ = crate::system::cpu_percent();
+                }
 
-                // Expensive polls stay on their own cadences.
-                let media_due = now_ms.saturating_sub(last_media_ms) >= MEDIA_REFRESH_MS;
+                // Expensive polls stay on their own cadences and only publish
+                // when their observable snapshot changed.
+                let should_poll_media = config.poll_media.load(Ordering::Relaxed);
+                let media_due =
+                    should_poll_media && now_ms.saturating_sub(last_media_ms) >= MEDIA_REFRESH_MS;
+                let mut media_changed = false;
                 if media_due {
                     last_media_ms = now_ms;
-                    last_media = current_media();
+                    if let Ok(next) = try_current_media() {
+                        media_changed = next != last_media;
+                        if media_changed {
+                            last_media = next;
+                        }
+                    }
+                } else if !should_poll_media && last_media.is_some() {
+                    last_media = None;
+                    media_changed = true;
                 }
+
                 let should_poll_tasks = config.poll_tasks.load(Ordering::Relaxed);
                 let tasks_due =
                     should_poll_tasks && now_ms.saturating_sub(last_tasks_ms) >= TASKS_REFRESH_MS;
-                let mut tasks_cleared = false;
+                let mut tasks_changed = false;
                 if tasks_due {
                     last_tasks_ms = now_ms;
-                    last_tasks = enumerate_tasks(6);
+                    let next = enumerate_tasks(6);
+                    tasks_changed = next != last_tasks;
+                    if tasks_changed {
+                        last_tasks = next;
+                    }
                 } else if !should_poll_tasks && !last_tasks.is_empty() {
                     last_tasks.clear();
-                    tasks_cleared = true;
+                    tasks_changed = true;
                 }
 
-                if backdrop.is_some() || media_due || tasks_due || tasks_cleared {
+                if backdrop.is_some() || media_changed || tasks_changed {
                     let update = WorkerUpdate {
                         media: last_media.clone(),
                         tasks: last_tasks.clone(),
@@ -273,23 +312,25 @@ pub fn spawn_worker(
     })
 }
 
-fn ensure_winrt() {
-    use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = unsafe { RoInitialize(RO_INIT_MULTITHREADED) };
-    });
+/// Samples the System Media Transport Controls: `Some` for a playing or
+/// paused session with a non-empty title/artist. Keeping paused metadata lets
+/// the Termielle module remain a real transport control instead of vanishing
+/// after the user presses Pause.
+pub fn current_media() -> Option<MediaInfo> {
+    let _apartment =
+        crate::apartment::Apartment::new(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED)
+            .ok()?;
+    try_current_media().ok().flatten()
 }
 
-/// Samples the System Media Transport Controls: `Some` only while something
-/// is actually playing with a non-empty title/artist. Fail-soft by design —
-/// no session, no COM, or no media all yield `None`, never an error surface.
-pub fn current_media() -> Option<MediaInfo> {
-    let info = current_media_inner().ok()??;
-    if !info.playing || (info.title.is_empty() && info.artist.is_empty()) {
-        return None;
+fn try_current_media() -> windows::core::Result<Option<MediaInfo>> {
+    let Some(info) = current_media_inner()? else {
+        return Ok(None);
+    };
+    if info.title.is_empty() && info.artist.is_empty() {
+        return Ok(None);
     }
-    Some(info)
+    Ok(Some(info))
 }
 
 fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
@@ -302,8 +343,13 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
         |op| op.Status(),
         |op| op.GetResults(),
     )?;
-    let session = manager.GetCurrentSession()?;
-    if session.GetPlaybackInfo()?.PlaybackStatus()? != Playback::Playing {
+    let session = match manager.GetCurrentSession() {
+        Ok(session) => session,
+        Err(_error) if manager.GetSessions()?.Size()? == 0 => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let status = session.GetPlaybackInfo()?.PlaybackStatus()?;
+    if !matches!(status, Playback::Playing | Playback::Paused) {
         return Ok(None);
     }
     let props = block_async(
@@ -319,7 +365,7 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
             .SourceAppUserModelId()
             .map(|id| id.to_string())
             .unwrap_or_default(),
-        playing: true,
+        playing: status == Playback::Playing,
         thumbnail,
     }))
 }

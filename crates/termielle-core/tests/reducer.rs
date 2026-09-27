@@ -397,3 +397,36 @@ fn completing_a_turn_clears_the_busy_stall() {
     assert!(!reducer.advance(10_000 + BUSY_STALL_MS));
     assert_eq!(reducer.visible_state(), VisualState::Idle);
 }
+
+#[test]
+fn wall_clock_rejects_expired_and_far_future_events() {
+    let mut reducer = SessionReducer::new(5_000, BUSY_STALL_MS);
+    let now = 20_000_000;
+
+    assert_eq!(
+        reducer.apply_at(
+            message(
+                source("claude"),
+                "expired",
+                EventKind::NeedsInput,
+                now - FOUR_HOURS_MS,
+            ),
+            now,
+        ),
+        ApplyOutcome::Rejected
+    );
+    assert_eq!(
+        reducer.apply_at(
+            message(
+                source("claude"),
+                "future",
+                EventKind::NeedsInput,
+                now + 60_001,
+            ),
+            now,
+        ),
+        ApplyOutcome::Rejected
+    );
+    assert_eq!(reducer.session_count(), 0);
+    assert_eq!(reducer.visible_state(), VisualState::Idle);
+}

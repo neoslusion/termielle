@@ -39,6 +39,7 @@ $targets = @{
     WarmFirstFrameMs   = 250.0
     WorkingSetMiB      = 50.0
     IdleCpuPercentCore = 0.5
+    IdlePresentRateHz  = 1.5
 }
 
 function Emit {
@@ -107,16 +108,27 @@ $fullPipe = '\\.\pipe\' + $pipe
 $ack = Join-Path $env:TEMP ("termielle-bench-{0}.jsonl" -f $runId)
 Remove-Item -LiteralPath $ack -ErrorAction SilentlyContinue
 $session = 'bench-' + $runId
+$sandboxProfile = Join-Path $env:TEMP ("termielle-bench-profile-" + [guid]::NewGuid().ToString('N'))
+$sandboxConfig = Join-Path $sandboxProfile '.termielle\config.json'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $sandboxConfig) | Out-Null
+'{"island":{"widgets":[],"face_animated":false,"forward_toasts":false,"bar":{"modules_left":[],"modules_center":["termielle"],"modules_right":[]}}}' | Set-Content -Encoding utf8 $sandboxConfig
+$previousUserProfile = $env:USERPROFILE
+$env:USERPROFILE = $sandboxProfile
 
-$app = Start-Process -FilePath $AppExe -ArgumentList '--pipe', $fullPipe, '--ack-file', $ack -PassThru -WindowStyle Hidden
+$app = Start-Process -FilePath $AppExe -ArgumentList '--pipe', $fullPipe, '--ack-file', $ack, '--config', $sandboxConfig -PassThru -WindowStyle Hidden
+    $env:USERPROFILE = $previousUserProfile
+$idleApp = $null
+$idleAck = $null
+$idleProfile = $null
 
 function Wait-AckState {
-    param([string]$State, [int]$Seconds, [int]$PollMs = 50)
+    param([string]$State, [int]$Seconds, [int]$PollMs = 50, [int]$AfterLine = 0, [string]$AckPath = $ack)
     $deadline = (Get-Date).AddSeconds($Seconds)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Path -LiteralPath $ack) {
-            $text = Get-Content -LiteralPath $ack -Raw
-            if ($text -match ('"state":"' + $State + '"')) { return $true }
+        if (Test-Path -LiteralPath $AckPath) {
+            $lines = @(Get-Content -LiteralPath $AckPath)
+            $lastLine = $lines | Select-Object -Last 1
+            if ($lines.Count -gt $AfterLine -and $lastLine -match ('"state":"' + $State + '"')) { return $true }
         }
         Start-Sleep -Milliseconds $PollMs
     }
@@ -162,19 +174,50 @@ try {
         $emitSamples.Add($sw.Elapsed.TotalMilliseconds)
     }
 
-    # 8. Long-run average CPU while idle (Ready hold has elapsed; the overlay
-    #    sits in Idle).
-    $cpuStart = $app.TotalProcessorTime.TotalMilliseconds
+    # 8. Stop the event-driven instance, then measure a fresh process. This
+    # avoids attributing Ready holds, face streaming, or backdrop warm-up to
+    # steady-state idle CPU.
+    if (-not $app.HasExited) {
+        Stop-Process -Id $app.Id -Force
+        $app.WaitForExit(5000) | Out-Null
+    }
+    $idleRunId = [guid]::NewGuid().ToString('N')
+    $idleFullPipe = '\\.\pipe\termielle-bench-idle-' + $idleRunId
+    $idleAck = Join-Path $env:TEMP ("termielle-bench-idle-{0}.jsonl" -f $idleRunId)
+    $idleProfile = Join-Path $env:TEMP ("termielle-bench-idle-profile-" + $idleRunId)
+    $idleConfig = Join-Path $idleProfile '.termielle\config.json'
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $idleConfig) | Out-Null
+    Copy-Item -LiteralPath $sandboxConfig -Destination $idleConfig
+    Remove-Item -LiteralPath $idleAck -ErrorAction SilentlyContinue
+    $previousUserProfile = $env:USERPROFILE
+    $env:USERPROFILE = $idleProfile
+    try {
+        $idleApp = Start-Process -FilePath $AppExe `
+            -ArgumentList '--pipe', $idleFullPipe, '--ack-file', $idleAck, '--config', $idleConfig `
+            -PassThru -WindowStyle Hidden
+    } finally {
+        $env:USERPROFILE = $previousUserProfile
+    }
+    if (-not (Wait-AckState 'idle' 15 50 0 $idleAck)) { throw 'idle instance never presented' }
+    Start-Sleep -Seconds 6
+    $idleApp.Refresh()
+    $cpuStart = $idleApp.TotalProcessorTime.TotalMilliseconds
+    $idleAckLinesBefore = @(Get-Content -LiteralPath $idleAck).Count
     $wallStart = (Get-Date)
     Start-Sleep -Seconds $DurationSeconds
-    $cpuDelta = $app.TotalProcessorTime.TotalMilliseconds - $cpuStart
+    $idleApp.Refresh()
+    $cpuDelta = $idleApp.TotalProcessorTime.TotalMilliseconds - $cpuStart
+    $idleAckLines = @(Get-Content -LiteralPath $idleAck).Count - $idleAckLinesBefore
+    $idlePresentRate = $idleAckLines / [double]$DurationSeconds
     $wallMs = ((Get-Date) - $wallStart).TotalMilliseconds
-    $cores = [Environment]::ProcessorCount
-    $cpuPctCore = ($cpuDelta / $wallMs) * 100.0 / $cores
+    $cpuPctCore = ($cpuDelta / $wallMs) * 100.0
 }
 finally {
+    if ($idleApp -and -not $idleApp.HasExited) { Stop-Process -Id $idleApp.Id -Force }
     if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
     Remove-Item -LiteralPath $ack -ErrorAction SilentlyContinue
+    if ($idleAck) { Remove-Item -LiteralPath $idleAck -ErrorAction SilentlyContinue }
+    if ($idleProfile) { Remove-Item -Recurse -Force $idleProfile -ErrorAction SilentlyContinue }
 }
 
 # 9. Verdicts.
@@ -186,6 +229,7 @@ $results = [ordered]@{
     'Working set mean (MiB)'     = $workingSetMean
     'Working set peak (MiB)'     = $peak
     'Idle CPU (% of one core)'   = $cpuPctCore
+    'Idle present rate (Hz)'     = $idlePresentRate
 }
 
 $fails = 0
@@ -195,6 +239,7 @@ foreach ($key in $results.Keys) {
         'Emitter p95' { $targets.EmitterP95Ms }
         'Event-to-frame' { $targets.EventToFrameMs }
         'Warm first frame' { $targets.WarmFirstFrameMs }
+        'Idle present rate' { $targets.IdlePresentRateHz }
         'Working set' { $targets.WorkingSetMiB }
         'Idle CPU' { $targets.IdleCpuPercentCore }
         default { [double]::MaxValue }

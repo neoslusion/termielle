@@ -20,6 +20,6 @@ pub(crate) mod types;
 
 pub use controller::Controller;
 pub use types::{
-    AlertBanner, ClickOutcome, ControllerActions, FALLBACK_FRAME_SIZE, HIT_ALERT_DISMISS,
-    HIT_MEDIA_NEXT, HIT_MEDIA_PLAY_PAUSE, HIT_MEDIA_PREV,
+    AlertBanner, AlertKind, ClickOutcome, ControllerActions, FALLBACK_FRAME_SIZE,
+    HIT_ALERT_DISMISS, HIT_MEDIA_NEXT, HIT_MEDIA_PLAY_PAUSE, HIT_MEDIA_PREV,
 };

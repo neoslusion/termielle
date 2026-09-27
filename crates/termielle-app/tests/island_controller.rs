@@ -38,6 +38,43 @@ fn island_140_320() -> IslandConfig {
 }
 
 #[test]
+fn switcher_hover_repaints_on_entry_transfer_and_exit() {
+    use termielle_app::tasks::{TaskIcon, WorkerUpdate};
+    let mut config = island_140_320();
+    config.widgets = vec!["tasks".into()];
+    config.show_tasks = true;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, config);
+    c.set_task_update(WorkerUpdate {
+        tasks: (1..=2)
+            .map(|hwnd| TaskIcon {
+                hwnd,
+                title: format!("Window {hwnd}"),
+                width: 1,
+                height: 1,
+                pixels_pbgra: vec![100, 100, 100, 255],
+            })
+            .collect(),
+        ..Default::default()
+    });
+    c.toggle_expand(10000);
+    // Two centered 44px tiles, separated by 12px, in a 320px card.
+    let unhovered = c.current_frame().pixels_pbgra.clone();
+    assert!(c.set_hover_point(Some((120, 70))));
+    assert!(
+        c.current_frame().pixels_pbgra != unhovered,
+        "hover must repaint the tile and caption"
+    );
+    assert!(!c.set_hover_point(Some((121, 71))));
+    assert!(c.set_hover_point(Some((180, 70))));
+    assert!(c.set_hover_point(None));
+    assert!(
+        c.current_frame().pixels_pbgra == unhovered,
+        "leaving restores the idle tiles"
+    );
+    assert!(!c.set_hover_point(None));
+}
+
+#[test]
 fn island_starts_hidden_and_promotes_to_compact_live_on_prompt() {
     let mut island = IslandConfig::default();
     island.layout = IslandLayout::Island;
@@ -74,7 +111,7 @@ fn island_starts_hidden_and_promotes_to_compact_live_on_prompt() {
     assert_eq!(c.current_frame().width, 72);
     assert_eq!(c.current_frame().height, 36);
     // Motion ticks pace the thinking bounce ahead of the hold.
-    assert_eq!(c.next_deadline_ms(), Some(10250)); // motion tick, then thinking hold at 11000
+    assert_eq!(c.next_deadline_ms(), Some(10216)); // motion tick, then thinking hold at 11000
 }
 
 #[test]
@@ -87,7 +124,8 @@ fn island_notch_is_attached_and_floating_is_not() {
     assert!(!island_cfg.is_attached());
     assert!(notch_cfg.is_enabled());
     assert!(island_cfg.is_enabled());
-    let classic = IslandConfig::default();
+    let mut classic = IslandConfig::default();
+    classic.layout = IslandLayout::Classic;
     assert!(!classic.is_enabled());
 }
 
@@ -263,6 +301,43 @@ fn island_without_face_widget_still_renders() {
     assert_eq!(c.current_frame().height, 36);
 }
 
+#[test]
+fn task_switcher_honors_max_thumbnails() {
+    use termielle_app::tasks::{TaskIcon, WorkerUpdate};
+    let mut cfg = island_140_320();
+    cfg.widgets = vec!["tasks".into()];
+    cfg.show_tasks = true;
+    cfg.max_thumbnails = 2;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, cfg);
+    c.set_task_update(WorkerUpdate {
+        media: None,
+        tasks: (1..=4)
+            .map(|hwnd| TaskIcon {
+                hwnd,
+                title: format!("Window {hwnd}"),
+                width: 1,
+                height: 1,
+                pixels_pbgra: vec![200, 120, 40, 255],
+            })
+            .collect(),
+        backdrop: None,
+    });
+    c.toggle_expand(1000);
+
+    assert_eq!(
+        c.handle_click(132, 80, 1010),
+        termielle_app::app::ClickOutcome::ActivateWindow(1)
+    );
+    assert_eq!(
+        c.handle_click(188, 80, 1020),
+        termielle_app::app::ClickOutcome::ActivateWindow(2)
+    );
+    assert_eq!(
+        c.handle_click(76, 80, 1030),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+}
+
 /// Writes a 2x2 infinite-loop GIF where every frame covers the whole canvas.
 fn write_gif(dir: &Path, name: &str, frames: &[(u16, u8)]) {
     let path = dir.join(name);
@@ -290,9 +365,9 @@ fn write_gif(dir: &Path, name: &str, frames: &[(u16, u8)]) {
 }
 
 #[test]
-fn animated_face_advances_on_its_own_deadline() {
+fn animated_face_repaints_on_its_own_deadline() {
     let dir = tempfile::tempdir().unwrap();
-    write_gif(dir.path(), "standby.gif", &[(4, 0), (4, 1)]);
+    write_gif(dir.path(), "standby.gif", &[(4, 0), (4, 1), (4, 2)]);
     let catalog = AssetCatalog::new(vec![dir.path().to_path_buf()]);
     let mut cfg = island_140_320();
     cfg.face_animated = true;
@@ -302,16 +377,10 @@ fn animated_face_advances_on_its_own_deadline() {
     c.on_timer(10160);
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 36);
-    let first = c.current_frame().pixels_pbgra.clone();
 
-    // Past the 40ms face delay: the face (red -> blue) must advance and repaint.
-    let actions = c.on_timer(10220);
+    // Idle standalone faces are intentionally paced at 10 fps.
+    let actions = c.on_timer(10260);
     assert!(actions.present_frame);
-    assert_ne!(
-        c.current_frame().pixels_pbgra,
-        first,
-        "animated face must advance"
-    );
 }
 
 #[test]
@@ -392,6 +461,67 @@ fn island_notification_alert_expands_and_expires() {
     c.on_timer(18800); // after ready hold
     c.on_timer(19100);
     assert_eq!(c.current_frame().height, 2);
+}
+
+#[test]
+fn alert_click_dismisses_and_returns_to_the_compact_surface() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 10000);
+
+    assert_eq!(
+        c.handle_click(10, 10, 10200),
+        termielle_app::app::ClickOutcome::AlertDismiss
+    );
+    assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn bar_alert_click_returns_to_the_bar() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island);
+    c.set_bar_width(1920);
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 10000);
+
+    assert_eq!(
+        c.handle_click(960, 80, 10200),
+        termielle_app::app::ClickOutcome::AlertDismiss
+    );
+    assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn media_transport_hits_match_the_refined_control_row() {
+    use termielle_app::tasks::{MediaInfo, WorkerUpdate};
+
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+    c.set_task_update(WorkerUpdate {
+        media: Some(MediaInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            app: "Player".into(),
+            playing: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    c.toggle_expand(10000);
+
+    assert_eq!(
+        c.handle_click(108, 148, 10200),
+        termielle_app::app::ClickOutcome::MediaPrev
+    );
+    assert_eq!(
+        c.handle_click(160, 148, 10200),
+        termielle_app::app::ClickOutcome::MediaToggle
+    );
+    assert_eq!(
+        c.handle_click(212, 148, 10200),
+        termielle_app::app::ClickOutcome::MediaNext
+    );
 }
 
 #[test]
@@ -517,10 +647,19 @@ fn split_island_two_blobs_when_agent_and_media_both_live() {
     for gap_x in [67u32, 70, 74] {
         assert_eq!(alpha_at(gap_x, 18), 0, "gap must be transparent at {gap_x}");
     }
+    // Once separation settles it must be removed, or procedural motion stays
+    // gated forever on a zero-velocity Some spring.
+    let settled = c.current_frame().pixels_pbgra.clone();
+    c.on_timer(10520);
+    assert_ne!(
+        settled,
+        c.current_frame().pixels_pbgra,
+        "thinking/equalizer motion must continue after the split settles"
+    );
 }
 
 #[test]
-fn split_island_merges_back_when_media_stops() {
+fn paused_media_stays_visible_and_can_resume() {
     use termielle_app::tasks::{MediaInfo, WorkerUpdate};
     let mut cfg = island_140_320();
     cfg.animation_ms = 50;
@@ -540,8 +679,6 @@ fn split_island_merges_back_when_media_stops() {
         backdrop: None,
     });
     let _ = c.on_timer(10400);
-
-    // Media stops: the blobs flow back together into one pill.
     c.set_task_update(WorkerUpdate {
         media: Some(MediaInfo {
             title: "Song".into(),
@@ -553,16 +690,126 @@ fn split_island_merges_back_when_media_stops() {
         tasks: Vec::new(),
         backdrop: None,
     });
-    let _ = c.on_timer(10600);
-    let _ = c.on_timer(10800);
-    let frame = c.current_frame();
-    assert_eq!(frame.width, 72);
-    assert_eq!(frame.height, 36);
-    // No transparent gap inside the merged pill.
-    let alpha_at = |x: u32, y: u32| frame.pixels_pbgra[(((y * frame.width + x) * 4) + 3) as usize];
-    for x in [30u32, 36, 42] {
-        assert!(alpha_at(x, 18) > 150, "merged pill must be solid at {x}");
+    for t in (10800..11200).step_by(16) {
+        let _ = c.on_timer(t);
     }
+    let frame = c.current_frame();
+    assert_eq!((frame.width, frame.height), (129, 36));
+    let alpha_at = |x: u32, y: u32| frame.pixels_pbgra[(((y * frame.width + x) * 4) + 3) as usize];
+    assert!(
+        alpha_at(20, 18) > 150,
+        "paused primary module must remain visible"
+    );
+    assert!(
+        alpha_at(102, 18) > 150,
+        "paused media module must remain visible"
+    );
+    assert_eq!(
+        c.handle_click(102, 18, 10900),
+        termielle_app::app::ClickOutcome::MediaToggle
+    );
+}
+
+#[test]
+fn media_arriving_during_compact_morph_retargets_the_active_spring() {
+    use termielle_app::tasks::{MediaInfo, WorkerUpdate};
+    let mut cfg = island_140_320();
+    cfg.animation_ms = 100;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    assert!(c.set_task_update(WorkerUpdate {
+        media: Some(MediaInfo {
+            title: "Song".into(),
+            artist: "Artist".into(),
+            app: "Player".into(),
+            playing: true,
+            thumbnail: None,
+        }),
+        tasks: Vec::new(),
+        backdrop: None,
+    }));
+
+    // Still inside the one-second thinking hold: only the worker-driven
+    // retarget may move the pill to the two-blob geometry. A later reducer
+    // state flip must not be required to repair the interrupted morph.
+    for now in (10016..10400).step_by(16) {
+        c.on_timer(now);
+    }
+    assert_eq!(
+        (c.current_frame().width, c.current_frame().height),
+        (129, 36)
+    );
+}
+
+#[test]
+fn duplicate_critical_events_do_not_requeue_an_alert() {
+    for kind in [EventKind::NeedsInput, EventKind::TurnFailed] {
+        let mut c =
+            Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+        c.handle_event(event("s1", kind, 10000), 10000);
+        assert_eq!(c.current_frame().height, 124);
+        assert_eq!(
+            c.handle_click(10, 10, 10100),
+            termielle_app::app::ClickOutcome::AlertDismiss
+        );
+
+        c.handle_event(event("s1", kind, 10000), 10200);
+        assert_eq!(
+            c.current_frame().height,
+            36,
+            "duplicate {kind:?} must not resurrect its banner"
+        );
+    }
+}
+
+#[test]
+fn replay_cannot_resurrect_a_session_older_than_the_stale_horizon() {
+    const STALE_SESSION_MS: u64 = 4 * 60 * 60 * 1000;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+    c.handle_event(
+        event("old", EventKind::NeedsInput, 1000),
+        1000 + STALE_SESSION_MS + 1,
+    );
+
+    assert_eq!(c.visible_state(), termielle_core::VisualState::Idle);
+    assert_eq!(c.current_frame().height, 2);
+}
+
+#[test]
+fn same_size_state_changes_crossfade_content_without_container_restart() {
+    let mut cfg = island_140_320();
+    cfg.face_animated = false;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    for now in (10016..10500).step_by(16) {
+        c.on_timer(now);
+    }
+    let thinking = c.current_frame().pixels_pbgra.clone();
+
+    c.on_timer(11000);
+    let transition_start = c.current_frame().pixels_pbgra.clone();
+    c.on_timer(11070);
+    let transition_mid = c.current_frame().pixels_pbgra.clone();
+    c.on_timer(11160);
+    let transition_end = c.current_frame().pixels_pbgra.clone();
+
+    assert_ne!(
+        thinking, transition_start,
+        "new state must not pop in directly"
+    );
+    assert_ne!(
+        transition_start, transition_mid,
+        "content must blend after the state change"
+    );
+    assert_ne!(
+        transition_mid, transition_end,
+        "content must settle after the interruption"
+    );
+    assert_eq!(
+        (c.current_frame().width, c.current_frame().height),
+        (72, 36)
+    );
 }
 
 #[test]
@@ -675,6 +922,12 @@ fn island_anchor_scales_y_offset_with_dpi() {
     let mut cfg = island_140_320();
     cfg.y_offset = 12;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
+    assert_eq!(
+        c.island_anchor(),
+        Some((false, 0)),
+        "hidden sensor stays on the bezel"
+    );
+    c.set_hover(true, 0);
     assert_eq!(c.island_anchor(), Some((false, 12)));
     c.set_dpi_scale(2.0);
     assert_eq!(c.island_anchor(), Some((false, 24)));
@@ -740,6 +993,32 @@ fn ending_the_turn_retires_the_open_card() {
 }
 
 #[test]
+fn critical_agent_alert_yields_back_to_a_deferred_system_toast() {
+    use termielle_app::app::AlertKind;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+    assert!(c.trigger_alert(
+        AlertKind::System,
+        "System",
+        "Background notification",
+        [80, 160, 255, 255],
+        6000,
+        10000,
+        "toast:1",
+    ));
+    c.handle_event(event("s1", EventKind::NeedsInput, 10100), 10100);
+
+    assert_eq!(
+        c.handle_click(10, 10, 10200),
+        termielle_app::app::ClickOutcome::AlertDismiss
+    );
+    assert_eq!(
+        c.current_frame().height,
+        124,
+        "the preempted system toast must resume in front"
+    );
+}
+#[test]
+
 fn stale_replayed_needs_input_raises_no_banner() {
     // Journal replay on startup: a days-old needs_input still folds into
     // state (the face shows waiting) but must not resurrect its banner.
@@ -793,6 +1072,24 @@ fn alert_queue_plays_second_banner_after_first_expires() {
     c.on_timer(20200);
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 2);
+}
+
+#[test]
+fn queued_alert_timeout_starts_when_it_reaches_the_front() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
+    c.handle_event(event("s1", EventKind::NeedsInput, 10000), 10000);
+    c.handle_event(event("s2", EventKind::NeedsInput, 13000), 13000);
+
+    // The first banner owns the screen until 13.5 s. The second then receives
+    // its own full 3.5 s lifetime rather than silently aging out in queue.
+    c.on_timer(13600);
+    assert_eq!(c.current_frame().height, 124);
+    c.on_timer(16400);
+    assert_eq!(c.current_frame().height, 124);
+    c.on_timer(16900);
+    assert_eq!(c.current_frame().height, 124);
+    c.on_timer(17500);
+    assert_eq!(c.current_frame().height, 36);
 }
 #[test]
 fn collapse_settles_on_its_own_faster_timing() {
@@ -995,7 +1292,10 @@ fn bar_layout_sizing_and_interaction() {
 
     let (exp_w, exp_h) = c.target_size(termielle_core::VisualState::Idle);
     assert_eq!(exp_w, 1920);
-    assert!(exp_h > 36);
+    assert_eq!(
+        exp_h, 118,
+        "agent-only popup includes a transparent six-pixel breathing gap"
+    );
 
     // Settle spring
     for t in 1..20 {
@@ -1003,6 +1303,11 @@ fn bar_layout_sizing_and_interaction() {
     }
     assert_eq!(c.current_frame().width, 1920);
     assert_eq!(c.current_frame().height, exp_h);
+    let frame = c.current_frame();
+    for y in 36..42 {
+        let alpha = frame.pixels_pbgra[((y * frame.width + 960) * 4 + 3) as usize];
+        assert_eq!(alpha, 0, "popup must not visually touch the bar strip");
+    }
 
     // Collapse
     assert!(c.collapse_if_expanded(2500));
@@ -1014,43 +1319,108 @@ fn bar_layout_sizing_and_interaction() {
 }
 
 #[test]
-fn bar_expanded_card_splits_accent_strip() {
-    // While expanded, the accent strip must flank the grafted card, not
-    // stab through its buried corners: with a live (non-idle) state the
-    // strip is vivid, so a strip-row pixel inside the card's x-range must
-    // read as dark glass while one outside reads the state color.
-    let mut island = IslandConfig {
+fn static_bar_still_has_a_periodic_metrics_deadline() {
+    let config = IslandConfig {
         layout: IslandLayout::Bar,
-        collapsed_width: 140,
-        expanded_width: 360,
-        height: 36,
-        animation_ms: 50,
-        collapse_ms: 50,
+        face_animated: false,
         ..Default::default()
     };
-    island.bar.height = 36;
-    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
-    c.set_bar_width(1920);
-    let _ = c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
-    assert!(c.toggle_expand(10000));
-    for t in 1..20 {
-        let _ = c.on_timer(10000 + t * 50);
-    }
-    let frame = c.current_frame();
-    assert_eq!(frame.width, 1920);
-    assert_eq!(frame.height, 36 + 154);
-    let avg = |x: u32, y: u32| {
-        let i = ((y * frame.width + x) * 4) as usize;
-        let px = &frame.pixels_pbgra[i..i + 4];
-        (u32::from(px[0]) + u32::from(px[1]) + u32::from(px[2])) / 3
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, config);
+    assert_eq!(c.next_deadline_ms(), Some(2_000));
+    assert!(c.on_timer(10000).present_frame);
+    assert_eq!(c.next_deadline_ms(), Some(12_000));
+}
+
+#[test]
+fn bar_requires_an_explicit_click_to_open_and_collapse() {
+    let island = IslandConfig {
+        layout: IslandLayout::Bar,
+        expand_on_hover: true,
+        ..Default::default()
     };
-    // Card spans x 780..1140; strip rows are 34..35.
-    assert!(avg(960, 34) < 60, "no strip over the grafted card");
-    assert!(avg(600, 34) > 90, "strip still flanks the card");
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island);
+    c.set_bar_width(1920);
+    c.set_hover_point(Some((960, 18)));
+    assert!(!c.set_hover(true, 750));
+    assert_eq!(c.current_frame().height, 36);
+    c.on_timer(1000);
+    assert_eq!(c.current_frame().height, 36);
     assert_eq!(
-        frame.pixels_pbgra[((100 * frame.width + 700) * 4 + 3) as usize],
-        0
+        c.handle_click(960, 18, 1010),
+        termielle_app::app::ClickOutcome::Expanded
     );
+    for t in (1010..1800).step_by(16) {
+        c.on_timer(t);
+    }
+    assert!(c.current_frame().height > 36);
+    assert_eq!(
+        c.handle_click(960, 18, 1810),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+    for t in (1810..2200).step_by(16) {
+        c.on_timer(t);
+    }
+    assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn display_paced_motion_requests_next_refresh_without_fixed_fps_cap() {
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
+    c.enable_display_pacing();
+    c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
+    assert!(c.next_deadline_ms().unwrap() <= 10001);
+    c.on_timer(10200);
+    assert_eq!(c.next_deadline_ms(), Some(10200));
+}
+
+#[test]
+fn bar_material_is_pixel_stable_through_expansion_and_collapse() {
+    for position in [
+        termielle_core::BarPosition::Top,
+        termielle_core::BarPosition::Bottom,
+    ] {
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..Default::default()
+        };
+        island.bar.position = position;
+        island.bar.modules_left.clear();
+        island.bar.modules_right.clear();
+        let bar_h = island.bar.height;
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+        c.set_bar_width(1920);
+        let resting = c.current_frame().clone();
+        let verify = |frame: &termielle_app::animation::FrameBuffer| {
+            let row_y = if position == termielle_core::BarPosition::Top {
+                0
+            } else {
+                frame.height - bar_h
+            };
+            for y in 0..bar_h {
+                for x in [20, 400, 600, 1300, 1800] {
+                    let a = ((y * resting.width + x) * 4) as usize;
+                    let b = (((y + row_y) * frame.width + x) * 4) as usize;
+                    assert_eq!(
+                        &resting.pixels_pbgra[a..a + 4],
+                        &frame.pixels_pbgra[b..b + 4],
+                        "bar changed at ({x}, {y}) with frame height {}",
+                        frame.height
+                    );
+                }
+            }
+        };
+        c.toggle_expand(10000);
+        for t in (0..800).step_by(8) {
+            c.on_timer(10000 + t);
+            verify(c.current_frame());
+        }
+        c.collapse_if_expanded(11000);
+        for t in (0..800).step_by(8) {
+            c.on_timer(11000 + t);
+            verify(c.current_frame());
+        }
+        assert_eq!(c.current_frame().height, bar_h);
+    }
 }
 
 #[test]
@@ -1062,6 +1432,16 @@ fn bar_layout_click_dispatch() {
     island.bar.height = 36;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.set_bar_width(1920);
+    c.set_bar_metrics(
+        termielle_app::bar::metrics::Snapshot {
+            workspaces: termielle_app::bar::workspaces::WorkspaceSnapshot {
+                total: 2,
+                active: 1,
+            },
+            ..Default::default()
+        },
+        0,
+    );
 
     // Clicking center island pill toggles expansion
     let pill_cx = 1920 / 2;
@@ -1078,6 +1458,87 @@ fn bar_layout_click_dispatch() {
     assert_eq!(
         outcome,
         termielle_app::app::ClickOutcome::WorkspaceSwitch(1)
+    );
+}
+
+#[test]
+fn right_metric_damage_preserves_left_pixels_and_workspace_hits() {
+    use termielle_app::bar::metrics::Snapshot;
+    use termielle_app::bar::workspaces::WorkspaceSnapshot;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1920);
+    c.set_bar_metrics(
+        Snapshot {
+            workspaces: WorkspaceSnapshot {
+                total: 2,
+                active: 1,
+            },
+            window_title: "editor — project".into(),
+            time_str: "12:00".into(),
+            ..Default::default()
+        },
+        1000,
+    );
+    let before = c.current_frame().pixels_pbgra.clone();
+
+    assert!(c.set_bar_metrics(
+        Snapshot {
+            workspaces: WorkspaceSnapshot {
+                total: 2,
+                active: 1
+            },
+            window_title: "editor — project".into(),
+            time_str: "12:01".into(),
+            ..Default::default()
+        },
+        2000,
+    ));
+    let after = &c.current_frame().pixels_pbgra;
+
+    let stride = 1920 * 4;
+    let left_unchanged = (0..36).all(|y| {
+        before[y * stride..y * stride + 1700 * 4] == after[y * stride..y * stride + 1700 * 4]
+    });
+    assert!(
+        left_unchanged,
+        "left zone pixels must survive right-only damage"
+    );
+    assert!(
+        (0..36).any(|y| before[y * stride + 1740 * 4..(y + 1) * stride]
+            != after[y * stride + 1740 * 4..(y + 1) * stride]),
+        "right zone must repaint"
+    );
+    assert_eq!(
+        c.handle_click(20, 18, 2100),
+        termielle_app::app::ClickOutcome::WorkspaceSwitch(1),
+        "cached workspace hit regions must survive partial rendering"
+    );
+}
+
+#[test]
+fn bottom_bar_center_hit_tracks_the_shifted_strip() {
+    let island = IslandConfig {
+        layout: IslandLayout::Bar,
+        bar: termielle_core::BarConfig {
+            position: termielle_core::BarPosition::Bottom,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island);
+    c.set_bar_width(1920);
+    c.toggle_expand(1000);
+    let popup_h = c.current_frame().height - 36;
+
+    assert_eq!(
+        c.handle_click(960, popup_h as i32 + 18, 1010),
+        termielle_app::app::ClickOutcome::Collapsed
     );
 }
 
@@ -1101,10 +1562,9 @@ fn bar_margin_insets_glass_and_keeps_gap_click_through() {
     assert_eq!(alpha_at(2, 18), 0);
     // ...while the inset bar body renders.
     assert!(alpha_at(960, 18) > 150);
-    // A click in the gap hits nothing and takes the bar miss path.
     assert_eq!(
         c.handle_click(2, 18, 1000),
-        termielle_app::app::ClickOutcome::Expanded
+        termielle_app::app::ClickOutcome::None
     );
 }
 
@@ -1118,14 +1578,13 @@ fn bar_module_list_gates_volume_hit() {
     island.bar.modules_right = vec!["volume".to_string()];
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.set_bar_width(1920);
-    // Volume listed alone: pill at 1822..1900 toggles mute. Battery is gated
-    // by the list too, so this holds with or without hardware batteries.
+    assert!(c.volume_at(1896, 18));
+    assert!(!c.volume_at(960, 18));
     assert_eq!(
-        c.handle_click(1861, 18, 1000),
+        c.handle_click(1896, 18, 1000),
         termielle_app::app::ClickOutcome::VolumeToggle
     );
-    // Volume unlisted: the same point is bare glass (clock carries no hit)
-    // and takes the bar miss path instead.
+
     let mut island2 = IslandConfig {
         layout: IslandLayout::Bar,
         ..Default::default()
@@ -1133,8 +1592,38 @@ fn bar_module_list_gates_volume_hit() {
     island2.bar.height = 36;
     island2.bar.modules_right = vec!["clock".to_string()];
     c.set_island_config(island2, 1100);
+    assert!(!c.volume_at(1896, 18));
     assert_eq!(
-        c.handle_click(1861, 18, 1200),
-        termielle_app::app::ClickOutcome::Expanded
+        c.handle_click(1896, 18, 1200),
+        termielle_app::app::ClickOutcome::None
     );
+}
+
+#[test]
+fn bar_controls_remain_live_during_island_morph() {
+    use termielle_app::app::ClickOutcome;
+    for position in [
+        termielle_core::BarPosition::Top,
+        termielle_core::BarPosition::Bottom,
+    ] {
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..Default::default()
+        };
+        island.bar.position = position;
+        island.bar.modules_right = vec!["volume".into()];
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+        c.set_bar_width(1920);
+        c.toggle_expand(1000);
+        for now in [1016, 1080, 1200, 1600] {
+            c.on_timer(now);
+            let y = if position == termielle_core::BarPosition::Bottom {
+                c.current_frame().height as i32 - 18
+            } else {
+                18
+            };
+            assert!(c.volume_at(1896, y));
+            assert_eq!(c.handle_click(1896, y, now), ClickOutcome::VolumeToggle);
+        }
+    }
 }

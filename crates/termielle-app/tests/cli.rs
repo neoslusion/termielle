@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+use termielle_ipc::EventServer;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -92,10 +93,9 @@ fn wait_for_ack_state(path: &Path, state: &str, seconds: u64) {
 
 /// Smoke mode on a unique pipe passes only when an external event reaches the
 /// `Thinking` state; the emitter delivers it over the real transport.
-///
-/// The app opens the pipe only after its startup work, and the emitter is
-/// fail-open, so a single early emit can be dropped with no trace on a loaded
-/// machine. Keep emitting until the app exits or the delivery window closes.
+/// The endpoint binds before journal replay and the emitter is fail-open while
+/// the process is still starting, so the test may retry until the external
+/// event reaches the smoke controller.
 #[test]
 fn smoke_test_passes_on_an_external_event_over_a_custom_pipe() {
     let pipe = unique_pipe("smoke-ext");
@@ -128,6 +128,34 @@ fn smoke_test_passes_on_an_external_event_over_a_custom_pipe() {
         emit_prompt_submitted(&pipe, "cli-ext");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+#[test]
+fn smoke_binds_after_a_previous_owner_releases_the_endpoint() {
+    let pipe = unique_pipe("handoff");
+    let previous_owner = EventServer::bind(&pipe).expect("hold previous endpoint");
+    let child = Command::new(app_binary())
+        .args(["--smoke-test", "--pipe"])
+        .arg(&pipe)
+        .spawn()
+        .expect("replacement app starts");
+    std::thread::sleep(Duration::from_millis(250));
+    drop(previous_owner);
+
+    let mut child = child;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if emit_prompt_submitted(&pipe, "cli-handoff") {
+            if let Ok(Some(status)) = child.try_wait() {
+                assert_eq!(Some(0), status.code());
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("replacement did not bind after the previous endpoint was released");
 }
 
 /// Smoke mode with no event at all times out with exit code 1.

@@ -225,24 +225,11 @@ impl EventServer {
     /// returned to the caller.
     pub fn receive_one(&self) -> Result<Vec<u8>, IpcError> {
         let instance = self.next_instance()?;
-        let connected = loop {
-            match self.accept(&instance) {
-                Ok(()) => break Ok(()),
-                // A client connected and closed before `ConnectNamedPipe`
-                // completed; the kernel discards the connection and the bytes
-                // it carried, with no error on the client's side. Reset the
-                // instance and keep listening instead of surfacing a ghost
-                // connection as an event error.
-                Err(IpcError::Os(code)) if code == ERROR_NO_DATA.0 => {
-                    // SAFETY: `instance` is a live pipe handle owned by this
-                    // scope; a disconnect failure only means the ghost is
-                    // already gone.
-                    unsafe {
-                        let _ = DisconnectNamedPipe(instance.raw());
-                    }
-                }
-                Err(error) => break Err(error),
-            }
+        let connected = match self.accept(&instance) {
+            // A closed writer can still have buffered bytes. Disconnecting
+            // here discards them; drain the completed connection first.
+            Err(IpcError::Os(code)) if code == ERROR_NO_DATA.0 => Ok(()),
+            result => result,
         };
 
         let result = connected.and_then(|()| read_line(&instance));
@@ -543,15 +530,6 @@ mod tests {
         // SAFETY: `rendered` is the NUL-terminated string just produced, still
         // owned by this scope.
         let sddl = unsafe { rendered.to_string() }.expect("descriptor is UTF-16");
-        // SAFETY: both allocations came from Win32 and are released once, here.
-        unsafe {
-            let _ = windows::Win32::Foundation::LocalFree(Some(
-                windows::Win32::Foundation::HLOCAL(rendered.0.cast()),
-            ));
-            let _ = windows::Win32::Foundation::LocalFree(Some(
-                windows::Win32::Foundation::HLOCAL(descriptor.0),
-            ));
-        }
 
         let (_sid_buffer, sid) = crate::security::current_user_sid().expect("current user SID");
 
@@ -577,5 +555,14 @@ mod tests {
             unsafe { windows::Win32::Security::EqualSid(ace_sid, sid) }.is_ok(),
             "DACL does not name the current user: {sddl}"
         );
+        // SAFETY: both allocations came from Win32 and are released once, here.
+        unsafe {
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(rendered.0.cast()),
+            ));
+            let _ = windows::Win32::Foundation::LocalFree(Some(
+                windows::Win32::Foundation::HLOCAL(descriptor.0),
+            ));
+        }
     }
 }

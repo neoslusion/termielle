@@ -14,8 +14,8 @@ use termielle_core::{GlassConfig, IslandGeometry, VisualState};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, CreateFontW,
-    DIB_RGB_COLORS, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteDC,
-    DeleteObject, DrawTextW, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteDC, DeleteObject, DrawTextW, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
     FONT_QUALITY, GetDC, HGDIOBJ, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::core::PCWSTR;
@@ -36,12 +36,12 @@ fn su(frame: &FrameBuffer, v: u32) -> u32 {
 /// fallback but dimmed for glass.
 pub fn accent_colors(state: VisualState) -> ([u8; 4], [u8; 4]) {
     match state {
-        VisualState::Idle => ([140, 123, 107, 220], [176, 163, 143, 180]),
-        VisualState::Thinking => ([61, 163, 232, 220], [107, 201, 242, 180]),
-        VisualState::Working => ([106, 158, 61, 220], [141, 192, 108, 180]),
-        VisualState::NeedsInput => ([212, 127, 74, 240], [224, 163, 123, 190]),
-        VisualState::Ready => ([160, 168, 47, 220], [194, 201, 92, 180]),
-        VisualState::Failed => ([0, 0, 138, 220], [0, 0, 255, 190]),
+        VisualState::Idle => ([174, 158, 148, 190], [210, 196, 188, 150]),
+        VisualState::Thinking => ([242, 108, 126, 220], [255, 160, 174, 170]),
+        VisualState::Working => ([137, 196, 54, 220], [180, 224, 126, 170]),
+        VisualState::NeedsInput => ([72, 170, 255, 230], [132, 205, 255, 175]),
+        VisualState::Ready => ([214, 190, 72, 220], [236, 222, 138, 175]),
+        VisualState::Failed => ([104, 84, 244, 230], [158, 145, 255, 175]),
     }
 }
 
@@ -136,6 +136,13 @@ pub const ICON_PX: u32 = 24;
 
 /// Filled disc for session dots.
 pub fn draw_disc(frame: &mut FrameBuffer, cx: i32, cy: i32, radius: u32, color: [u8; 4]) {
+    let alpha = u32::from(color[3]);
+    let color = [
+        (u32::from(color[0]) * alpha / 255) as u8,
+        (u32::from(color[1]) * alpha / 255) as u8,
+        (u32::from(color[2]) * alpha / 255) as u8,
+        color[3],
+    ];
     let (cx, cy) = (sx(frame, cx), sx(frame, cy));
     let r = su(frame, radius) as i32;
     for y in -r..=r {
@@ -238,6 +245,59 @@ pub fn blend_frame_over(dst: &mut FrameBuffer, content: &FrameBuffer, dx: i32, d
                     (u32::from(pixel[3]) * scale / 255) as u8,
                 ],
             );
+        }
+    }
+}
+
+/// Interpolate premultiplied pixels, rather than stacking two translucent
+/// layers: unchanged text must not dim to 75% halfway through a swap.
+pub(crate) fn crossfade_content(destination: &mut FrameBuffer, previous: &FrameBuffer, alpha: u8) {
+    let weight = u32::from(alpha);
+    for y in 0..destination.height {
+        for x in 0..destination.width {
+            let index = ((y * destination.width + x) * 4) as usize;
+            let source = if x < previous.width && y < previous.height {
+                let index = ((y * previous.width + x) * 4) as usize;
+                &previous.pixels_pbgra[index..index + 4]
+            } else {
+                &[0; 4]
+            };
+            for (dst, src) in destination.pixels_pbgra[index..index + 4]
+                .iter_mut()
+                .zip(source)
+            {
+                *dst = ((u32::from(*dst) * weight + u32::from(*src) * (255 - weight) + 127) / 255)
+                    as u8;
+            }
+        }
+    }
+}
+
+/// Clip translated content with the same signed-distance silhouette as the
+/// material. Alpha alone cannot supply coverage for translucent themes.
+pub(crate) fn clip_content(frame: &mut FrameBuffer, blobs: &[BlobRect], bridge_k: f32) {
+    let scale = frame.scale;
+    let blobs: Vec<_> = blobs
+        .iter()
+        .map(|b| BlobRect {
+            x: sx(frame, b.x),
+            y: sx(frame, b.y),
+            w: su(frame, b.w),
+            h: su(frame, b.h),
+            r: su(frame, b.r),
+            attached: b.attached,
+        })
+        .collect();
+    for (index, pixel) in frame.pixels_pbgra.chunks_exact_mut(4).enumerate() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let x = (index % frame.width as usize) as f32 + 0.5;
+        let y = (index / frame.width as usize) as f32 + 0.5;
+        let coverage =
+            ((0.5 - blobs_distance(&blobs, x, y, bridge_k * scale)).clamp(0.0, 1.0) * 255.0) as u32;
+        for channel in pixel {
+            *channel = (u32::from(*channel) * coverage / 255) as u8;
         }
     }
 }
@@ -404,13 +464,13 @@ pub fn glass_layer_blobs(
 
             // 4. Parabolic Top Specular Sheen (Subtle Fluent light reflection):
             // Soft luminous top reflection matching Windows 11 Fluent surfaces.
-            let sheen_h = (height as f32 * 0.30).clamp(10.0 * scale, 32.0 * scale);
+            let sheen_h = (height as f32 * 0.24).clamp(8.0 * scale, 24.0 * scale);
             if fy < sheen_h && -sd > 1.0 * scale {
                 let t = 1.0 - (fy / sheen_h);
                 let curve = t * t;
                 let cx_norm = (fx - width as f32 / 2.0).abs() / (width as f32 / 2.0);
                 let horiz_fade = 1.0 - 0.30 * cx_norm * cx_norm;
-                let sheen_alpha = ((glass.highlight_alpha as f32 * 0.28).clamp(10.0, 32.0)
+                let sheen_alpha = ((glass.highlight_alpha as f32 * 0.18).clamp(6.0, 20.0)
                     * curve
                     * horiz_fade
                     * (cov_u as f32 / 255.0)) as u8;
@@ -432,7 +492,7 @@ pub fn glass_layer_blobs(
                 let rim_alpha = if any_attached && fy < 1.5 * scale {
                     0u8
                 } else {
-                    ((glass.border_alpha as f32 * (0.85 + 0.65 * top_factor)).clamp(20.0, 65.0)
+                    ((glass.border_alpha as f32 * (0.70 + 0.45 * top_factor)).clamp(12.0, 42.0)
                         * (cov_u as f32 / 255.0)) as u8
                 };
                 if rim_alpha > 0 {
@@ -475,37 +535,37 @@ pub fn glass_layer_blobs(
 /// result a valid premultiplied texel — the same rule the GIF compositor
 /// relies on — so filtered edges composite exactly like authored ones.
 fn sample_bilinear(src: &FrameBuffer, fx: f32, fy: f32) -> [u8; 4] {
-    if src.width == 0 || src.height == 0 {
+    sample_bilinear_pixels(&src.pixels_pbgra, src.width, src.height, fx, fy)
+}
+
+fn sample_bilinear_pixels(pixels: &[u8], width: u32, height: u32, fx: f32, fy: f32) -> [u8; 4] {
+    if width == 0 || height == 0 || pixels.len() < (width as usize * height as usize * 4) {
         return [0, 0, 0, 0];
     }
-    let fx = fx.clamp(0.0, src.width as f32 - 1.0);
-    let fy = fy.clamp(0.0, src.height as f32 - 1.0);
+    let fx = fx.clamp(0.0, width as f32 - 1.0);
+    let fy = fy.clamp(0.0, height as f32 - 1.0);
     let x0 = fx.floor() as u32;
     let y0 = fy.floor() as u32;
-    let x1 = (x0 + 1).min(src.width - 1);
-    let y1 = (y0 + 1).min(src.height - 1);
+    let x1 = (x0 + 1).min(width - 1);
+    let y1 = (y0 + 1).min(height - 1);
     let tx = fx - fx.floor();
     let ty = fy - fy.floor();
     let tap = |x: u32, y: u32| -> [f32; 4] {
-        let i = ((y * src.width + x) * 4) as usize;
+        let i = ((y * width + x) * 4) as usize;
         [
-            f32::from(src.pixels_pbgra[i]),
-            f32::from(src.pixels_pbgra[i + 1]),
-            f32::from(src.pixels_pbgra[i + 2]),
-            f32::from(src.pixels_pbgra[i + 3]),
+            f32::from(pixels[i]),
+            f32::from(pixels[i + 1]),
+            f32::from(pixels[i + 2]),
+            f32::from(pixels[i + 3]),
         ]
     };
-    let a = tap(x0, y0);
-    let b = tap(x1, y0);
-    let c = tap(x0, y1);
-    let d = tap(x1, y1);
+    let taps = [tap(x0, y0), tap(x1, y0), tap(x0, y1), tap(x1, y1)];
     let weights = [
         (1.0 - tx) * (1.0 - ty),
         tx * (1.0 - ty),
         (1.0 - tx) * ty,
         tx * ty,
     ];
-    let taps = [a, b, c, d];
     let mut out = [0u8; 4];
     for ch in 0..4 {
         let mut acc = 0.0f32;
@@ -556,7 +616,33 @@ pub fn blit_rounded(
     th: u32,
     radius: u32,
 ) {
-    if src.width == 0 || src.height == 0 || tw == 0 || th == 0 {
+    blit_rounded_pixels(
+        frame,
+        &src.pixels_pbgra,
+        src.width,
+        src.height,
+        x,
+        y,
+        tw,
+        th,
+        radius,
+    );
+}
+
+/// Allocation-free rounded blit for borrowed thumbnail/task pixel buffers.
+#[allow(clippy::too_many_arguments)]
+pub fn blit_rounded_pixels(
+    frame: &mut FrameBuffer,
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    x: i32,
+    y: i32,
+    tw: u32,
+    th: u32,
+    radius: u32,
+) {
+    if src_width == 0 || src_height == 0 || tw == 0 || th == 0 {
         return;
     }
     let (x, y, tw, th) = (sx(frame, x), sx(frame, y), su(frame, tw), su(frame, th));
@@ -578,9 +664,9 @@ pub fn blit_rounded(
             if cov == 0 {
                 continue;
             }
-            let fx = (tx as f32 + 0.5) * src.width as f32 / tw as f32 - 0.5;
-            let fy = (ty as f32 + 0.5) * src.height as f32 / th as f32 - 0.5;
-            let pixel = sample_bilinear(src, fx, fy);
+            let sample_x = (tx as f32 + 0.5) * src_width as f32 / tw as f32 - 0.5;
+            let sample_y = (ty as f32 + 0.5) * src_height as f32 / th as f32 - 0.5;
+            let pixel = sample_bilinear_pixels(src, src_width, src_height, sample_x, sample_y);
             let alpha = (pixel[3] as u32 * cov / 255) as u8;
             if alpha == 0 {
                 continue;
@@ -615,6 +701,28 @@ pub fn draw_text(
     bold: bool,
     color: [u8; 4],
 ) {
+    draw_text_in_rect(
+        frame,
+        text,
+        (x, y, max_w, (font_size * 2).max(18) as u32),
+        font_size,
+        bold,
+        color,
+        false,
+    );
+}
+
+/// Draw text against the actual control bounds, avoiding guessed font-height offsets.
+pub fn draw_text_in_rect(
+    frame: &mut FrameBuffer,
+    text: &str,
+    rect: (i32, i32, u32, u32),
+    font_size: i32,
+    bold: bool,
+    color: [u8; 4],
+    centered: bool,
+) {
+    let (x, y, max_w, height) = rect;
     if text.is_empty() || max_w == 0 || font_size <= 0 {
         return;
     }
@@ -624,8 +732,20 @@ pub fn draw_text(
         su(frame, max_w),
         su(frame, font_size as u32) as i32,
     );
-    let h = (font_size * 2).max(18) as u32;
+    let h = su(frame, height);
     let w = max_w;
+    let key = super::text_cache::TextKey {
+        text: text.to_owned(),
+        width: w,
+        height: h,
+        font_size,
+        bold,
+        centered,
+    };
+    if let Some(mask) = super::text_cache::get(&key) {
+        paint_text_mask(frame, &mask, x, y, color);
+        return;
+    }
     // Supersampled scratch dimensions. The 2x2 box average in the blend loop
     // below is what turns the extra raster into extra edge information.
     let (sw, sh) = (w * 2, h * 2);
@@ -716,22 +836,19 @@ pub fn draw_text(
             memory_dc,
             &mut wide_text,
             &mut rect,
-            DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            (if centered { DT_CENTER } else { DT_LEFT })
+                | DT_NOPREFIX
+                | DT_SINGLELINE
+                | DT_END_ELLIPSIS
+                | DT_VCENTER,
         );
     }
 
     let src_slice = unsafe { std::slice::from_raw_parts(bits as *const u8, total_bytes) };
 
+    let mut mask = Vec::new();
     for row in 0..h as i32 {
-        let target_y = y + row;
-        if target_y < 0 || target_y >= frame.height as i32 {
-            continue;
-        }
         for col in 0..w as i32 {
-            let target_x = x + col;
-            if target_x < 0 || target_x >= frame.width as i32 {
-                continue;
-            }
             // Box-average the 2x2 supersampled block into one coverage
             // value: luminance per tap, then the mean of four. Grayscale AA
             // keeps channels in agreement, so no subpixel fringes survive.
@@ -748,19 +865,7 @@ pub fn draw_text(
             if val == 0 {
                 continue;
             }
-            let text_alpha = (u32::from(val) * u32::from(color[3]) / 255) as u8;
-            if text_alpha == 0 {
-                continue;
-            }
-            let p_b = (u32::from(color[0]) * u32::from(text_alpha) / 255) as u8;
-            let p_g = (u32::from(color[1]) * u32::from(text_alpha) / 255) as u8;
-            let p_r = (u32::from(color[2]) * u32::from(text_alpha) / 255) as u8;
-            blend_pixel(
-                frame,
-                target_x as u32,
-                target_y as u32,
-                [p_b, p_g, p_r, text_alpha],
-            );
+            mask.push((col as u32, row as u32, val));
         }
     }
 
@@ -771,6 +876,32 @@ pub fn draw_text(
         let _ = DeleteDC(memory_dc);
         let _ = ReleaseDC(None, screen_dc);
         let _ = DeleteObject(HGDIOBJ(font.0));
+    }
+    let mask = super::text_cache::insert(key, mask);
+    paint_text_mask(frame, &mask, x, y, color);
+}
+
+fn paint_text_mask(
+    frame: &mut FrameBuffer,
+    mask: &super::text_cache::Coverage,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+) {
+    for &(col, row, coverage) in mask {
+        let tx = x + col as i32;
+        let ty = y + row as i32;
+        if tx < 0 || ty < 0 || tx >= frame.width as i32 || ty >= frame.height as i32 {
+            continue;
+        }
+        let alpha = u32::from(coverage) * u32::from(color[3]) / 255;
+        let pixel = [
+            (u32::from(color[0]) * alpha / 255) as u8,
+            (u32::from(color[1]) * alpha / 255) as u8,
+            (u32::from(color[2]) * alpha / 255) as u8,
+            alpha as u8,
+        ];
+        blend_pixel(frame, tx as u32, ty as u32, pixel);
     }
 }
 
@@ -810,11 +941,12 @@ pub fn blit_scaled(frame: &mut FrameBuffer, src: &FrameBuffer, x: i32, y: i32, t
 pub fn draw_accent_strip(frame: &mut FrameBuffer, attached: bool, radius: u32, color: [u8; 4]) {
     let (width, height) = (frame.width, frame.height);
     let radius = su(frame, radius);
-    let margin = sx(frame, 8);
+    let marker_width = su(frame, 32).min(width.saturating_sub(su(frame, 16)));
+    let start_x = ((width.saturating_sub(marker_width)) / 2) as i32;
     let y0 = if attached { 0 } else { sx(frame, 2) };
-    let thick = sx(frame, 2);
+    let thick = sx(frame, 1).max(1);
     for y in y0..(y0 + thick).min(height as i32) {
-        for x in margin..(width as i32 - margin) {
+        for x in start_x..start_x + marker_width as i32 {
             let cov = rounded_rect_coverage_aa(x, y, frame.width, frame.height, radius, attached);
             if cov == 0 {
                 continue;
@@ -862,16 +994,16 @@ pub fn draw_button_circle(
             }
             let color = if dist >= r - stroke {
                 [
-                    ((border[0] as u32 * cov) / 255) as u8,
-                    ((border[1] as u32 * cov) / 255) as u8,
-                    ((border[2] as u32 * cov) / 255) as u8,
+                    ((border[0] as u32 * border[3] as u32 * cov) / 65025) as u8,
+                    ((border[1] as u32 * border[3] as u32 * cov) / 65025) as u8,
+                    ((border[2] as u32 * border[3] as u32 * cov) / 65025) as u8,
                     ((border[3] as u32 * cov) / 255) as u8,
                 ]
             } else {
                 [
-                    ((bg[0] as u32 * cov) / 255) as u8,
-                    ((bg[1] as u32 * cov) / 255) as u8,
-                    ((bg[2] as u32 * cov) / 255) as u8,
+                    ((bg[0] as u32 * bg[3] as u32 * cov) / 65025) as u8,
+                    ((bg[1] as u32 * bg[3] as u32 * cov) / 65025) as u8,
+                    ((bg[2] as u32 * bg[3] as u32 * cov) / 65025) as u8,
                     ((bg[3] as u32 * cov) / 255) as u8,
                 ]
             };
@@ -972,24 +1104,25 @@ pub fn draw_progress_bar(
 }
 
 /// Draws previous track glyph (|<<).
-/// Glyph centers read logical; shapes iterate in design units and only the
-/// plotted pixels scale, so topology never changes with DPI.
+/// Transport glyphs use the frame's authoring scale for both center and
+/// offsets, matching their surrounding button geometry at every DPI.
 pub fn draw_glyph_prev(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
     let s = frame.scale;
-    let gx = |dx: i32| (cx as f32 + dx as f32 * s).round() as i32;
-    let gy = |dy: i32| (cy as f32 + dy as f32 * s).round() as i32;
+    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
+    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
+    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
     for dy in -5..=5 {
         blend_pixel(frame, gx(-6) as u32, gy(dy) as u32, color);
         blend_pixel(frame, gx(-5) as u32, gy(dy) as u32, color);
     }
     for dx in 0..=4 {
-        let max_y = 5 - dx;
+        let max_y = dx + 1;
         for dy in -max_y..=max_y {
             blend_pixel(frame, gx(-4 + dx) as u32, gy(dy) as u32, color);
         }
     }
     for dx in 0..=4 {
-        let max_y = 5 - dx;
+        let max_y = dx + 1;
         for dy in -max_y..=max_y {
             blend_pixel(frame, gx(1 + dx) as u32, gy(dy) as u32, color);
         }
@@ -999,8 +1132,9 @@ pub fn draw_glyph_prev(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]
 /// Draws play triangle glyph (>).
 pub fn draw_glyph_play(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
     let s = frame.scale;
-    let gx = |dx: i32| (cx as f32 + dx as f32 * s).round() as i32;
-    let gy = |dy: i32| (cy as f32 + dy as f32 * s).round() as i32;
+    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
+    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
+    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
     for dx in 0..=8 {
         let half_h = ((8 - dx) * 6) / 8;
         for dy in -half_h..=half_h {
@@ -1012,32 +1146,33 @@ pub fn draw_glyph_play(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]
 /// Draws pause bars glyph (||).
 pub fn draw_glyph_pause(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
     let s = frame.scale;
-    let gx = |dx: i32| (cx as f32 + dx as f32 * s).round() as i32;
-    let gy = |dy: i32| (cy as f32 + dy as f32 * s).round() as i32;
+    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
+    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
+    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
     for dy in -6..=6 {
-        blend_pixel(frame, gx(-4) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(-3) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(-2) as u32, gy(dy) as u32, color);
-
-        blend_pixel(frame, gx(2) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(3) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(4) as u32, gy(dy) as u32, color);
+        for dx in -4..=-2 {
+            blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
+        }
+        for dx in 2..=4 {
+            blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
+        }
     }
 }
 
-/// Draws next track glyph (>>|).
+/// Draws next-track glyph (>>|).
 pub fn draw_glyph_next(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
     let s = frame.scale;
-    let gx = |dx: i32| (cx as f32 + dx as f32 * s).round() as i32;
-    let gy = |dy: i32| (cy as f32 + dy as f32 * s).round() as i32;
+    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
+    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
+    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
     for dx in 0..=4 {
-        let max_y = dx + 1;
+        let max_y = 5 - dx;
         for dy in -max_y..=max_y {
             blend_pixel(frame, gx(-5 + dx) as u32, gy(dy) as u32, color);
         }
     }
     for dx in 0..=4 {
-        let max_y = dx + 1;
+        let max_y = 5 - dx;
         for dy in -max_y..=max_y {
             blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
         }
@@ -1263,7 +1398,75 @@ fn draw_circle(frame: &mut FrameBuffer, cx: i32, cy: i32, radius: u32, color: [u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossfade_keeps_unchanged_premultiplied_pixels_constant() {
+        let original = FrameBuffer {
+            width: 1,
+            height: 1,
+            pixels_pbgra: vec![30, 60, 90, 128],
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        };
+        for alpha in [0, 64, 128, 192, 255] {
+            let mut destination = original.clone();
+            crossfade_content(&mut destination, &original, alpha);
+            assert_eq!(destination.pixels_pbgra, original.pixels_pbgra);
+        }
+    }
+
+    #[test]
+    fn content_is_clipped_to_the_scaled_rounded_silhouette() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
+            let size = (20.0 * scale) as u32;
+            let mut frame = FrameBuffer {
+                width: size,
+                height: size,
+                pixels_pbgra: vec![255; (size * size * 4) as usize],
+                delay_ms: 0,
+                loop_index: 0,
+                scale,
+            };
+            clip_content(
+                &mut frame,
+                &[BlobRect {
+                    x: 0,
+                    y: 0,
+                    w: 20,
+                    h: 20,
+                    r: 10,
+                    attached: false,
+                }],
+                0.0,
+            );
+            assert_eq!(frame.alpha_at(0, 0), 0);
+            assert_eq!(frame.alpha_at(size - 1, 0), 0);
+            assert_eq!(frame.alpha_at(size / 2, size / 2), 255);
+            assert!(
+                frame
+                    .pixels_pbgra
+                    .chunks_exact(4)
+                    .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+            );
+        }
+    }
     use termielle_core::{GlassConfig, IslandGeometry, VisualState};
+
+    #[test]
+    fn state_palette_uses_bgra_channel_order() {
+        let (failed, _) = accent_colors(VisualState::Failed);
+        assert!(failed[2] > failed[0] && failed[2] > failed[1]);
+        let (waiting, _) = accent_colors(VisualState::NeedsInput);
+        assert!(waiting[2] > waiting[1] && waiting[1] > waiting[0]);
+        let (ready, _) = accent_colors(VisualState::Ready);
+        assert!(ready[0] > ready[2] && ready[1] > ready[2]);
+        let tint = GlassConfig::default().tint;
+        assert!(
+            tint[0] >= tint[2],
+            "dark material must not have a warm red cast"
+        );
+    }
 
     #[test]
     fn notch_and_island_frames_have_correct_size() {
@@ -1314,6 +1517,30 @@ mod tests {
         assert_eq!(ink, [18, 20, 28, 255]);
         // Dark on light at high alpha: contrast ratio against #F3F3F3 > 12.
         assert!(dim[3] >= 217);
+    }
+
+    #[test]
+    fn translucent_disc_premultiplies_its_color() {
+        let mut frame = FrameBuffer {
+            width: 16,
+            height: 16,
+            pixels_pbgra: vec![0; 16 * 16 * 4],
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        };
+        draw_disc(&mut frame, 8, 8, 3, [240, 160, 80, 51]);
+        let center = (8 * 16 + 8) * 4;
+        assert_eq!(&frame.pixels_pbgra[center..center + 4], &[48, 32, 16, 51]);
+        frame.pixels_pbgra.fill(0);
+        draw_button_circle(&mut frame, 8, 8, 5, [240, 160, 80, 51], [255, 255, 255, 25]);
+        assert_eq!(&frame.pixels_pbgra[center..center + 4], &[48, 32, 16, 51]);
+        assert!(
+            frame
+                .pixels_pbgra
+                .chunks_exact(4)
+                .all(|p| p[..3].iter().all(|c| *c <= p[3]))
+        );
     }
 
     #[test]
@@ -1403,6 +1630,43 @@ mod tests {
         assert_eq!(f.alpha_at(20, 20), 255);
         assert_eq!(f.alpha_at(29, 29), 255);
         assert_eq!(f.alpha_at(30, 30), 0);
+    }
+
+    #[test]
+    fn text_is_centered_in_control_bounds_at_multiple_scales() {
+        for scale in [1.0, 1.25, 2.0] {
+            for text in ["1", "10", "100%"] {
+                let width = (80.0 * scale) as u32;
+                let height = (40.0 * scale) as u32;
+                let mut frame = FrameBuffer {
+                    width,
+                    height,
+                    scale,
+                    pixels_pbgra: vec![0; (width * height * 4) as usize],
+                    delay_ms: 0,
+                    loop_index: 0,
+                };
+                draw_text_in_rect(&mut frame, text, (0, 0, 80, 40), 12, false, [255; 4], true);
+                let mut bounds = (width, height, 0, 0);
+                for y in 0..height {
+                    for x in 0..width {
+                        if frame.alpha_at(x, y) > 32 {
+                            bounds.0 = bounds.0.min(x);
+                            bounds.1 = bounds.1.min(y);
+                            bounds.2 = bounds.2.max(x);
+                            bounds.3 = bounds.3.max(y);
+                        }
+                    }
+                }
+                assert!(bounds.2 > bounds.0);
+                assert!(
+                    ((bounds.0 + bounds.2) as f32 / 2.0 - width as f32 / 2.0).abs() <= 2.0 * scale
+                );
+                assert!(
+                    ((bounds.1 + bounds.3) as f32 / 2.0 - height as f32 / 2.0).abs() <= 2.0 * scale
+                );
+            }
+        }
     }
 
     #[test]

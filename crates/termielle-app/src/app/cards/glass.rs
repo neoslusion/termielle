@@ -29,6 +29,8 @@ impl Controller {
             right_x,
             right_w,
             self.render_scale().to_bits(),
+            blobs.first().map_or(0, |blob| blob.w),
+            self.separation_now().to_bits(),
         );
         if let Some((cached_key, buf)) = &self.glass_cache {
             if *cached_key == key {

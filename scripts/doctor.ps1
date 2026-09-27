@@ -45,40 +45,46 @@ Assert-Check (Test-Path -LiteralPath $app -PathType Leaf) "Overlay binary at $ap
 Assert-Check (Test-Path -LiteralPath $emit -PathType Leaf) "Emitter binary at $emit"
 
 if ($failures.Count -eq 0) {
-    # 3. The overlay smoke test on the default pipe. Exit 3 means a live
-    #    overlay holds the instance mutex: the check must not pass silently.
-    $smoke = Start-Process -FilePath $app -ArgumentList '--smoke-test' -PassThru -Wait -WindowStyle Hidden
-    Assert-Check ($smoke.ExitCode -eq 0) 'Overlay smoke test passes (default pipe)'
-
-    # 4. A unique pipe sink through smoke mode: the emitter alone must
-    #    deliver the event that clears the smoke test.
+    # A unique pipe keeps validation isolated from a user's live overlay.
     $pipe = 'termielle-doctor-' + [guid]::NewGuid().ToString('N')
     $fullPipe = '\\.\pipe\' + $pipe
-    $smoke2 = Start-Process -FilePath $app -ArgumentList '--smoke-test', '--pipe', $fullPipe -PassThru -WindowStyle Hidden
-    Start-Sleep -Milliseconds 400
-    $payload = '{"type":"prompt_submitted","session_id":"doctor","prompt":"x"}'
-    # The emitter is a GUI-subsystem executable (so hooks never flash a
-    # console), which PowerShell's `&` runs asynchronously. Drive it through
-    # the .NET Process API instead, and read its exit code.
-    $psi = [System.Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName = $emit
-    $psi.UseShellExecute = $false
-    $psi.CreateNoWindow = $true
-    $psi.RedirectStandardInput = $true
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    foreach ($arg in @('--source', 'codex', '--event', 'prompt_submitted', '--input', 'stdin', '--pipe', $fullPipe)) {
-        $null = $psi.ArgumentList.Add($arg)
+    $smoke = $null
+    $emitExit = 1
+    try {
+        $smoke = Start-Process -FilePath $app `
+            -ArgumentList '--smoke-test', '--pipe', $fullPipe `
+            -PassThru -WindowStyle Hidden
+        $payload = '{"type":"prompt_submitted","session_id":"doctor","prompt":"x"}'
+        Start-Sleep -Milliseconds 400
+        for ($attempt = 0; $attempt -lt 5 -and $emitExit -ne 0; $attempt++) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $emit
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.RedirectStandardInput = $true
+            foreach ($arg in @('--source', 'codex', '--event', 'prompt_submitted', '--input', 'stdin', '--pipe', $fullPipe)) {
+                $null = $psi.ArgumentList.Add($arg)
+            }
+            $emitProc = [System.Diagnostics.Process]::Start($psi)
+            $emitProc.StandardInput.Write($payload)
+            $emitProc.StandardInput.Close()
+            if ($emitProc.WaitForExit(5000)) {
+                $emitExit = $emitProc.ExitCode
+            } else {
+                Stop-Process -Id $emitProc.Id -Force -ErrorAction SilentlyContinue
+            }
+            if ($emitExit -ne 0) { Start-Sleep -Milliseconds 200 }
+        }
+        $settled = $smoke.WaitForExit(15000)
+        Assert-Check ($emitExit -eq 0) 'Emitter delivers over the unique pipe'
+        Assert-Check ($settled -and $smoke.ExitCode -eq 0) 'Overlay smoke passes end to end'
+    } finally {
+        if ($smoke -and -not $smoke.HasExited) {
+            Stop-Process -Id $smoke.Id -Force -ErrorAction SilentlyContinue
+        }
     }
-    $emitProc = [System.Diagnostics.Process]::Start($psi)
-    $emitProc.StandardInput.Write($payload)
-    $emitProc.StandardInput.Close()
-    $null = $emitProc.StandardOutput.ReadToEnd()
-    $emitProc.WaitForExit()
-    $emitExit = $emitProc.ExitCode
-    $settled = $smoke2.WaitForExit(15000)
-    Assert-Check ($emitExit -eq 0) 'Emitter delivers over the unique pipe'
-    Assert-Check ($settled -and $smoke2.ExitCode -eq 0) 'Smoke passes on the external event'
 }
 
 if ($failures.Count -gt 0) {

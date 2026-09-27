@@ -1,4 +1,5 @@
 pub mod animation;
+mod apartment;
 pub mod app;
 pub mod backdrop;
 pub mod bar;

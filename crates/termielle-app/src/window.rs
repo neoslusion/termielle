@@ -9,11 +9,10 @@ use windows::Win32::Foundation::{
     WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION,
-    CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HGDIOBJ, HMONITOR, MONITOR_DEFAULTTONEAREST,
+    AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
+    EnumDisplayMonitors, GetDC, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
     MONITORINFO, MONITORINFOEXW, MonitorFromRect, MonitorFromWindow, RGBQUAD, ReleaseDC,
-    SelectObject, SetDIBitsToDevice,
+    SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -33,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 use windows::core::BOOL;
 use windows::core::PCWSTR;
@@ -83,6 +83,7 @@ pub fn straight_or_key(alpha: u8, b: u8, g: u8, r: u8) -> [u8; 3] {
 
 /// Message id used by [`WakeHandle::post`] to wake the message loop.
 const WAKE_MSG: u32 = WM_APP + 1;
+const ANIMATION_MSG: u32 = WM_APP + 3;
 
 /// `WM_MOUSELEAVE` (0x02A3), posted after `TrackMouseEvent(TME_LEAVE)`.
 /// Not exported by windows 0.62's `WindowsAndMessaging`, so it lives here.
@@ -129,6 +130,8 @@ pub enum HitTestResult {
 /// Window-local events the overlay loop has to react to.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WindowEvent {
+    /// The display clock reached a vertical blank with an armed deadline.
+    AnimationFrame,
     /// The repaint/advance deadline set by [`OverlayWindow::set_timer`] was reached.
     Timer,
     /// Display topology or DPI changed; the caller should re-clamp and present.
@@ -141,20 +144,23 @@ pub enum WindowEvent {
     LayoutChanged(termielle_core::IslandLayout),
     /// Tray requested a theme switch.
     ThemeChanged(String),
-    /// Tray requested a Y-offset change.
+    /// Tray requested the Bar position to change.
+    BarPositionChanged(termielle_core::BarPosition),
+    /// Tray requested a standalone Island/Notch Y-offset change.
     YOffsetChanged(i32),
-    /// User clicked the island at frame-local (x, y).
     ClickAt(i32, i32),
+    /// Wheel delta and physical client coordinates.
+    ScrollAt(i32, i32, i16),
     /// The pointer was pressed down on (`true`) or released from the island,
     /// for the Dynamic Island press swell.
     PressChanged(bool),
     /// Cursor entered (`true`) or left (`false`) the island pill.
     HoverChanged(bool),
-    /// Tray toggled task thumbnails on/off.
-    ToggleTasks,
-    /// Tray toggled hover-to-expand on/off.
+    /// Tray toggled the media widget.
+    ToggleMusic,
+    /// Tray toggled hover-to-expand.
     ToggleHoverExpand,
-    /// Tray toggled the termielle face widget on/off.
+    /// Tray toggled the Termielle face widget.
     ToggleFace,
     /// Windows light/dark theme setting changed; re-resolve `auto`.
     SystemThemeChanged,
@@ -260,6 +266,8 @@ struct WindowState {
     events: Sender<WindowEvent>,
     alpha: RefCell<AlphaMap>,
     is_island: bool,
+    is_bar: bool,
+    menu_state: RefCell<tray::MenuState>,
     /// Whether the cursor is currently inside the opaque pill. Used to emit
     /// each hover transition exactly once.
     hover_inside: RefCell<bool>,
@@ -373,6 +381,19 @@ unsafe extern "system" fn window_proc(
             };
             return LRESULT(value);
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_MOUSEWHEEL => {
+            let (x, y) = lparam_point(lparam);
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+                let delta = (wparam.0 >> 16) as u16 as i16;
+                let _ = unsafe {
+                    (*state)
+                        .events
+                        .send(WindowEvent::ScrollAt(x - rect.left, y - rect.top, delta))
+                };
+            }
+            return LRESULT(0);
+        }
         WM_LBUTTONDOWN => {
             // Press feedback: swell the pill while the pointer is held.
             // Capture so the release is reported even if the swell moves
@@ -406,6 +427,12 @@ unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
             }
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
+            // Capture can be revoked without a button-up (Alt-Tab, menus,
+            // another window). Never leave the physical press swell latched.
+            let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(false)) };
+            return LRESULT(0);
         }
         WM_MOUSEMOVE => {
             // Hover-to-expand: report the enter transition once, then arm
@@ -464,6 +491,9 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_SETTINGCHANGE => {
+            if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SPI_SETWORKAREA.0 as usize {
+                let _ = unsafe { (*state).events.send(WindowEvent::DisplayChanged) };
+            }
             // lParam points at a NUL-terminated string naming the changed
             // setting; the light/dark toggle broadcasts "ImmersiveColorSet".
             if lparam.0 != 0 {
@@ -484,6 +514,10 @@ unsafe extern "system" fn window_proc(
             if wparam.0 == TIMER_ID {
                 let _ = unsafe { (*state).events.send(WindowEvent::Timer) };
             }
+            return LRESULT(0);
+        }
+        ANIMATION_MSG => {
+            let _ = unsafe { (*state).events.send(WindowEvent::AnimationFrame) };
             return LRESULT(0);
         }
         WM_DPICHANGED => {
@@ -508,7 +542,7 @@ unsafe extern "system" fn window_proc(
             // Interactive affordance: a hand cursor over the pill tells the
             // user the island is clickable, matching Dynamic Island behavior.
             let is_island = unsafe { (*state).is_island };
-            if is_island {
+            if is_island && !unsafe { (*state).is_bar } {
                 let mut point = POINT { x: 0, y: 0 };
                 let mut rect = RECT::default();
                 if unsafe { GetCursorPos(&mut point) }.is_ok()
@@ -532,15 +566,30 @@ unsafe extern "system" fn window_proc(
                     }
                 }
             }
+            // Returning handled without setting a cursor leaves the cursor
+            // selected by the previously active application in place. That
+            // commonly appears as an hourglass over the passive bar.
+            if let Ok(arrow) = unsafe { LoadCursorW(None, IDC_ARROW) } {
+                unsafe { SetCursor(Some(arrow)) };
+            }
             return LRESULT(1);
         }
-        WM_CLOSE => return LRESULT(0),
+        WM_CLOSE => {
+            let _ = unsafe { (*state).events.send(WindowEvent::Quit) };
+            return LRESULT(0);
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
+            // HWND user data is a borrow of OverlayWindow's stable Box; it
+            // must not outlive the native window or survive handle reuse.
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+        }
         WM_DESTROY => return LRESULT(0),
         tray::TRAY_MSG => {
             if wparam.0 as u32 == tray::TRAY_ID {
                 let mouse = tray::callback_mouse_message(lparam.0);
                 if tray::is_menu_message(mouse) {
-                    match tray::show_menu(hwnd) {
+                    let menu_state = unsafe { (&*state).menu_state.borrow().clone() };
+                    match tray::show_menu(hwnd, &menu_state) {
                         tray::TRAY_EXIT => {
                             let _ = unsafe { (*state).events.send(WindowEvent::Quit) };
                         }
@@ -603,6 +652,27 @@ unsafe extern "system" fn window_proc(
                                     .send(WindowEvent::ThemeChanged("transparent".into()))
                             };
                         }
+                        tray::TRAY_THEME_AUTO => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("auto".into()))
+                            };
+                        }
+                        tray::TRAY_BAR_TOP => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::BarPositionChanged(
+                                    termielle_core::BarPosition::Top,
+                                ))
+                            };
+                        }
+                        tray::TRAY_BAR_BOTTOM => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::BarPositionChanged(
+                                    termielle_core::BarPosition::Bottom,
+                                ))
+                            };
+                        }
                         tray::TRAY_YOFFSET_0 => {
                             let _ = unsafe { (*state).events.send(WindowEvent::YOffsetChanged(0)) };
                         }
@@ -622,8 +692,8 @@ unsafe extern "system" fn window_proc(
                             let _ =
                                 unsafe { (*state).events.send(WindowEvent::YOffsetChanged(300)) };
                         }
-                        tray::TRAY_TOGGLE_TASKS => {
-                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleTasks) };
+                        tray::TRAY_TOGGLE_MUSIC => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleMusic) };
                         }
                         tray::TRAY_TOGGLE_HOVER => {
                             let _ = unsafe { (*state).events.send(WindowEvent::ToggleHoverExpand) };
@@ -648,6 +718,7 @@ unsafe extern "system" fn window_proc(
 /// only becomes visible when the first frame is presented.
 pub struct OverlayWindow {
     hwnd: HWND,
+    destroyed: std::cell::Cell<bool>,
     state: Box<WindowState>,
     receiver: Receiver<WindowEvent>,
     repositioned: bool,
@@ -657,6 +728,7 @@ pub struct OverlayWindow {
     /// Blurred wallpaper captured by the worker thread, sampled under the
     /// pill during draw. `None` until the first worker round lands.
     backdrop: RefCell<Option<crate::backdrop::Backdrop>>,
+    surface: RefCell<Option<surface::Surface>>,
     /// Last ULW destination (x, y, w, h) in physical pixels.
     last_dest: (i32, i32, u32, u32),
     /// Monitor the island is anchored to. Picked from the cursor position on
@@ -699,9 +771,9 @@ impl OverlayWindow {
 
         let island_enabled = config.island.layout != IslandLayout::Classic;
         let ex_style = if config.always_on_top || island_enabled {
-            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW
+            WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
         } else {
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW
+            WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
         };
         let (x, y) = match &config.position {
             Some(position) => (position.x_logical, position.y_logical),
@@ -729,6 +801,8 @@ impl OverlayWindow {
             events: sender,
             alpha: RefCell::new(AlphaMap::default()),
             is_island: config.island.is_enabled(),
+            is_bar: config.island.is_bar(),
+            menu_state: RefCell::new(tray::MenuState::from_island(&config.island)),
             hover_inside: RefCell::new(false),
         });
         let state_ptr = &*state as *const WindowState as isize;
@@ -736,6 +810,7 @@ impl OverlayWindow {
 
         let window = Self {
             hwnd,
+            destroyed: std::cell::Cell::new(false),
             state,
             receiver,
             repositioned: false,
@@ -744,6 +819,7 @@ impl OverlayWindow {
             tray: false,
             glass: config.island.glass.clone(),
             backdrop: RefCell::new(None),
+            surface: RefCell::new(None),
             last_dest: (0, 0, 1, 1),
         };
         if matches!(config.render, RenderMode::ColorKey) {
@@ -867,10 +943,15 @@ impl OverlayWindow {
     /// Blocks until a window message arrives, dispatches it, and returns the
     /// event it produced, if any.
     pub fn next_event(&mut self) -> Result<Option<WindowEvent>, WindowError> {
+        // One Win32 message can enqueue several semantic events (release +
+        // click). Deliver those before blocking for another OS message.
+        if let Ok(event) = self.receiver.try_recv() {
+            return Ok(Some(event));
+        }
         let mut message = MSG::default();
         let result = unsafe { GetMessageW(&mut message, Some(self.hwnd), 0, 0) };
         if result.0 == 0 {
-            return Ok(None);
+            return Ok(Some(WindowEvent::Quit));
         }
         if result.0 == -1 {
             return Err(WindowError::Win32(unsafe { GetLastError().0 }));
@@ -951,6 +1032,16 @@ impl OverlayWindow {
         self.state.is_island = is_island;
     }
 
+    /// Updates whether the active island surface is the full-width bar.
+    pub fn set_bar(&mut self, is_bar: bool) {
+        self.state.is_bar = is_bar;
+    }
+
+    /// Updates the state used to render tray menu checkmarks.
+    pub fn set_tray_state(&mut self, state: tray::MenuState) {
+        *self.state.menu_state.borrow_mut() = state;
+    }
+
     /// Updates the glass material live (theme switches); the new tint and
     /// blur apply on the next present.
     pub fn set_glass(&mut self, glass: &GlassConfig) {
@@ -960,10 +1051,14 @@ impl OverlayWindow {
     /// Destroys the window and posts `WM_QUIT` to the owning thread's queue.
     /// Must be called from the thread that created the window.
     pub fn destroy(&self) {
+        if self.destroyed.replace(true) {
+            return;
+        }
         if self.tray {
             let _ = tray::remove(self.hwnd);
         }
         let _ = unsafe { DestroyWindow(self.hwnd) };
+        self.surface.borrow_mut().take();
         unsafe { PostQuitMessage(0) };
     }
 
@@ -1015,6 +1110,21 @@ impl OverlayWindow {
             }
         }
         1.0
+    }
+
+    /// DPI scale for the monitor the next anchor update will use. This avoids
+    /// authoring one frame at the old monitor's scale before a hotplug move.
+    pub fn anchor_dpi_scale(&self) -> f32 {
+        let Some(monitor) = self.anchor_monitor else {
+            return 1.0;
+        };
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok() {
+            (dpi_x as f32 / 96.0).clamp(0.5, 4.0)
+        } else {
+            1.0
+        }
     }
 
     /// Checks if the cursor is currently on a different monitor than `anchor_monitor`.
@@ -1192,57 +1302,37 @@ impl OverlayWindow {
         // Frames arrive authored at device pixels: every blit below is 1:1,
         // so the old bilinear upscale is gone and pixels land exactly.
         let (w, h) = (frame.width, frame.height);
-        let expected = w as usize * h as usize * 4;
+        let expected = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .ok_or(WindowError::FrameBuffer)?;
+        if w == 0 || h == 0 {
+            return Err(WindowError::FrameBuffer);
+        }
         if frame.pixels_pbgra.len() != expected {
             return Err(WindowError::FrameBuffer);
         }
 
-        let screen = unsafe { GetDC(None) };
-        if screen.is_invalid() {
-            return Err(WindowError::Win32(unsafe { GetLastError().0 }));
+        let mut surface = self.surface.borrow_mut();
+        if surface.as_ref().is_none_or(|s| s.width < w || s.height < h) {
+            *surface = Some(surface::Surface::new(w, h)?);
         }
-        let memory = unsafe { CreateCompatibleDC(Some(screen)) };
-        if memory.is_invalid() {
-            let _ = unsafe { ReleaseDC(None, screen) };
-            return Err(WindowError::Win32(unsafe { GetLastError().0 }));
-        }
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w as i32,
-                biHeight: -(h as i32),
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                biSizeImage: 0,
-                ..Default::default()
-            },
-            bmiColors: [RGBQUAD::default()],
-        };
-        let mut bits: *mut c_void = std::ptr::null_mut();
-        let dib =
-            unsafe { CreateDIBSection(Some(memory), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) };
-        let Ok(dib) = dib else {
-            let error = unsafe { GetLastError().0 };
-            let _ = unsafe { DeleteDC(memory) };
-            let _ = unsafe { ReleaseDC(None, screen) };
-            return Err(WindowError::Win32(error));
-        };
+        let surface = surface.as_mut().expect("surface was allocated");
+        let memory = surface.dc;
+        let stride = surface.width as usize * 4;
 
         // Frosted glass: capture the live backdrop once (cached) and blur
         // it under the frame's own tint. The backdrop excludes layered windows,
         // so the pill can never feed back into itself. `None` means blur is off
         // or capture failed — fall back to the flat procedural frame.
-        let backdrop = if self.glass.blur_radius > 0 {
-            self.backdrop.borrow().clone()
-        } else {
-            None
-        };
+        let backdrop_guard = self.backdrop.borrow();
+        let backdrop = backdrop_guard
+            .as_ref()
+            .filter(|_| self.glass.blur_radius > 0);
 
         let is_hidden_sensor = h <= 4;
         let mut alpha_map = Vec::with_capacity(w as usize * h as usize);
-        let len = w as usize * h as usize * 4;
-        let dst = unsafe { std::slice::from_raw_parts_mut(bits as *mut u8, len) };
+        let dst = surface.pixels();
         if is_hidden_sensor {
             // Assign alpha = 1 for the hidden sensor: 1/255 opacity is completely invisible
             // to the human eye, but ensures Windows DWM treats the window as an active
@@ -1256,33 +1346,28 @@ impl OverlayWindow {
             alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         } else {
             // 1:1 blit: the frame already matches the window surface.
-            match backdrop.as_ref() {
+            match backdrop {
                 Some(bg) => {
                     for yy in 0..h {
                         for xx in 0..w {
                             let source = &frame.pixels_pbgra
                                 [(yy as usize * w as usize + xx as usize) * 4..][..4];
-                            let target = (yy as usize * w as usize + xx as usize) * 4;
+                            let target = yy as usize * stride + xx as usize * 4;
                             if source[3] == 0 {
                                 // Outside the pill: stay fully transparent so clicks
                                 // pass through and the desktop shows untouched.
                                 dst[target..target + 4].fill(0);
                             } else {
-                                // Sample the backdrop proportionally and clamped:
-                                // during morphs the stored backdrop was captured
-                                // for the previous pill size, and blur hides the
-                                // stretch. Never panics on size mismatch.
-                                let bx = ((u64::from(xx) * u64::from(bg.width)) / u64::from(w))
-                                    .min(u64::from(bg.width.saturating_sub(1)))
-                                    as usize;
-                                let by = ((u64::from(yy) * u64::from(bg.height)) / u64::from(h))
-                                    .min(u64::from(bg.height.saturating_sub(1)))
-                                    as usize;
-                                let bi = (by * bg.width as usize + bx) * 4;
+                                let pixel = bg
+                                    .sample(
+                                        x.saturating_add(xx as i32),
+                                        y.saturating_add(yy as i32),
+                                    )
+                                    .unwrap_or(&self.glass.tint);
                                 let ia = 255 - u32::from(source[3]);
-                                let bg_b = u32::from(bg.pixels.get(bi).copied().unwrap_or(0));
-                                let bg_g = u32::from(bg.pixels.get(bi + 1).copied().unwrap_or(0));
-                                let bg_r = u32::from(bg.pixels.get(bi + 2).copied().unwrap_or(0));
+                                let bg_b = u32::from(pixel[0]);
+                                let bg_g = u32::from(pixel[1]);
+                                let bg_r = u32::from(pixel[2]);
                                 let comp_b = (u32::from(source[0]) + bg_b * ia / 255).min(255);
                                 let comp_g = (u32::from(source[1]) + bg_g * ia / 255).min(255);
                                 let comp_r = (u32::from(source[2]) + bg_r * ia / 255).min(255);
@@ -1315,7 +1400,7 @@ impl OverlayWindow {
                         for xx in 0..w {
                             let source = &frame.pixels_pbgra
                                 [(yy as usize * w as usize + xx as usize) * 4..][..4];
-                            let target = (yy as usize * w as usize + xx as usize) * 4;
+                            let target = yy as usize * stride + xx as usize * 4;
                             dst[target..target + 4].copy_from_slice(source);
                             alpha_map.push(source[3]);
                         }
@@ -1330,12 +1415,6 @@ impl OverlayWindow {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        // The DIB must be selected into the source DC before UpdateLayeredWindow:
-        // CreateDIBSection only allocates the section and returns the `bits`
-        // pointer, it does not select the bitmap. Without this the DC still has
-        // the stock 1x1 monochrome bitmap, ULW composites nothing, and the
-        // window shows an empty (fully transparent) surface.
-        let previous = unsafe { SelectObject(memory, HGDIOBJ(dib.0)) };
         let origin = POINT { x: 0, y: 0 };
         // The window is already sized and positioned by `present` via
         // SetWindowPos; leaving pptDst and psize NULL updates only the surface
@@ -1353,7 +1432,7 @@ impl OverlayWindow {
         let update = unsafe {
             UpdateLayeredWindow(
                 self.hwnd,
-                Some(screen),
+                None,
                 Some(&dest),
                 Some(&size),
                 Some(memory),
@@ -1363,13 +1442,6 @@ impl OverlayWindow {
                 ULW_ALPHA,
             )
         };
-        // Restore the stock bitmap so DeleteDC's cleanup bookkeeping stays
-        // symmetric, then release everything. ULW has already copied the
-        // pixels into the redirection surface at this point.
-        unsafe { SelectObject(memory, previous) };
-        let _ = unsafe { DeleteObject(HGDIOBJ(dib.0)) };
-        let _ = unsafe { DeleteDC(memory) };
-        let _ = unsafe { ReleaseDC(None, screen) };
         update?;
 
         if self.state.is_island {
@@ -1509,58 +1581,9 @@ pub struct WakeHandle {
 /// GUI thread out of `GetMessageW`.
 unsafe impl Send for WakeHandle {}
 
-/// A precise animation clock: a background thread sleeps until the next
-/// deadline and wakes the GUI thread, which decodes and presents the frame.
-/// `WM_TIMER` cannot pace 16 ms frames — its messages are delivered only when
-/// the queue is idle, adding unpredictable latency — so the deadlines live on
-/// this thread instead.
-pub struct AnimationClock {
-    deadline: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Kept for the wake handle's lifetime; the spawned thread holds its own
-    /// copy, so this field keeps the handle alive for as long as the clock.
-    _wake: WakeHandle,
-}
-
-/// Sentinel: no deadline is armed.
-const NO_DEADLINE: u64 = u64::MAX;
-
-impl AnimationClock {
-    /// Starts the clock thread. The overlay arms deadlines with
-    /// [`AnimationClock::arm`] after every frame.
-    pub fn spawn(wake: WakeHandle) -> Self {
-        let deadline = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(NO_DEADLINE));
-        let clock = Self {
-            deadline: deadline.clone(),
-            _wake: wake,
-        };
-        std::thread::spawn(move || {
-            loop {
-                let at = deadline.load(std::sync::atomic::Ordering::Relaxed);
-                if at == NO_DEADLINE {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                let now = now_ms();
-                if at > now {
-                    std::thread::sleep(std::time::Duration::from_millis(at - now));
-                }
-                let _ = wake.post();
-                // Give the GUI thread a moment to re-arm before checking again,
-                // so a due-but-not-yet-rearmed deadline does not spin.
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-        });
-        clock
-    }
-
-    /// Arms the next deadline; `None` disarms the clock.
-    pub fn arm(&self, deadline: Option<u64>) {
-        self.deadline.store(
-            deadline.unwrap_or(NO_DEADLINE),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-}
+mod clock;
+mod surface;
+pub use clock::AnimationClock;
 
 /// Milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
@@ -1570,6 +1593,11 @@ fn now_ms() -> u64 {
 }
 
 impl WakeHandle {
+    fn post_animation(&self) -> Result<(), WindowError> {
+        unsafe { PostMessageW(Some(self.hwnd), ANIMATION_MSG, WPARAM(0), LPARAM(0)) }?;
+        Ok(())
+    }
+
     /// Posts an empty message to the overlay's message queue.
     pub fn post(&self) -> Result<(), WindowError> {
         unsafe { PostMessageW(Some(self.hwnd), WAKE_MSG, WPARAM(0), LPARAM(0)) }?;
@@ -1582,10 +1610,68 @@ mod tests {
     use super::*;
 
     #[test]
+    fn upload_surface_reuses_capacity_and_preserves_row_stride() {
+        let mut window = OverlayWindow::create(&AppConfig::default(), true).unwrap();
+        for (width, height) in [(31, 17), (23, 9), (32, 16)] {
+            let mut pixels = vec![0u8; width * height * 4];
+            for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+                pixel.copy_from_slice(&[(index % width) as u8, (index / width) as u8, 0, 255]);
+            }
+            let frame = FrameBuffer {
+                width: width as u32,
+                height: height as u32,
+                pixels_pbgra: pixels,
+                delay_ms: 0,
+                loop_index: 0,
+                scale: 1.0,
+            };
+            window.present(&frame).unwrap();
+            let mut surface = window.surface.borrow_mut();
+            let surface = surface.as_mut().unwrap();
+            assert_eq!((surface.width, surface.height), (32, 32));
+            let stride = surface.width as usize * 4;
+            let pixels = surface.pixels();
+            for y in 0..height {
+                assert_eq!(
+                    &pixels[y * stride..y * stride + width * 4],
+                    &frame.pixels_pbgra[y * width * 4..(y + 1) * width * 4]
+                );
+            }
+        }
+        window.destroy();
+        assert!(window.surface.borrow().is_none());
+        window.destroy();
+    }
+
+    #[test]
     fn wide_strings_round_trip() {
         let wide = encode_wide("\\\\.\\DISPLAY1");
         assert_eq!(wide_to_string(&wide), "\\\\.\\DISPLAY1");
         assert_eq!(wide.last(), Some(&0));
+    }
+
+    #[test]
+    fn queued_release_and_click_do_not_require_another_window_message() {
+        let mut window = OverlayWindow::create(&AppConfig::default(), true).unwrap();
+        window
+            .state
+            .events
+            .send(WindowEvent::PressChanged(false))
+            .unwrap();
+        window
+            .state
+            .events
+            .send(WindowEvent::ClickAt(20, 10))
+            .unwrap();
+        window.destroy();
+        assert_eq!(
+            window.next_event().unwrap(),
+            Some(WindowEvent::PressChanged(false))
+        );
+        assert_eq!(
+            window.next_event().unwrap(),
+            Some(WindowEvent::ClickAt(20, 10))
+        );
     }
 
     #[test]
