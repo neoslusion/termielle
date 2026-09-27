@@ -151,15 +151,25 @@ impl Controller {
         let (margin, vis_off, vis_h, pill_off, pill_h, bar_r) = self.bar_row();
         let bar_x = margin as i32;
         let bar_w = width.saturating_sub(margin * 2);
-        let row_blob = [crate::animation::notch::BlobRect {
-            x: bar_x,
-            y: vis_off,
-            w: bar_w,
-            h: vis_h,
-            r: bar_r,
-            attached: true,
-        }];
-        let row = self.glass_layer_blobs(width, bar_h, 0, true, &row_blob, false);
+        // An edge-to-edge bar is a transparent band, not a surface: the
+        // desktop shows through it and the only thing on screen that carries
+        // the theme's material is the center pill. A strip that is inset by a
+        // margin or given a corner radius *is* a shape of its own, so it gets
+        // the row's glass. Deciding this here rather than letting it fall out
+        // of layer compositing keeps the clear band the documented default
+        // instead of an accident of draw order.
+        let strip_is_surface = margin > 0 || bar_r > 0;
+        let row = strip_is_surface.then(|| {
+            let row_blob = [crate::animation::notch::BlobRect {
+                x: bar_x,
+                y: vis_off,
+                w: bar_w,
+                h: vis_h,
+                r: bar_r,
+                attached: true,
+            }];
+            self.glass_layer_blobs(width, bar_h, 0, true, &row_blob, false)
+        });
         let key = cache_key(self, width, bar_h);
         let left_valid = self
             .bar_left_cache
@@ -223,12 +233,16 @@ impl Controller {
             let mut frame = self.current.clone();
             if damage.contains(BarDamage::LEFT) {
                 clear_region(&mut frame, bar_y, 0, left_end, bar_h);
-                composite_region(&mut frame, &row, bar_y, 0, left_end);
+                if let Some(row) = row.as_ref() {
+                    composite_region(&mut frame, row, bar_y, 0, left_end);
+                }
                 composite_region(&mut frame, &left_frame, bar_y, 0, left_end);
             }
             if damage.contains(BarDamage::RIGHT) {
                 clear_region(&mut frame, bar_y, right_start, width, bar_h);
-                composite_region(&mut frame, &row, bar_y, right_start, width);
+                if let Some(row) = row.as_ref() {
+                    composite_region(&mut frame, row, bar_y, right_start, width);
+                }
                 composite_region(&mut frame, &right_frame, bar_y, right_start, width);
             }
             let mut hits = left_hits;
@@ -245,7 +259,9 @@ impl Controller {
         }
 
         let mut frame = self.blank_frame(width, height);
-        composite_region(&mut frame, &row, bar_y, 0, width);
+        if let Some(row) = row.as_ref() {
+            composite_region(&mut frame, row, bar_y, 0, width);
+        }
         composite_region(&mut frame, &left_frame, bar_y, 0, left_end);
         composite_region(&mut frame, &right_frame, bar_y, right_start, width);
         if expanded && self.bar_module("center", "termielle") {
@@ -422,18 +438,15 @@ mod tests {
         );
     }
 
-    /// The strip is one continuous glass surface. The side zones are cached
-    /// transparent layers that only carry the pixels they paint, so they have
-    /// to be blended over the row: copying them replaced their transparent
-    /// pixels with nothing and left the bar with glass only in the gap between
-    /// the zones, so the desktop showed through the strip raw.
-    #[test]
-    fn strip_glass_survives_under_both_side_zones() {
+    fn bar_controller(margin: u32, corner_radius: u32) -> Controller {
         let mut island = IslandConfig {
             layout: IslandLayout::Bar,
             ..IslandConfig::default()
         };
         island.bar.height = 36;
+        island.bar.edge_to_edge = margin == 0;
+        island.bar.margin = margin;
+        island.bar.corner_radius = corner_radius;
         island.bar.modules_left = vec!["workspaces".to_string(), "window".to_string()];
         island.bar.modules_right = vec!["cpu".to_string(), "clock".to_string()];
         let mut controller = Controller::new_with_island(
@@ -444,8 +457,7 @@ mod tests {
             None,
             island,
         );
-        let width = 1536u32;
-        controller.set_bar_width(width);
+        controller.set_bar_width(1536);
         controller.set_bar_metrics(
             Snapshot {
                 workspaces: WorkspaceSnapshot {
@@ -456,28 +468,54 @@ mod tests {
             },
             0,
         );
+        controller
+    }
 
-        let frame = controller.render_bar(VisualState::Idle, width, 36, 60_000);
-        let alpha = |x: u32, y: u32| -> u8 {
-            let idx = ((y as usize * frame.width as usize) + x as usize) * 4;
-            frame.pixels_pbgra[idx + 3]
+    /// The default bar is edge to edge with no margin and no corner radius, so
+    /// it is a transparent band and the desktop shows through it. Only the
+    /// center pill carries the theme's material. A strip that is inset or
+    /// rounded is a shape of its own and does get the row's glass.
+    #[test]
+    fn only_an_inset_or_rounded_strip_carries_the_row_glass() {
+        let width = 1536u32;
+
+        let mut edge = bar_controller(0, 0);
+        let frame = edge.render_bar(VisualState::Idle, width, 36, 60_000);
+        let alpha = |f: &crate::animation::FrameBuffer, x: u32, y: u32| -> u8 {
+            let idx = ((y as usize * f.width as usize) + x as usize) * 4;
+            f.pixels_pbgra[idx + 3]
         };
-        let (pill_cx, pill_off, pill_w, _) = controller.bar_pill_rect(width);
-        let y = (pill_off + 4) as u32;
+        let (pill_cx, pill_off, pill_w, pill_h) = edge.bar_pill_rect(width);
+        let mid = (pill_off + (pill_h / 2) as i32) as u32;
 
-        // Left of the pill, under the left zone; right of the pill, under the
-        // right zone. Both must still be the row's glass, not a hole.
-        let probes = [
-            8u32,
+        // The pill itself is glass, and nothing around it is.
+        assert!(
+            alpha(&frame, pill_cx as u32 + pill_w / 2, mid) > 0,
+            "the center pill must carry the glass background"
+        );
+        for x in [
+            4u32,
             pill_cx as u32 / 2,
             pill_cx as u32 + pill_w + 8,
-            width - 8,
-        ];
-        for x in probes {
-            assert!(
-                alpha(x, y) > 0,
-                "strip is unpainted at x={x}: the side zones erased the row's glass"
+            width - 4,
+        ] {
+            assert_eq!(
+                alpha(&frame, x, mid),
+                0,
+                "an edge-to-edge bar must stay clear at x={x}"
             );
+        }
+
+        for (margin, corner_radius) in [(12u32, 0u32), (0, 10)] {
+            let mut floating = bar_controller(margin, corner_radius);
+            let frame = floating.render_bar(VisualState::Idle, width, 36, 60_000);
+            let y = (floating.bar_row().1 + 4) as u32;
+            for x in [margin + 4, width / 2, width - margin - 5] {
+                assert!(
+                    alpha(&frame, x, y) > 0,
+                    "a strip with margin={margin} radius={corner_radius} must be glass at x={x}"
+                );
+            }
         }
     }
 }
