@@ -1,8 +1,11 @@
 //! Bar zone painters: left (workspaces/title), right (clock/stats), center (island).
 
 use super::super::controller::Controller;
-use super::text::{ellipsize_middle, paint_metric_text};
-use super::types::{BarCard, BarHit, BarMetricsCache};
+use super::text::ellipsize_middle;
+use super::types::{
+    BATTERY_W, BarCard, BarHit, BarMetricsCache, CLOCK_ICON, CLOCK_TEXT_W, CLOCK_W, ICON, ICON_GAP,
+    METRIC_W, MODULE_GAP, VALUE_W, VOLUME_W,
+};
 use crate::animation::FrameBuffer;
 use termielle_core::VisualState;
 
@@ -189,6 +192,11 @@ impl Controller {
     }
 
     /// Status items use a shared baseline without permanent button chrome.
+    ///
+    /// The zone is a set of readouts, so a module is an icon plus its number
+    /// and no label word: the glyph names the metric and the number is the
+    /// thing being read. Dropping "CPU" and "RAM" frees about 60 px and lets
+    /// the numbers carry bold primary ink against a dimmer icon.
     pub(crate) fn paint_bar_right(
         &self,
         frame: &mut FrameBuffer,
@@ -198,18 +206,27 @@ impl Controller {
         pill_y: i32,
         pill_h: u32,
     ) -> Vec<BarHit> {
-        use crate::animation::notch::{draw_rounded_rect, draw_text_in_rect, ink_pair};
+        use crate::animation::icons;
+        use crate::animation::notch::{draw_text_in_rect, ink_pair};
         let mut hits = Vec::new();
         let (primary, secondary) = ink_pair(&self.island.glass);
         let mut right = width as i32 - bar_x - 12;
         if self.bar_module("right", "clock") {
-            right -= 84;
+            right -= CLOCK_W;
+            icons::draw_icon(
+                frame,
+                icons::CLOCK,
+                right,
+                pill_y + (pill_h as i32 - CLOCK_ICON) / 2,
+                CLOCK_ICON as u32,
+                secondary,
+            );
             draw_text_in_rect(
                 frame,
                 &metrics.time_str,
-                (right, pill_y, 84, pill_h),
+                (right + CLOCK_ICON + ICON_GAP, pill_y, CLOCK_TEXT_W, pill_h),
                 12,
-                false,
+                true,
                 primary,
                 true,
             );
@@ -217,110 +234,92 @@ impl Controller {
                 crate::bar::shell::ShellAction::Clock.hit_id(),
                 right,
                 pill_y,
-                84,
+                CLOCK_W as u32,
                 pill_h,
             ));
-            right -= 16;
+            right -= MODULE_GAP;
         }
         if self.bar_module("right", "battery") {
             if let Some(percent) = metrics.battery.0 {
-                right -= super::battery::BATTERY_MODULE_W;
-                draw_text_in_rect(
-                    frame,
-                    &format!("{percent}%"),
-                    (right, pill_y, super::battery::BATTERY_TEXT_W, pill_h),
-                    12,
-                    false,
-                    primary,
-                    true,
-                );
-                let y = pill_y + (pill_h as i32 - super::battery::BATTERY_H as i32) / 2;
-                let parts = super::battery::battery_geometry(right, y, percent);
-                let color = if percent <= 20 && !metrics.battery.1 {
+                right -= BATTERY_W;
+                // Low battery is the one case that outranks the theme's ink,
+                // and charging is the one state worth a different glyph.
+                let ink = if percent <= 20 && !metrics.battery.1 {
                     [85, 85, 240, 255]
                 } else {
                     primary
                 };
-                draw_rounded_rect(
+                draw_text_in_rect(
                     frame,
-                    parts.body.0,
-                    parts.body.1,
-                    parts.body.2,
-                    parts.body.3,
-                    2,
-                    [0; 4],
-                    color,
+                    &format!("{percent}%"),
+                    (right, pill_y, VALUE_W, pill_h),
+                    13,
+                    true,
+                    ink,
+                    true,
                 );
-                draw_rounded_rect(
+                icons::draw_icon(
                     frame,
-                    parts.nub.0,
-                    parts.nub.1,
-                    parts.nub.2,
-                    parts.nub.3,
-                    1,
-                    color,
-                    [0; 4],
+                    if metrics.battery.1 {
+                        icons::BATTERY_CHARGING
+                    } else {
+                        icons::BATTERY
+                    },
+                    right + VALUE_W as i32 + ICON_GAP,
+                    pill_y + (pill_h as i32 - ICON) / 2,
+                    ICON as u32,
+                    ink,
                 );
-                draw_rounded_rect(
-                    frame,
-                    parts.fill.0,
-                    parts.fill.1,
-                    parts.fill.2,
-                    parts.fill.3,
-                    1,
-                    color,
-                    [0; 4],
-                );
-                if metrics.battery.1 {
-                    // Beside the battery, not inside it: the body is only
-                    // 10 px tall, and a bolt drawn into it clipped the glyph
-                    // and hung a tail below the outline.
-                    draw_text_in_rect(
-                        frame,
-                        "ϟ",
-                        (parts.bolt.0, parts.bolt.1, parts.bolt.2, parts.bolt.3),
-                        9,
-                        true,
-                        color,
-                        true,
-                    );
-                }
-                right -= 16;
+                right -= MODULE_GAP;
             }
         }
         if self.bar_module("right", "volume") {
-            right -= 24;
-            super::text::paint_speaker(
+            right -= VOLUME_W;
+            icons::draw_icon(
                 frame,
+                if metrics.volume.muted {
+                    icons::VOLUME_MUTED
+                } else {
+                    icons::VOLUME
+                },
                 right,
-                pill_y + (pill_h as i32 - 16) / 2,
-                metrics.volume.muted,
+                pill_y + (pill_h as i32 - VOLUME_W) / 2,
+                VOLUME_W as u32,
                 primary,
             );
             hits.push((
                 crate::bar::HIT_BAR_VOLUME_TOGGLE,
                 right - 4,
                 pill_y,
-                32,
+                VOLUME_W as u32 + 8,
                 pill_h,
             ));
-            right -= 16;
+            right -= MODULE_GAP;
         }
-        for (module, label, value) in [
-            ("memory", "RAM", metrics.memory_pct),
-            ("cpu", "CPU", metrics.cpu_pct),
+        for (module, icon, value) in [
+            ("memory", icons::MEMORY, metrics.memory_pct),
+            ("cpu", icons::CPU, metrics.cpu_pct),
         ] {
             if self.bar_module("right", module) {
-                right -= 74;
-                paint_metric_text(
+                right -= METRIC_W;
+                icons::draw_icon(
                     frame,
-                    (right, pill_y, 74, pill_h),
-                    label,
-                    &format!("{value}%"),
-                    primary,
+                    icon,
+                    right,
+                    pill_y + (pill_h as i32 - ICON) / 2,
+                    ICON as u32,
                     secondary,
                 );
-                right -= 16;
+                draw_text_in_rect(
+                    frame,
+                    &format!("{value}%"),
+                    (right + ICON + ICON_GAP, pill_y, VALUE_W, pill_h),
+                    13,
+                    true,
+                    primary,
+                    true,
+                );
+                right -= MODULE_GAP;
             }
         }
         hits
@@ -467,27 +466,17 @@ impl Controller {
                 // The control-panel glyph lives inside the pill's right end.
                 // It is registered before the pill's whole-surface hit, so
                 // the open/close click keeps every other pixel to itself.
-                let panel_w = 20i32;
-                let panel_x = pill_cx + pill_w as i32 - panel_w - 6;
+                let panel_w = 18i32;
+                let panel_x = pill_cx + pill_w as i32 - panel_w - 7;
                 let panel_y = local_pill_y + (pill_h as i32 - panel_w) / 2;
-                for (row, len) in [9i32, 14, 7].iter().enumerate() {
-                    let line_y = panel_y + 5 + row as i32 * 5;
-                    crate::animation::notch::fill_rect_pub(
-                        compact_frame,
-                        panel_x,
-                        line_y,
-                        *len as u32,
-                        2,
-                        [255, 255, 255, 110],
-                    );
-                    crate::animation::notch::draw_disc(
-                        compact_frame,
-                        panel_x + *len,
-                        line_y,
-                        2,
-                        [255, 255, 255, 190],
-                    );
-                }
+                crate::animation::icons::draw_icon(
+                    compact_frame,
+                    crate::animation::icons::ADJUSTMENTS,
+                    panel_x,
+                    panel_y,
+                    panel_w as u32,
+                    primary,
+                );
                 hits.push((
                     crate::app::types::HIT_CARD_PANEL,
                     panel_x - 2,

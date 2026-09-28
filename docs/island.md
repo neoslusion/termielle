@@ -68,6 +68,13 @@ resume playback. Workspace buttons select virtual desktops; the speaker
 toggles mute and the wheel adjusts volume. CPU, memory, battery, clock, and
 window title remain passive status modules.
 
+Right-zone modules are a glyph plus its number and no label word: the icon
+names the metric, the number is the thing being read. The glyphs are
+[Tabler Icons](https://github.com/tabler/tabler-icons) (MIT, © 2020-2024
+Pawel Kuna), embedded as their upstream SVG path data and stroked at draw time
+from a distance field, so they stay sharp at any scale and a new icon is one
+line of path data. `draw_icon` lives in `animation/icons.rs`.
+
 The bar keeps a fixed strip height while the focused Termielle popup opens
 below or above it. This is a persistent Waybar-style surface, not a macOS menu
 bar clone. The popup is a focused detail view; it does not duplicate the

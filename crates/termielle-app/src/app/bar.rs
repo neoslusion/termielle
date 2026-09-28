@@ -1,6 +1,4 @@
 //! Waybar-style status bar: metrics cache, row geometry, and zone painters.
-
-pub(crate) mod battery;
 pub(crate) mod geometry;
 pub(crate) mod modules;
 pub(crate) mod render;

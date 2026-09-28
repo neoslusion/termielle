@@ -108,7 +108,18 @@ impl Controller {
                 PanelRow::Volume => {
                     let glyph_x = PANEL_PAD;
                     let glyph_y = y + (PANEL_ROW_H - 24) / 2;
-                    super::super::bar::text::paint_speaker(frame, glyph_x, glyph_y, muted, primary);
+                    crate::animation::icons::draw_icon(
+                        frame,
+                        if muted {
+                            crate::animation::icons::VOLUME_MUTED
+                        } else {
+                            crate::animation::icons::VOLUME
+                        },
+                        glyph_x,
+                        glyph_y,
+                        24,
+                        primary,
+                    );
                     // The whole glyph is the mute target; the track answers
                     // the wheel, and the two steppers own their own cells.
                     self.icon_hits.push((

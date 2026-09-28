@@ -22,12 +22,12 @@ use windows::core::PCWSTR;
 
 /// Maps one logical design unit to device pixels for `frame`. At 1.0 this
 /// is the identity, so unscaled frames render bit-identically to before.
-fn sx(frame: &FrameBuffer, v: i32) -> i32 {
+pub(crate) fn sx(frame: &FrameBuffer, v: i32) -> i32 {
     (v as f32 * frame.scale).round() as i32
 }
 
 /// Same for unsigned extents (sizes, radii, font heights).
-fn su(frame: &FrameBuffer, v: u32) -> u32 {
+pub(crate) fn su(frame: &FrameBuffer, v: u32) -> u32 {
     ((v as f32 * frame.scale).round() as i64).clamp(0, i64::from(u32::MAX)) as u32
 }
 
