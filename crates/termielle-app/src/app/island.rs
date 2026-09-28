@@ -147,14 +147,21 @@ impl Controller {
             return Presentation::Expanded;
         }
         if self.manually_expanded {
-            // Waybar mode is a persistent status surface: only an explicit
-            // click on the Termielle module opens its focused popup.
+            // Waybar mode is a persistent status surface: an explicit click on
+            // the Termielle module opens its focused popup.
             return Presentation::Expanded;
         }
-        let agent_live = !matches!(self.state, VisualState::Idle);
-        if self.hover_expanded && !self.island.is_bar() {
-            return Presentation::Compact;
+        // A bar's pill *is* the island, so hovering it opens the same card a
+        // click does. Standalone Island keeps its own smaller hover step,
+        // which is why the two layouts differ here.
+        if self.hover_expanded {
+            return if self.island.is_bar() {
+                Presentation::Expanded
+            } else {
+                Presentation::Compact
+            };
         }
+        let agent_live = !matches!(self.state, VisualState::Idle);
         if agent_live || self.media_available() {
             return Presentation::Compact;
         }
@@ -792,19 +799,35 @@ impl Controller {
         self.morph_to_target(now_ms)
     }
 
-    /// Tracks the cursor without opening the persistent bar. Bar expansion is
-    /// click-only; standalone Island keeps the existing hover affordance.
+    /// Hover dwell before a bar pill opens its card, in ms. A cursor merely
+    /// crossing the strip should not throw a popup open.
+    pub const HOVER_DWELL_MS: u64 = 300;
+    /// Grace after the pointer leaves the pill, in ms, so it can travel down
+    /// into the card it just opened instead of dismissing it on the way.
+    pub const HOVER_GRACE_MS: u64 = 500;
+
+    /// Tracks the cursor and opens the bar's popup on hover when
+    /// `expand_on_hover` is on.
+    ///
+    /// Both edges are deferred. Entering waits out [`HOVER_DWELL_MS`] so a
+    /// cursor merely crossing the strip does not throw the card open, and
+    /// leaving waits [`HOVER_GRACE_MS`] so the pointer can travel down into
+    /// the card it just opened instead of dismissing it on the way.
     pub fn set_hover(&mut self, inside: bool, now_ms: u64) -> bool {
         if !self.island.is_enabled() {
             return false;
         }
-        if self.island.is_bar() {
-            self.hover_expanded = false;
-            self.hover_deadline = None;
-            return false;
-        }
         if !self.island.expand_on_hover {
-            return false;
+            // Turning the setting off has to close whatever hover opened.
+            self.hover_deadline = None;
+            if !self.hover_expanded {
+                return false;
+            }
+            self.hover_expanded = false;
+            return self.morph_to_target(now_ms);
+        }
+        if self.island.is_bar() {
+            return self.set_bar_hover(inside, now_ms);
         }
         if self.state != VisualState::Idle || self.manually_expanded {
             self.hover_expanded = inside;
@@ -815,6 +838,59 @@ impl Controller {
         }
         self.hover_expanded = inside;
         self.morph_to_target(now_ms)
+    }
+
+    /// The bar half of [`Self::set_hover`]: a click already owns the card when
+    /// one is open, and a click that just closed it must not be undone by the
+    /// pointer still resting on the pill - hence `hover_suppressed`, which
+    /// only clears once the pointer has actually left.
+    fn set_bar_hover(&mut self, inside: bool, now_ms: u64) -> bool {
+        if inside {
+            if self.hover_suppressed {
+                return false;
+            }
+            // A pointer that jitters a pixel off the pill and back must not
+            // leave a close armed behind it: the close fires on schedule even
+            // though the pointer is sitting on the pill, the card collapses,
+            // re-arms open, and the two chase each other. Cancelling on
+            // return is what makes the grace a grace rather than a countdown
+            // the pointer never sees.
+            if self.hover_deadline.is_some_and(|(expand, _)| !expand) {
+                self.hover_deadline = None;
+            }
+            // Already counting down to open. The poll runs on every present,
+            // so this guard is what stops it re-arming: each re-arm pushes the
+            // deadline to now + dwell, and a deadline that keeps moving is a
+            // deadline that never arrives.
+            let opening = self.hover_deadline.is_some_and(|(expand, _)| expand);
+            if self.hover_expanded || opening || self.manually_expanded {
+                return false;
+            }
+            self.hover_suppressed = false;
+            self.hover_deadline = Some((true, now_ms.saturating_add(Self::HOVER_DWELL_MS)));
+            return false;
+        }
+        // Leaving clears the suppression, so the next entry can open again.
+        self.hover_suppressed = false;
+        if self.manually_expanded {
+            return false;
+        }
+        if !self.hover_expanded {
+            // Not open yet: leaving restarts the dwell rather than clearing
+            // it. A pointer resting on a pill is never perfectly still, and
+            // clearing on every stray pixel meant the dwell was cancelled
+            // before it could ever complete. The dwell is continuous time on
+            // the pill, not frames sampled from it.
+            if self.hover_deadline.is_some_and(|(expand, _)| expand) {
+                self.hover_deadline = Some((true, now_ms.saturating_add(Self::HOVER_DWELL_MS)));
+            }
+            return false;
+        }
+        if self.hover_deadline.is_some_and(|(expand, _)| !expand) {
+            return false;
+        }
+        self.hover_deadline = Some((false, now_ms.saturating_add(Self::HOVER_GRACE_MS)));
+        false
     }
 
     /// Press feedback: the pointer went down (`true`) or up on the pill.

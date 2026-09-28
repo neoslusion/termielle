@@ -441,7 +441,11 @@ unsafe extern "system" fn window_proc(
             // the pill... except the alpha map may lag a fresh frame by one
             // present, hence the re-test.
             let is_island = unsafe { (*state).is_island };
-            if is_island {
+            // A bar's window is mostly transparent but its hit map covers every
+            // opaque pixel - module text, an open card - so an alpha hit test
+            // here would report "over the pill" while the pointer crosses the
+            // clock. The bar polls the pill's own rect instead.
+            if is_island && !unsafe { (*state).is_bar } {
                 let (x, y) = lparam_point(lparam);
                 let over_pill = {
                     let alpha = unsafe { (*state).alpha.borrow() };
@@ -463,8 +467,16 @@ unsafe extern "system" fn window_proc(
         }
         WM_MOUSELEAVE => {
             let is_island = unsafe { (*state).is_island };
+            let is_bar = unsafe { (*state).is_bar };
             let mut inside = unsafe { (*state).hover_inside.borrow_mut() };
             if *inside {
+                // A bar never armed `inside` (it polls the pill rect), but a
+                // layout switch can leave it set from the island path. Clear
+                // it so the next hover starts from a known state.
+                if is_bar {
+                    *inside = false;
+                    return LRESULT(0);
+                }
                 // UpdateLayeredWindow resizes synthesize spurious leaves
                 // while the cursor is still over the pill. Verify with the
                 // real cursor position; a false leave collapsed the pill

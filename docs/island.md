@@ -56,10 +56,17 @@ it does not simulate live wallpaper blur or prove real-time presentation cadence
 ### Waybar-style system bar
 
 Bar mode is the primary desktop layout: a persistent top or bottom strip with
-left, center, and right module zones. The center `termielle` module is compact
-and click-only; hovering it does not expand the bar. Clicking the module opens
-the focused Termielle popup, and clicking it again closes the popup. Escape or
-an outside click also closes it.
+left, center, and right module zones. Clicking the center `termielle` module
+opens the focused Termielle popup, and clicking it again closes the popup.
+Escape or an outside click also closes it.
+
+With `expand_on_hover` on, dwelling over the pill opens that same popup: the
+bar's pill *is* the island, so hover reaches the state a click reaches. Both
+edges are deferred - 300 ms to open, so a cursor crossing the strip does not
+throw the card open, and 500 ms to close, so the pointer can travel down into
+the card it just opened. A click that dismissed the card is not undone by the
+pointer still resting on the pill; leaving and returning re-arms it. Standalone
+Island keeps its own smaller hover step, so the two layouts differ here.
 
 The module shows the face when enabled, a consistent agent state label, and
 media metadata when a playing or paused media session is available. Media

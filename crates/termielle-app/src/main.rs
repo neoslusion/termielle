@@ -1288,11 +1288,23 @@ fn poll_hover(
     if controller.set_hover_point(window.cursor_client_pos()) {
         actions.present_frame = true;
     }
-    let over = window.cursor_over_pill();
+    // A bar window is mostly transparent and its hit map covers every opaque
+    // pixel - module text, an open card - so "over an opaque pixel" would
+    // open the card when the pointer merely crosses the clock. Hover needs the
+    // pill's own rect.
+    let over = if controller.island_config().is_bar() {
+        window
+            .cursor_client_pos()
+            .is_some_and(|point| controller.point_over_bar_surface(point))
+    } else {
+        window.cursor_over_pill()
+    };
     if controller.set_hover(over, now) {
         actions.present_frame = true;
-        actions.next_deadline_ms = controller.next_deadline_ms();
     }
+    // A hover can arm a dwell or a grace without changing anything on screen,
+    // so the schedule is re-read whether or not the frame did.
+    actions.next_deadline_ms = controller.next_deadline_ms();
     if controller.is_manually_expanded() {
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,

@@ -71,6 +71,41 @@ impl Controller {
         let pill_cx = ((width.saturating_sub(pill_w)) / 2) as i32;
         (pill_cx, pill_off, pill_w, pill_h)
     }
+    /// Whether a physical client point counts as being on the bar's surface.
+    ///
+    /// A bar window is mostly transparent and its hit map covers every opaque
+    /// pixel - module text, an open card - so "over an opaque pixel" cannot
+    /// tell the pill apart from the rest of the strip. The point arrives in
+    /// physical client pixels and is mapped into frame space first, the same
+    /// way `set_hover_point` maps it before testing icon hit-rects.
+    ///
+    /// With nothing open, only the pill counts. With a card open *by hover*,
+    /// the whole frame counts: reaching a switch means travelling from the
+    /// pill down a card taller than the strip, so "left the pill" is not
+    /// "gone", and treating it as gone closed the card out from under the
+    /// pointer. A card opened by click is deliberately excluded - there the
+    /// same flag drives click-outside dismissal, which must still fire.
+    pub fn point_over_bar_surface(&self, point: (i32, i32)) -> bool {
+        let (x, y) = (self.to_logical(point.0), self.to_logical(point.1));
+        let (pill_cx, pill_off, pill_w, pill_h) = self.bar_pill_rect(self.bar_width);
+        let (width, height) = self.current_logical_size();
+        let bar_h = self.island.bar.height;
+        let bar_y = if self.island.bar.position == termielle_core::BarPosition::Top {
+            0
+        } else {
+            height.saturating_sub(bar_h) as i32
+        };
+        let top = bar_y + pill_off;
+        if x >= pill_cx && x < pill_cx + pill_w as i32 && y >= top && y < top + pill_h as i32 {
+            return true;
+        }
+        self.hover_expanded
+            && !self.manually_expanded
+            && x >= 0
+            && x < width as i32
+            && y >= 0
+            && y < height as i32
+    }
 
     /// Whether a bar module name is listed in its zone (`left`, `center`,
     /// `right`). Unknown names are ignored; order within a zone is fixed by

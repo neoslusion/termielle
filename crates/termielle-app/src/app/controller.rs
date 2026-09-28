@@ -1146,6 +1146,201 @@ mod tests {
         assert_eq!(c.face_frame.pixels_pbgra[0], 240);
     }
 
+    /// A bar with the hover setting in the given state. Reduced motion so the
+    /// morph lands on its target in one tick and the tests can assert geometry
+    /// rather than an intermediate frame of the spring.
+    fn bar_with_hover(expand_on_hover: bool) -> Controller {
+        let mut c = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            true,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: true,
+                expand_on_hover,
+                ..IslandConfig::default()
+            },
+        );
+        c.set_bar_width(1536);
+        c
+    }
+
+    /// A bar's pill is the Dynamic Island: with `expand_on_hover` on, dwelling
+    /// over it opens the same card a click opens. This used to be refused
+    /// outright for bar layout while the control panel and the tray menu both
+    /// offered the toggle.
+    #[test]
+    fn hovering_a_bar_pill_opens_its_card_after_the_dwell() {
+        let mut c = bar_with_hover(true);
+        c.set_hover(true, 1_000);
+        // Dwell deferred: nothing on screen has changed yet.
+        assert!(!c.hover_expanded, "hover must not open on the first move");
+        assert_eq!(
+            c.hover_deadline.map(|(_, at)| at),
+            Some(1_000 + Controller::HOVER_DWELL_MS)
+        );
+
+        c.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+        assert!(c.hover_expanded);
+        // A hovered bar pill reports Expanded, so the window grows the same
+        // way a click does.
+        assert!(matches!(
+            c.presentation(),
+            crate::animation::notch::Presentation::Expanded
+        ));
+    }
+
+    /// A pointer resting on a pill is never perfectly still: a pixel of
+    /// jitter reads as leaving. Without cancelling the armed close the card
+    /// collapsed, re-armed open, and the two chased each other - nine opens
+    /// and fourteen closes in two seconds.
+    #[test]
+    fn jittering_on_the_pill_does_not_oscillate_an_open_card() {
+        let mut c = bar_with_hover(true);
+        let mut now;
+
+        // Settle first: the dwell is continuous time on the pill.
+        for step in 0..25 {
+            now = 1_000 + step * 20;
+            c.set_hover(true, now);
+            c.on_timer(now);
+        }
+        assert!(c.hover_expanded, "a settled pointer must open the card");
+
+        // Then jitter: a single poll off the pill every twenty.
+        let mut opens = 0;
+        let mut closes = 0;
+        for step in 0..60 {
+            now = 1_500 + step * 20;
+            let inside = step % 20 != 7;
+            c.set_hover(inside, now);
+            let before = c.hover_expanded;
+            c.on_timer(now);
+            if c.hover_expanded && !before {
+                opens += 1;
+            }
+            if before && !c.hover_expanded {
+                closes += 1;
+            }
+        }
+        assert_eq!(closes, 0, "a jittering pointer must not close the card");
+        assert_eq!(opens, 0, "an open card must not re-open on jitter");
+        assert!(c.hover_expanded, "the card must still be open at the end");
+    }
+
+    /// Leaving waits a grace period so the pointer can reach the card it just
+    /// opened instead of dismissing it on the way down.
+    #[test]
+    fn leaving_a_bar_pill_closes_after_the_grace() {
+        let mut c = bar_with_hover(true);
+        c.set_hover(true, 1_000);
+        c.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+        assert!(c.hover_expanded);
+
+        c.set_hover(false, 2_000);
+        assert!(
+            c.hover_expanded,
+            "the card must survive the pointer leaving"
+        );
+        assert_eq!(
+            c.hover_deadline.map(|(_, at)| at),
+            Some(2_000 + Controller::HOVER_GRACE_MS)
+        );
+
+        c.on_timer(2_000 + Controller::HOVER_GRACE_MS);
+        assert!(!c.hover_expanded);
+    }
+
+    /// A click that dismissed the card must not be undone by the pointer still
+    /// resting on the pill; leaving and returning re-arms it.
+    #[test]
+    fn a_click_close_is_not_undone_by_a_still_pointer() {
+        let mut c = bar_with_hover(true);
+        c.manually_expanded = true;
+        c.collapse_if_expanded(1_000);
+        assert!(c.hover_suppressed);
+
+        c.set_hover(true, 1_100);
+        c.on_timer(1_100 + Controller::HOVER_DWELL_MS);
+        assert!(
+            !c.hover_expanded,
+            "a dismissed card must stay dismissed while the pointer rests"
+        );
+
+        c.set_hover(false, 1_200);
+        c.set_hover(true, 1_300);
+        c.on_timer(1_300 + Controller::HOVER_DWELL_MS);
+        assert!(c.hover_expanded, "a fresh hover must be able to reopen it");
+    }
+
+    /// Reaching a switch means travelling from the pill down a card that is
+    /// taller than the strip. If "left the pill" closed the card, the pointer
+    /// arrived at the switch after the card had gone and the click landed on
+    /// the desktop - the control panel's switches were unreachable by hover.
+    #[test]
+    fn a_hover_opened_card_survives_the_trip_from_the_pill_to_a_switch() {
+        let mut c = bar_with_hover(true);
+        c.set_bar_width(1536);
+        let (width, height) = c.current_logical_size();
+        let (pill_cx, pill_off, pill_w, pill_h) = c.bar_pill_rect(c.bar_width);
+
+        // The pointer lands on the pill and dwells.
+        let pill_mid_x = pill_cx + (pill_w / 2) as i32;
+        let pill_mid_y = pill_off + (pill_h / 2) as i32;
+        let on_pill = (pill_mid_x, pill_mid_y);
+        c.set_hover(true, 1_000);
+        c.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+        assert!(c.hover_expanded, "the card must be open");
+
+        let (_, open_height) = c.current_logical_size();
+        assert!(open_height > height, "the frame must have grown");
+        let on_switch = (pill_mid_x, pill_mid_y + 80);
+
+        // Mid-trip, well past the old 500 ms grace, the surface still counts.
+        assert!(
+            c.point_over_bar_surface(on_switch),
+            "a hover-opened card must stay open while the pointer is on it"
+        );
+        assert!(c.point_over_bar_surface(on_pill));
+        // The bar strip spans the full width, so staying over the window is
+        // still "on the surface"; leaving means leaving the window.
+        assert!(
+            c.point_over_bar_surface((10, 10)),
+            "the strip itself stays on the surface while the card is open"
+        );
+        assert!(
+            !c.point_over_bar_surface((pill_mid_x, open_height as i32 + 40)),
+            "leaving the whole surface must end the hover"
+        );
+
+        // A card opened by *click* must not extend, or outside-click dismissal
+        // would stop firing.
+        let mut clicked = bar_with_hover(true);
+        clicked.manually_expanded = true;
+        assert!(
+            !clicked.point_over_bar_surface(on_switch),
+            "a clicked-open card must keep the strict pill test for dismissal"
+        );
+        let _ = (width, pill_w, pill_h);
+    }
+
+    /// The toggle has to be able to close what it opened, otherwise turning it
+    /// off mid-hover leaves the card stuck open.
+    #[test]
+    fn turning_expand_on_hover_off_closes_a_hover_opened_card() {
+        let mut c = bar_with_hover(true);
+        c.set_hover(true, 1_000);
+        c.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+        assert!(c.hover_expanded);
+
+        c.island.expand_on_hover = false;
+        c.set_hover(true, 2_000);
+        assert!(!c.hover_expanded);
+        assert!(c.hover_deadline.is_none());
+    }
+
     /// `frame_rate` claims to override each GIF's own delays. It only ever
     /// reached the classic surface, because `advance_animation` returns early
     /// once the island is enabled - so setting 60 did nothing for a bar face,
