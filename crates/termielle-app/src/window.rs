@@ -1201,6 +1201,23 @@ impl OverlayWindow {
         cursor_over_pill_raw(self.hwnd, &alpha)
     }
 
+    /// Raw cursor position in frame-local coordinates, with no hit test.
+    ///
+    /// [`Self::cursor_client_pos`] answers `None` unless the cursor is over an
+    /// opaque clickable pixel, which is what icon highlighting wants and the
+    /// exact opposite of what a bar's hover needs: the bar's hit map covers
+    /// module text and an open card, so "is the pointer on the pill" can
+    /// never be answered by asking whether the pixel under it is opaque.
+    pub fn cursor_frame_pos(&self) -> Option<(i32, i32)> {
+        unsafe {
+            let mut point = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut point).ok()?;
+            let mut rect = RECT::default();
+            GetWindowRect(self.hwnd, &mut rect).ok()?;
+            Some((point.x - rect.left, point.y - rect.top))
+        }
+    }
+
     /// Cursor position in frame-local coordinates when it is over the pill.
     pub fn cursor_client_pos(&self) -> Option<(i32, i32)> {
         unsafe {
