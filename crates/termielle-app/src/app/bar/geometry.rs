@@ -99,8 +99,13 @@ impl Controller {
         if x >= pill_cx && x < pill_cx + pill_w as i32 && y >= top && y < top + pill_h as i32 {
             return true;
         }
-        self.hover_expanded
-            && !self.manually_expanded
+        // With a card open - by hover or by click - the whole window counts as
+        // the surface. Click-outside dismissal asks this same question, and
+        // testing the pill alone made every click inside the panel body look
+        // like a click outside: the card dismissed itself instead of pressing
+        // the switch under the pointer. With nothing open only the pill counts,
+        // so crossing the strip still opens nothing.
+        (self.hover_expanded || self.manually_expanded)
             && x >= 0
             && x < width as i32
             && y >= 0

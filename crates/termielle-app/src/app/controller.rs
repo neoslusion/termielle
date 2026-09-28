@@ -1323,14 +1323,31 @@ mod tests {
             "leaving the whole surface must end the hover"
         );
 
-        // A card opened by *click* must not extend, or outside-click dismissal
-        // would stop firing.
+        // A card opened by *click* covers the window too, and it has to:
+        // click-outside dismissal asks the same question, and testing the pill
+        // alone made every click inside the panel look like a click outside,
+        // so the card dismissed itself instead of pressing the switch.
         let mut clicked = bar_with_hover(true);
+        clicked.set_hover(true, 1_000);
+        clicked.on_timer(1_000 + Controller::HOVER_DWELL_MS);
         clicked.manually_expanded = true;
+        clicked.hover_expanded = false;
+        clicked.on_timer(2_000);
+        let (open_w, open_h) = clicked.current_logical_size();
         assert!(
-            !clicked.point_over_bar_surface(on_switch),
-            "a clicked-open card must keep the strict pill test for dismissal"
+            open_h > 36,
+            "the card must be open for this to mean anything"
         );
+        let inside = (pill_cx + (pill_w / 2) as i32, open_h as i32 - 10);
+        assert!(
+            clicked.point_over_bar_surface(inside),
+            "a click inside a click-opened card is not a click outside it"
+        );
+        assert!(
+            !clicked.point_over_bar_surface((5, open_h as i32 + 20)),
+            "a click past the card still dismisses"
+        );
+        let _ = (on_switch, open_w);
         let _ = (width, pill_w, pill_h);
     }
 
