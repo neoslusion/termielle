@@ -1911,6 +1911,57 @@ fn the_panel_is_a_surface_of_its_own() {
     assert!(c.is_manually_expanded(), "the island's card should be open");
 }
 
+/// The pill lives in the strip and the panel hangs below it, so opening the
+/// panel must leave the pill on screen. They shared one morph driver, so the
+/// panel's height read as "the island has expanded" and the pill faded out
+/// under it.
+#[test]
+fn the_pill_stays_on_screen_while_the_panel_is_open() {
+    use termielle_app::app::ClickOutcome;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1536);
+
+    // The resting pill paints pixels in the strip: the face and the label.
+    let lit = |f: &termielle_app::animation::FrameBuffer, x: u32, y: u32| -> usize {
+        let mut n = 0;
+        for yy in y..y + 30 {
+            for xx in x..x + 180 {
+                let i = (yy as usize * f.width as usize + xx as usize) * 4;
+                if f.pixels_pbgra[i + 3] > 8 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    };
+    let (_, pill_x, pill_y, pill_w, _) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+        .copied()
+        .expect("the collapsed pill installs its own hit");
+    let resting = lit(c.current_frame(), pill_x as u32, pill_y as u32);
+
+    let entry = control_center_point(&c);
+    c.handle_click(entry.0, entry.1, 1000);
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(c.is_panel_open());
+    let with_panel = lit(c.current_frame(), pill_x as u32, pill_y as u32);
+    assert!(
+        with_panel >= resting * 9 / 10,
+        "the pill must stay painted while the panel is open: {resting} then {with_panel}"
+    );
+    let _ = (pill_w, ClickOutcome::PanelToggled);
+}
+
 /// macOS drops the Control Center out of its menu-bar icon, not out of the
 /// middle of the bar. The card therefore anchors to the entry's own click
 /// region, and only the island's own card stays centred.

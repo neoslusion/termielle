@@ -361,7 +361,14 @@ impl Controller {
         mut hits: Vec<BarHit>,
     ) {
         // 4. Center Module: Dynamic Island
-        if card.progress < 0.35 {
+        //
+        // The pill lives in the strip; the card hangs below it. Only the
+        // island's own card morphs the pill away - the Control Center is a
+        // separate surface, so opening it must leave the pill where it is.
+        // Sharing one morph driver is what made the pill vanish the moment the
+        // panel opened: the panel's height read as "the island is expanded".
+        let island_owns_card = !self.panel_open;
+        if card.progress < 0.35 || !island_owns_card {
             let (primary, _) = crate::animation::notch::ink_pair(&self.island.glass);
             let mut compact = self.blank_frame(width, self.island.bar.height);
             let compact_frame = &mut compact;
@@ -496,9 +503,14 @@ impl Controller {
                     pill_h,
                 ));
             }
-            let alpha = (255.0
-                * (1.0 - crate::animation::notch::smoothstep(0.0, 0.35, card.progress)))
-            .round() as u8;
+            // No island morph is running when the panel owns the card, so the
+            // pill stays at full opacity rather than fading to nothing.
+            let alpha = if island_owns_card {
+                (255.0 * (1.0 - crate::animation::notch::smoothstep(0.0, 0.35, card.progress)))
+                    .round() as u8
+            } else {
+                255
+            };
             let bar_y = card.bar_y;
             crate::animation::notch::blend_frame_over(frame, &compact, 0, bar_y, alpha);
         }
