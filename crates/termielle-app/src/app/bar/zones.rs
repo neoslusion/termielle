@@ -532,7 +532,7 @@ impl Controller {
 
                 let island_cfg = self.island.clone();
                 let saved_hover = self.hover_point;
-                let content_x = (width.saturating_sub(card.content_w) / 2) as i32;
+                let content_x = card.content_x;
                 self.hover_point = saved_hover.map(|(x, y)| (x - content_x, y - card.island_y));
                 self.render_content(
                     &mut content,
@@ -547,8 +547,8 @@ impl Controller {
                 self.hover_point = saved_hover;
             }
 
-            // Offset hit targets recorded in sub-frame by (island_x, island_y)
-            let content_x = (width.saturating_sub(card.content_w) / 2) as i32;
+            // Offset hit targets recorded in sub-frame by (content_x, island_y)
+            let content_x = card.content_x;
             for hit in &mut self.icon_hits {
                 hit.1 += content_x;
                 hit.2 += card.island_y;

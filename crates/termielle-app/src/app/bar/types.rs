@@ -15,6 +15,11 @@ pub(crate) struct BarZoneCache {
     pub(crate) key: (u32, u32, f32, u32),
     pub(crate) frame: Rc<FrameBuffer>,
     pub(crate) hits: Vec<BarHit>,
+    /// Centre x of this zone's Control Center entry, when it drew one. The
+    /// card reads it back instead of recomputing the right-zone layout, so the
+    /// panel hangs from the icon the frame actually painted rather than from
+    /// a second, independently-derived idea of where that icon is.
+    pub(crate) control_center_x: Option<i32>,
 }
 
 /// Transparent breathing room between the persistent strip and its popup.
@@ -57,6 +62,10 @@ pub(crate) struct BarCard {
     pub(crate) bar_y: i32,
     pub(crate) progress: f32,
     pub(crate) island_x: i32,
+    /// Left edge of the full-size card content, in frame coordinates. Same
+    /// anchor as `island_x`; carried separately because the card animates its
+    /// width while the content inside it is already full size.
+    pub(crate) content_x: i32,
     pub(crate) island_y: i32,
     pub(crate) island_w: u32,
     pub(crate) exp_h: u32,

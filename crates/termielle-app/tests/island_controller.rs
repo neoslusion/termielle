@@ -1853,6 +1853,52 @@ fn strip_control_center_toggles_the_panel() {
     );
 }
 
+/// macOS drops the Control Center out of its menu-bar icon, not out of the
+/// middle of the bar. The card therefore anchors to the entry's own click
+/// region, and only the island's own card stays centred.
+#[test]
+fn the_panel_hangs_from_the_control_center_icon() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1536);
+    let (_, icon_x, _, icon_w, _) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::app::HIT_CARD_PANEL)
+        .copied()
+        .expect("the strip must carry a Control Center entry");
+    let icon_centre = icon_x + icon_w as i32 / 2;
+    assert!(
+        icon_centre > 1536 * 2 / 3,
+        "the icon belongs on the right of the strip, not the centre"
+    );
+
+    c.handle_click(icon_centre, 18, 1000);
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+    let (_, row_x, _, row_w, _) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::app::HIT_PANEL_TOGGLE_BASE - 2)
+        .copied()
+        .expect("the open panel installs its rows");
+    let card_left = row_x - 18;
+    let card_centre = card_left + (row_w / 2) as i32;
+    assert!(
+        (card_centre - icon_centre).abs() < row_w as i32,
+        "the panel should hang from the icon: card centre {card_centre}, icon {icon_centre}"
+    );
+    assert!(
+        card_left > 1536 / 2,
+        "the panel must sit right of centre, not under the pill: left {card_left}"
+    );
+}
+
 /// The volume row is an absolute level, a wheel target, and a mute button, and
 /// each Termielle row names the setting it owns. Windows' own quick settings
 /// stay delegated to the shell.
@@ -1888,16 +1934,28 @@ fn panel_rows_drive_the_level_and_name_their_settings() {
         c.on_timer(tick);
     }
 
-    // The card is `expanded_width` wide, centered under a 36 px strip with a
-    // 6 px gap. The panel's rows start 40 px below the card top, 28 px tall,
-    // 8 px apart, and the steppers and speaker are laid out in card-local
-    // space (app/cards/panel.rs).
-    let card_w = c.island_config().expanded_width.min(1920 - 32) as i32;
-    let card_left = (1920 - card_w) / 2;
+    // The panel hangs from the Control Center icon, so its card is no longer
+    // centred and the row coordinates cannot be recomputed from the strip
+    // width. Every target is read back out of the frame's click regions
+    // instead: a hand-computed position that misses reports `None` or, worse,
+    // a different control's outcome, and the test would pass for the wrong
+    // reason.
+    let region = |id: isize| {
+        c.click_regions()
+            .iter()
+            .find(|(found, ..)| *found == id)
+            .copied()
+            .unwrap_or_else(|| panic!("frame must install region {id}"))
+    };
     let card_top = 36 + 6;
     let row = |index: i32| card_top + 40 + 36 * index + 14;
-    let down = card_left + card_w - 18 - 56 + 14;
-    let up = card_left + card_w - 18 - 14;
+    let (_, down_x, _, _, _) = region(termielle_app::app::HIT_PANEL_VOLUME_DOWN);
+    let (_, up_x, _, _, _) = region(termielle_app::app::HIT_PANEL_VOLUME_UP);
+    let down = down_x + 7;
+    let up = up_x + 7;
+    // A panel row's toggle sits at the card's pad, so it locates the card.
+    let (_, toggle_x, _, _, _) = region(termielle_app::app::HIT_PANEL_TOGGLE_BASE - 2);
+    let card_left = toggle_x - 18;
     assert_eq!(
         c.handle_click(down, row(0), 1500),
         ClickOutcome::VolumeSet(55),

@@ -141,7 +141,19 @@ impl Controller {
         let (pill_cx, _, pill_w, _) = self.bar_pill_rect(width);
         let island_w =
             (pill_w as f32 + (content_w as f32 - pill_w as f32) * progress).round() as u32;
-        let island_x = ((width.saturating_sub(island_w)) / 2) as i32;
+        // The panel hangs from the Control Center icon, as macOS has it, so it
+        // travels out of the strip rather than out of the pill. The island's
+        // own card stays centred: that one belongs to the island.
+        let centre_x = if self.panel_open {
+            self.bar_right_cache
+                .as_ref()
+                .and_then(|cache| cache.control_center_x)
+                .unwrap_or(width as i32 / 2)
+        } else {
+            width as i32 / 2
+        };
+        let island_x =
+            (centre_x - (island_w / 2) as i32).clamp(0, (width as i32 - island_w as i32).max(0));
         let island_y = if is_top {
             (bar_h + BAR_POPUP_GAP) as i32
         } else {
@@ -278,9 +290,12 @@ impl Controller {
             );
         }
 
+        let content_x =
+            (centre_x - (content_w / 2) as i32).clamp(0, (width as i32 - content_w as i32).max(0));
         let card = BarCard {
             bar_y,
             island_x,
+            content_x,
             island_y,
             island_w,
             exp_h,
@@ -309,10 +324,14 @@ impl Controller {
             key: zone.key,
             frame: Rc::new(frame),
             hits,
+            control_center_x: None,
         }
     }
 
     fn build_right_zone(&self, zone: &ZonePaint) -> BarZoneCache {
+        // The Control Center's own hit rect is where the frame says the icon
+        // is; the panel anchors to that rather than to a second guess.
+        let mut control_center_x = None;
         let mut frame = self.blank_frame(zone.width, zone.bar_h);
         let hits = self.paint_bar_right(
             &mut frame,
@@ -322,10 +341,16 @@ impl Controller {
             zone.pill_off,
             zone.pill_h,
         );
+        for (id, x, _, w, _) in &hits {
+            if *id == crate::app::types::HIT_CARD_PANEL {
+                control_center_x = Some(x + *w as i32 / 2);
+            }
+        }
         BarZoneCache {
             key: zone.key,
             frame: Rc::new(frame),
             hits,
+            control_center_x,
         }
     }
 }
