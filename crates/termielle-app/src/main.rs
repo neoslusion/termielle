@@ -280,9 +280,17 @@ fn main() {
         // A fixed frame rate overrides each GIF's own delays: the overlay
         // presents frames at exactly this cadence (clamped to a whole
         // millisecond interval).
-        config
-            .frame_rate
-            .map(|rate| ((1000u64 + u64::from(rate) / 2) / u64::from(rate)).max(1)),
+        //
+        // The interval is deliberately a millisecond *under* the frame time.
+        // The pacer waits for this deadline and then aligns to the next
+        // vertical blank, so a deadline that rounds up to 16.7 -> 17 lands
+        // just past that blank and the overlay waits a whole extra frame: a
+        // requested 60 ran at 30. Landing inside the frame targets the blank
+        // the caller meant.
+        config.frame_rate.map(|rate| {
+            let interval = (1000u64 + u64::from(rate) / 2) / u64::from(rate);
+            interval.saturating_sub(1).max(1)
+        }),
         config.island.clone(),
     );
     // User zoom rides on top of monitor DPI inside `render_scale`.

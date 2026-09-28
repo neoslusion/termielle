@@ -6,6 +6,16 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput};
 use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
+
+/// Requested system timer period, in milliseconds.
+///
+/// Without this the pre-wait is quantised to the system timer, which defaults
+/// to 15.6 ms: a 17 ms deadline therefore expired on the *second* tick and
+/// the overlay presented every other refresh, halving the animation rate.
+/// `WaitForVBlank` still does the real alignment - this only stops the wait
+/// from overshooting into the next frame before it starts.
+const TIMER_PERIOD_MS: u32 = 1;
 
 pub struct AnimationClock {
     sender: Sender<Option<u64>>,
@@ -33,6 +43,7 @@ impl AnimationClock {
         let (sender, receiver) = mpsc::channel::<Option<u64>>();
         let hwnd = wake.hwnd.0 as usize;
         std::thread::spawn(move || {
+            unsafe { timeBeginPeriod(TIMER_PERIOD_MS) };
             let mut deadline: Option<u64> = None;
             let mut factory: Option<IDXGIFactory1> = None;
             let mut output = None;
@@ -93,6 +104,7 @@ impl AnimationClock {
                     break;
                 }
             }
+            unsafe { timeEndPeriod(TIMER_PERIOD_MS) };
         });
         Self { sender }
     }

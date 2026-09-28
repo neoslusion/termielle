@@ -950,7 +950,7 @@ impl Controller {
 /// The deadline for the next animation frame: the fixed interval when
 /// configured (minus the smoothed present cost), else the frame's own GIF
 /// delay.
-fn deadline_for(
+pub(crate) fn deadline_for(
     interval: Option<u64>,
     present_cost_ms: u64,
     now_ms: u64,
@@ -1144,6 +1144,40 @@ mod tests {
         c.advance_face(1_080);
         assert_eq!(c.face_idx, 3);
         assert_eq!(c.face_frame.pixels_pbgra[0], 240);
+    }
+
+    /// `frame_rate` claims to override each GIF's own delays. It only ever
+    /// reached the classic surface, because `advance_animation` returns early
+    /// once the island is enabled - so setting 60 did nothing for a bar face,
+    /// which stayed on the asset's 40 ms cadence.
+    #[test]
+    fn a_configured_frame_rate_overrides_the_face_asset_delay() {
+        let mut c = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            // 60 Hz, as main.rs derives it from a 60 fps setting.
+            Some(17),
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: true,
+                ..IslandConfig::default()
+            },
+        );
+        c.set_bar_width(1536);
+        c.face_frames.push(c.face_frame.clone());
+        c.face_delays.push(200);
+        c.face_frames.push(c.face_frame.clone());
+        c.face_delays.push(200);
+
+        c.arm_face_deadline(1_000);
+        // 200 ms of authored delay, overridden by the 17 ms cadence.
+        assert_eq!(c.face_deadline, Some(1_017));
+
+        c.frame_interval_ms = None;
+        c.arm_face_deadline(1_000);
+        assert_eq!(c.face_deadline, Some(1_200), "the asset delay takes over");
     }
 
     #[test]

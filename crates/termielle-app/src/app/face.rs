@@ -75,14 +75,31 @@ impl Controller {
         if self.face_decoder.is_none() && self.face_frames.len() < 2 {
             return;
         }
-        let minimum = self.face_min_delay_ms();
+        self.face_deadline = Some(self.face_deadline_for(now_ms));
+    }
+
+    /// When the user configured a `frame_rate`, that cadence wins over the
+    /// asset's own delay. This is what the option has always claimed to do,
+    /// but only the classic surface read it: `advance_animation` returns
+    /// early once the island is enabled, so island and bar faces kept the
+    /// GIF's timing no matter what was set. Subtracting the smoothed present
+    /// cost keeps a 60 Hz face on a 60 Hz clock instead of drifting late.
+    fn face_deadline_for(&self, now_ms: u64) -> u64 {
+        if self.frame_interval_ms.is_some() {
+            return super::controller::deadline_for(
+                self.frame_interval_ms,
+                self.present_cost_ms,
+                now_ms,
+                0,
+            );
+        }
         let delay = self
             .face_delays
             .get(self.face_idx)
             .copied()
             .unwrap_or(40)
-            .max(minimum as u32);
-        self.face_deadline = Some(now_ms.saturating_add(delay as u64));
+            .max(self.face_min_delay_ms() as u32);
+        now_ms.saturating_add(u64::from(delay))
     }
 
     /// Advances the face animation one step and re-renders the current pill:
@@ -116,14 +133,7 @@ impl Controller {
         // so advancing the index alone left both showing the GIF's first
         // frame forever: the animation ticked and nothing moved.
         self.face_frame = self.face_frames[self.face_idx].clone();
-        let minimum = self.face_min_delay_ms();
-        let delay = self
-            .face_delays
-            .get(self.face_idx)
-            .copied()
-            .unwrap_or(40)
-            .max(minimum as u32);
-        self.face_deadline = Some(now_ms.saturating_add(delay as u64));
+        self.face_deadline = Some(self.face_deadline_for(now_ms));
         let (w, h) = self.current_logical_size();
         // A bar face tick redraws only the center surface. The side zones are
         // unchanged by a face frame, so taking the cached-zone path here is
