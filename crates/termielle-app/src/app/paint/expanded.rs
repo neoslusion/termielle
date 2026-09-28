@@ -36,20 +36,25 @@ impl Controller {
         };
 
         if height >= 85 {
-            // Authentic tall card layout dropping vertically downward.
-            self.paint_card_header(frame, state, island, &ctx);
             if self.panel_open {
-                // The panel is a deliberate body: the user asked for it, and
-                // it yields to anything louder that arrives while it is open.
+                // Control Center is a separate surface, not a body of the
+                // island's card: it does not wear the island's header, and it
+                // is not swapped out for media or an agent turn. It has its
+                // own title, and it closes on its own terms.
                 self.paint_control_panel(frame, island, &ctx);
-            } else if self.media_available() && island.has_widget("music") {
-                self.paint_media_card(frame, island, &ctx);
-            } else if state != VisualState::Idle {
-                self.paint_agent_activity(frame, state, island, &ctx);
-            } else if island.has_widget("tasks") && island.show_tasks && !self.tasks.is_empty() {
-                self.paint_task_switcher(frame, island, &ctx);
             } else {
-                self.paint_standby_dashboard(frame, island, &ctx);
+                // Authentic tall card layout dropping vertically downward.
+                self.paint_card_header(frame, state, island, &ctx);
+                if self.media_available() && island.has_widget("music") {
+                    self.paint_media_card(frame, island, &ctx);
+                } else if state != VisualState::Idle {
+                    self.paint_agent_activity(frame, state, island, &ctx);
+                } else if island.has_widget("tasks") && island.show_tasks && !self.tasks.is_empty()
+                {
+                    self.paint_task_switcher(frame, island, &ctx);
+                } else {
+                    self.paint_standby_dashboard(frame, island, &ctx);
+                }
             }
         } else {
             // Compact / transitioning view.

@@ -1824,8 +1824,8 @@ fn strip_control_center_toggles_the_panel() {
     // it unreachable, and it could only ever mean "open".
     assert_eq!(
         c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 1500),
-        ClickOutcome::Collapsed,
-        "the strip entry must close the card it opened"
+        ClickOutcome::PanelToggled,
+        "the strip entry must close the panel it opened, as a panel"
     );
     for tick in (1500..2100).step_by(16) {
         c.on_timer(tick);
@@ -1833,7 +1833,7 @@ fn strip_control_center_toggles_the_panel() {
     assert_eq!(
         c.current_frame().height,
         collapsed_h,
-        "the second press of the strip entry closes the card"
+        "the second press of the strip entry closes the panel"
     );
 
     // Open it again, then hand the card back to the pill.
@@ -1845,12 +1845,70 @@ fn strip_control_center_toggles_the_panel() {
         c.on_timer(tick);
     }
     assert!(c.current_frame().height > 120, "the panel is open again");
-    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Collapsed);
-    assert_eq!(
-        c.handle_click(960, 18, 2800),
-        ClickOutcome::Expanded,
-        "the next open shows the default card, not the panel"
+
+    // Clicking the pill opens the island's own card, and the panel steps
+    // aside: they are two surfaces, not one surface with two bodies.
+    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Expanded);
+    assert!(
+        !c.is_panel_open(),
+        "the pill's card must not carry the panel with it"
     );
+}
+
+/// Control Center and the pill are two surfaces, not one surface with two
+/// bodies. They used to share everything: opening the panel set
+/// `manually_expanded` and painted inside the island's card, so the pill's
+/// header sat on the panel, the pill's hover could take it away, and
+/// dismissing "the card" dismissed the panel.
+#[test]
+fn the_panel_is_a_surface_of_its_own() {
+    use termielle_app::app::ClickOutcome;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1536);
+    let entry = control_center_point(&c);
+    // The pill's own centre, read from the frame: a hard-coded x is wrong for
+    // any bar width but one, and a miss returns `None` rather than a hit.
+    let (_, px, py, pw, ph) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+        .copied()
+        .expect("the collapsed pill installs its own hit");
+    let pill = (px + pw as i32 / 2, py + ph as i32 / 2);
+
+    c.handle_click(entry.0, entry.1, 1000);
+    assert!(c.is_panel_open(), "the strip entry opens the panel");
+    assert!(
+        !c.is_manually_expanded(),
+        "the panel must not be the island's manually expanded card"
+    );
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+
+    // The pill's hover is a gesture on the island. It must not reach across
+    // and take the panel away.
+    c.set_hover(true, 1500);
+    c.on_timer(1500 + 2000);
+    assert!(
+        c.is_panel_open(),
+        "hovering the pill must not close a separate panel"
+    );
+
+    // Pressing the pill means the island: the panel steps aside and the
+    // island's own card opens.
+    assert_eq!(c.handle_click(pill.0, pill.1, 5000), ClickOutcome::Expanded);
+    assert!(
+        !c.is_panel_open(),
+        "the pill's card must not carry the panel"
+    );
+    assert!(c.is_manually_expanded(), "the island's card should be open");
 }
 
 /// macOS drops the Control Center out of its menu-bar icon, not out of the

@@ -146,9 +146,10 @@ impl Controller {
         if !self.alerts.is_empty() {
             return Presentation::Expanded;
         }
-        if self.manually_expanded {
+        if self.manually_expanded || self.panel_open {
             // Waybar mode is a persistent status surface: an explicit click on
-            // the Termielle module opens its focused popup.
+            // the Termielle module opens its focused popup. Control Center is a
+            // separate surface that expands the window on its own account.
             return Presentation::Expanded;
         }
         // A bar's pill *is* the island, so hovering it opens the same card a
@@ -674,26 +675,24 @@ impl Controller {
                 }
                 crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
                 crate::app::types::HIT_CARD_PANEL => {
-                    // The strip entry is always live, so this is a real
-                    // toggle: closed opens the panel, open closes the card. It
-                    // used to be a glyph inside the pill that could only ever
-                    // mean "open", which is why hovering the pill - and
-                    // therefore opening that card - made the panel
-                    // unreachable.
-                    if self.manually_expanded || self.hover_expanded {
+                    // Control Center is its own surface, not a body of the
+                    // island's card. It used to set `manually_expanded` and
+                    // paint itself inside that card, which is exactly why the
+                    // panel and the pill read as one object: the island's
+                    // header sat on top of it, the pill's hover could take it
+                    // away, and dismissing "the card" dismissed the panel.
+                    if self.panel_open {
                         self.panel_open = false;
-                        self.hover_deadline = None;
-                        self.hover_suppressed = true;
-                        if self.manually_expanded {
-                            self.manually_expanded = false;
-                        }
-                        self.hover_expanded = false;
-                        self.interaction_deadline = None;
                         self.morph_to_target(now_ms);
-                        return ClickOutcome::Collapsed;
+                        return ClickOutcome::PanelToggled;
                     }
+                    // One surface at a time. They are separate, so opening one
+                    // clears the other rather than nesting inside it.
                     self.panel_open = true;
-                    self.toggle_expand(now_ms);
+                    self.manually_expanded = false;
+                    self.hover_expanded = false;
+                    self.hover_deadline = None;
+                    self.interaction_deadline = Some(now_ms.saturating_add(100));
                     self.morph_to_target(now_ms);
                     return ClickOutcome::PanelToggled;
                 }
@@ -719,14 +718,19 @@ impl Controller {
                     return ClickOutcome::PanelToggle(setting);
                 }
                 crate::bar::HIT_BAR_TERMIELLE_MODULE => {
-                    if self.collapse_if_expanded(now_ms) {
-                        // Closing the popup drops the panel with it, so the
-                        // next open shows the card the user came for.
+                    // The pill is the island, not the panel. Pressing it
+                    // dismisses the panel and toggles the island's own card.
+                    // Routing this through `collapse_if_expanded` first
+                    // swallowed the press: with the panel open that closed
+                    // the panel and returned, so the island never opened.
+                    if self.manually_expanded || self.hover_expanded {
+                        self.collapse_if_expanded(now_ms);
                         self.panel_open = false;
                         return ClickOutcome::Collapsed;
-                    } else if self.toggle_expand(now_ms) {
-                        return ClickOutcome::Expanded;
                     }
+                    self.panel_open = false;
+                    self.toggle_expand(now_ms);
+                    return ClickOutcome::Expanded;
                 }
                 id if id <= crate::bar::HIT_BAR_WORKSPACE_BASE
                     && id > crate::bar::HIT_BAR_WORKSPACE_BASE - 50 =>
@@ -783,6 +787,11 @@ impl Controller {
         if !self.island.is_enabled() {
             return false;
         }
+        if self.panel_open {
+            // Clicking the pill opens the island's card, so the panel steps
+            // aside rather than nesting inside it.
+            self.panel_open = false;
+        }
         if self.collapse_if_expanded(now_ms) {
             return true;
         }
@@ -793,6 +802,12 @@ impl Controller {
         self.morph_to_target(now_ms)
     }
 
+    /// Whether the Control Center panel is open. It is a surface of its own,
+    /// not a body of the island's card, so callers can ask about it directly.
+    pub fn is_panel_open(&self) -> bool {
+        self.panel_open
+    }
+
     /// Whether the island is currently manually expanded into the full card.
     pub fn is_manually_expanded(&self) -> bool {
         self.manually_expanded
@@ -800,7 +815,21 @@ impl Controller {
 
     /// Collapses the island if it was manually expanded (e.g. click outside or Escape).
     pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
-        if !self.island.is_enabled() || !self.manually_expanded {
+        if !self.island.is_enabled() {
+            return false;
+        }
+        if self.panel_open {
+            // The panel is not the island's card, so it is dismissed on its
+            // own terms and leaves the island exactly as it found it.
+            self.panel_open = false;
+            self.interaction_deadline = None;
+            self.hover_deadline = None;
+            if self.island.is_bar() {
+                self.hover_suppressed = true;
+            }
+            return self.morph_to_target(now_ms);
+        }
+        if !self.manually_expanded {
             return false;
         }
         self.manually_expanded = false;
@@ -841,6 +870,11 @@ impl Controller {
             return self.morph_to_target(now_ms);
         }
         if self.island.is_bar() {
+            if self.panel_open {
+                // The panel is a separate surface: the pill does not take it
+                // away, and the panel does not answer to the pill.
+                return false;
+            }
             return self.set_bar_hover(inside, now_ms);
         }
         if self.state != VisualState::Idle || self.manually_expanded {
