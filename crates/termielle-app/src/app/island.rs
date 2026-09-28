@@ -718,17 +718,21 @@ impl Controller {
                     return ClickOutcome::PanelToggle(setting);
                 }
                 crate::bar::HIT_BAR_TERMIELLE_MODULE => {
-                    // The pill is the island, not the panel. Pressing it
-                    // dismisses the panel and toggles the island's own card.
-                    // Routing this through `collapse_if_expanded` first
-                    // swallowed the press: with the panel open that closed
-                    // the panel and returned, so the island never opened.
-                    if self.manually_expanded || self.hover_expanded {
-                        self.collapse_if_expanded(now_ms);
+                    // The pill is the island, not the panel. While the panel
+                    // is open, pressing the pill dismisses the panel and
+                    // nothing else: swapping straight to the island's card
+                    // morphed the pill away as it dismissed, which read as
+                    // "dismissing the panel collapsed the pill too".
+                    if self.panel_open {
                         self.panel_open = false;
+                        self.hover_suppressed = true;
+                        self.morph_to_target(now_ms);
                         return ClickOutcome::Collapsed;
                     }
-                    self.panel_open = false;
+                    if self.manually_expanded || self.hover_expanded {
+                        self.collapse_if_expanded(now_ms);
+                        return ClickOutcome::Collapsed;
+                    }
                     self.toggle_expand(now_ms);
                     return ClickOutcome::Expanded;
                 }

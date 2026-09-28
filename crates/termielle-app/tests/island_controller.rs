@@ -1846,9 +1846,10 @@ fn strip_control_center_toggles_the_panel() {
     }
     assert!(c.current_frame().height > 120, "the panel is open again");
 
-    // Clicking the pill opens the island's own card, and the panel steps
-    // aside: they are two surfaces, not one surface with two bodies.
-    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Expanded);
+    // Dismissing the panel with the pill must not open the island's card:
+    // the pill is what was pressed, and the pill is not the card.
+    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Collapsed);
+    assert!(!c.is_manually_expanded(), "the island's card stays shut");
     assert!(
         !c.is_panel_open(),
         "the pill's card must not carry the panel with it"
@@ -1901,14 +1902,18 @@ fn the_panel_is_a_surface_of_its_own() {
         "hovering the pill must not close a separate panel"
     );
 
-    // Pressing the pill means the island: the panel steps aside and the
-    // island's own card opens.
-    assert_eq!(c.handle_click(pill.0, pill.1, 5000), ClickOutcome::Expanded);
-    assert!(
-        !c.is_panel_open(),
-        "the pill's card must not carry the panel"
+    // The pill dismisses the panel and leaves the island alone. Swapping
+    // straight to the island's card morphed the pill away as it dismissed,
+    // which read as "dismissing the panel collapsed the pill too".
+    assert_eq!(
+        c.handle_click(pill.0, pill.1, 5000),
+        ClickOutcome::Collapsed
     );
-    assert!(c.is_manually_expanded(), "the island's card should be open");
+    assert!(!c.is_panel_open(), "the pill dismisses the panel");
+    assert!(
+        !c.is_manually_expanded(),
+        "the island's card must stay shut: two surfaces, not a swap"
+    );
 }
 
 /// The pill lives in the strip and the panel hangs below it, so opening the

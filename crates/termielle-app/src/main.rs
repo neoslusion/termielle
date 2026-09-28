@@ -1307,10 +1307,14 @@ fn poll_hover(
     // A hover can arm a dwell or a grace without changing anything on screen,
     // so the schedule is re-read whether or not the frame did.
     actions.next_deadline_ms = controller.next_deadline_ms();
-    if controller.is_manually_expanded() {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{
-            GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
-        };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
+    };
+    // Either surface counts as open. The panel no longer sets
+    // `manually_expanded` - it is not the island's card - so gating
+    // dismissal on that alone left it dismissible only by pressing its own
+    // icon: no Escape, no click outside.
+    if controller.is_manually_expanded() || controller.is_panel_open() {
         let l_click = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
         let r_click = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0;
         let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } < 0;
