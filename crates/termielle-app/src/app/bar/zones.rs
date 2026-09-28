@@ -3,8 +3,8 @@
 use super::super::controller::Controller;
 use super::text::ellipsize_middle;
 use super::types::{
-    BATTERY_W, BarCard, BarHit, BarMetricsCache, CLOCK_ICON, CLOCK_TEXT_W, CLOCK_W, ICON, ICON_GAP,
-    METRIC_W, MODULE_GAP, VALUE_W, VOLUME_W,
+    BATTERY_W, BarCard, BarHit, BarMetricsCache, CLOCK_ICON, CLOCK_TEXT_W, CLOCK_W,
+    CONTROL_CENTER_W, ICON, ICON_GAP, METRIC_W, MODULE_GAP, VALUE_W, VOLUME_W,
 };
 use crate::animation::FrameBuffer;
 use termielle_core::VisualState;
@@ -239,6 +239,29 @@ impl Controller {
             ));
             right -= MODULE_GAP;
         }
+        if self.bar_module("right", "control_center") {
+            // Where macOS puts it: a menu-bar item between the status icons
+            // and the clock, live whether or not a card is open. It used to
+            // live as a glyph inside the pill, which made it unreachable the
+            // moment hovering the pill opened that card.
+            right -= CONTROL_CENTER_W;
+            icons::draw_icon(
+                frame,
+                icons::ADJUSTMENTS,
+                right,
+                pill_y + (pill_h as i32 - CONTROL_CENTER_W) / 2,
+                CONTROL_CENTER_W as u32,
+                primary,
+            );
+            hits.push((
+                crate::app::types::HIT_CARD_PANEL,
+                right - 4,
+                pill_y,
+                CONTROL_CENTER_W as u32 + 8,
+                pill_h,
+            ));
+            right -= MODULE_GAP;
+        }
         if self.bar_module("right", "battery") {
             if let Some(percent) = metrics.battery.0 {
                 right -= BATTERY_W;
@@ -462,29 +485,8 @@ impl Controller {
                         false,
                     );
                 }
-
-                // The control-panel glyph lives inside the pill's right end.
-                // It is registered before the pill's whole-surface hit, so
-                // the open/close click keeps every other pixel to itself.
-                let panel_w = 18i32;
-                let panel_x = pill_cx + pill_w as i32 - panel_w - 7;
-                let panel_y = local_pill_y + (pill_h as i32 - panel_w) / 2;
-                crate::animation::icons::draw_icon(
-                    compact_frame,
-                    crate::animation::icons::ADJUSTMENTS,
-                    panel_x,
-                    panel_y,
-                    panel_w as u32,
-                    primary,
-                );
-                hits.push((
-                    crate::app::types::HIT_CARD_PANEL,
-                    panel_x - 2,
-                    pill_y + (pill_h as i32 - panel_w) / 2,
-                    panel_w as u32 + 4,
-                    panel_w as u32,
-                ));
-
+                // The Control Center moved to the strip, so the pill's label
+                // runs the full width again.
                 // Register hit target for clicking the Dynamic Island pill
                 hits.push((
                     crate::bar::HIT_BAR_TERMIELLE_MODULE,

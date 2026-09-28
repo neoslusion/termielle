@@ -73,6 +73,13 @@ pub(crate) const MODULES: &[BarModule] = &[
         zone: BarZone::Right,
     },
     BarModule {
+        // A menu-bar item between the status icons and the clock, as macOS
+        // has it. An unregistered module id is silently ignored, so this has
+        // to be in the table for the name to mean anything.
+        id: "control_center",
+        zone: BarZone::Right,
+    },
+    BarModule {
         id: "clock",
         zone: BarZone::Right,
     },

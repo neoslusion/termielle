@@ -72,6 +72,10 @@ impl Default for BarConfig {
                 "memory".to_string(),
                 "volume".to_string(),
                 "battery".to_string(),
+                // Between the status icons and the clock, which is where macOS
+                // puts Control Center: a menu-bar item that is always live,
+                // not something you have to open a card to reach.
+                "control_center".to_string(),
                 "clock".to_string(),
             ],
         }

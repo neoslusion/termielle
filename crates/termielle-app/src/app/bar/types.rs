@@ -40,6 +40,9 @@ pub(crate) const MODULE_GAP: i32 = 12;
 pub(crate) const VOLUME_W: i32 = 15;
 /// Battery is a number plus its glyph, like the other metrics.
 pub(crate) const BATTERY_W: i32 = VALUE_W as i32 + ICON_GAP + ICON;
+/// The Control Center entry is a glyph alone, like volume: a menu-bar item
+/// that opens a panel rather than a readout.
+pub(crate) const CONTROL_CENTER_W: i32 = 15;
 /// The clock reads `HH:MM`, which is wider than a percentage.
 pub(crate) const CLOCK_ICON: i32 = 13;
 pub(crate) const CLOCK_TEXT_W: u32 = 38;

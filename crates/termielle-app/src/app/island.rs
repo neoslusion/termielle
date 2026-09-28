@@ -674,14 +674,28 @@ impl Controller {
                 }
                 crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
                 crate::app::types::HIT_CARD_PANEL => {
-                    // The glyph only exists while the popup is closed, so
-                    // this always means "open, showing the panel".
-                    self.panel_open = true;
-                    if self.toggle_expand(now_ms) {
+                    // The strip entry is always live, so this is a real
+                    // toggle: closed opens the panel, open closes the card. It
+                    // used to be a glyph inside the pill that could only ever
+                    // mean "open", which is why hovering the pill - and
+                    // therefore opening that card - made the panel
+                    // unreachable.
+                    if self.manually_expanded || self.hover_expanded {
+                        self.panel_open = false;
+                        self.hover_deadline = None;
+                        self.hover_suppressed = true;
+                        if self.manually_expanded {
+                            self.manually_expanded = false;
+                        }
+                        self.hover_expanded = false;
+                        self.interaction_deadline = None;
                         self.morph_to_target(now_ms);
-                        return ClickOutcome::PanelToggled;
+                        return ClickOutcome::Collapsed;
                     }
-                    return ClickOutcome::None;
+                    self.panel_open = true;
+                    self.toggle_expand(now_ms);
+                    self.morph_to_target(now_ms);
+                    return ClickOutcome::PanelToggled;
                 }
                 crate::app::types::HIT_PANEL_VOLUME_DOWN
                 | crate::app::types::HIT_PANEL_VOLUME_UP => {

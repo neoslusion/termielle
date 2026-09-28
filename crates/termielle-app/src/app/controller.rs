@@ -796,6 +796,14 @@ impl Controller {
         &self.current
     }
 
+    /// The click regions the current frame installed, as
+    /// `(id, x, y, w, h)` in frame coordinates. Read-only: it lets callers
+    /// that cannot see `icon_hits` - tests, the review renderer - address a
+    /// module by asking where it is instead of recomputing its layout.
+    pub fn click_regions(&self) -> &[(isize, i32, i32, u32, u32)] {
+        &self.icon_hits
+    }
+
     /// The state currently being presented; drives the acknowledgement file.
     pub fn visible_state(&self) -> VisualState {
         self.state

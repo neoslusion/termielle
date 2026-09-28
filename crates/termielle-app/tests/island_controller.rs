@@ -1793,7 +1793,7 @@ fn left_zone_drops_overflow_instead_of_crossing_the_center_pill() {
 /// own click closes the popup and hands the next open back to the default
 /// card.
 #[test]
-fn panel_glyph_opens_the_panel_and_the_pill_hands_the_card_back() {
+fn strip_control_center_toggles_the_panel() {
     use termielle_app::app::ClickOutcome;
 
     let mut island = IslandConfig {
@@ -1807,7 +1807,7 @@ fn panel_glyph_opens_the_panel_and_the_pill_hands_the_card_back() {
 
     // The glyph sits at the pill's right end, ahead of the pill's own hit.
     assert_eq!(
-        c.handle_click(panel_glyph_x(), 18, 1000),
+        c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 1000),
         ClickOutcome::PanelToggled
     );
     for tick in (1000..1400).step_by(16) {
@@ -1819,18 +1819,35 @@ fn panel_glyph_opens_the_panel_and_the_pill_hands_the_card_back() {
         c.current_frame().height
     );
 
-    // The pill still owns its own surface: clicking it closes the popup.
-    assert_eq!(c.handle_click(960, 18, 1500), ClickOutcome::Collapsed);
+    // The strip entry stays live while the card is open, and it is a real
+    // toggle now: it used to live inside the pill, where opening the card made
+    // it unreachable, and it could only ever mean "open".
+    assert_eq!(
+        c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 1500),
+        ClickOutcome::Collapsed,
+        "the strip entry must close the card it opened"
+    );
     for tick in (1500..2100).step_by(16) {
         c.on_timer(tick);
     }
     assert_eq!(
         c.current_frame().height,
         collapsed_h,
-        "the popup is closed again"
+        "the second press of the strip entry closes the card"
     );
+
+    // Open it again, then hand the card back to the pill.
     assert_eq!(
-        c.handle_click(960, 18, 2200),
+        c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 2200),
+        ClickOutcome::PanelToggled
+    );
+    for tick in (2200..2600).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(c.current_frame().height > 120, "the panel is open again");
+    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Collapsed);
+    assert_eq!(
+        c.handle_click(960, 18, 2800),
         ClickOutcome::Expanded,
         "the next open shows the default card, not the panel"
     );
@@ -1864,7 +1881,7 @@ fn panel_rows_drive_the_level_and_name_their_settings() {
         1000,
     );
     assert_eq!(
-        c.handle_click(panel_glyph_x(), 18, 1000),
+        c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 1000),
         ClickOutcome::PanelToggled
     );
     for tick in (1000..1400).step_by(16) {
@@ -1922,8 +1939,19 @@ fn panel_rows_drive_the_level_and_name_their_settings() {
 
 /// The glyph's x follows the pill's right end, so the tests never hard-code
 /// the pill's own width.
-fn panel_glyph_x() -> i32 {
-    960 + 90 - 26 + 10
+/// Centre of the Control Center's click region, read from the frame the
+/// controller just painted. The entry is a strip module in the right zone, so
+/// asking the frame where it is beats recomputing the right-zone layout here -
+/// a wrong constant would silently click the volume or clock module instead,
+/// and `handle_click` would happily report that as a hit.
+fn control_center_point(c: &Controller) -> (i32, i32) {
+    let (_, x, y, w, h) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::app::HIT_CARD_PANEL)
+        .copied()
+        .expect("the bar must install a Control Center click region");
+    (x + w as i32 / 2, y + h as i32 / 2)
 }
 
 #[test]

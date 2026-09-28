@@ -89,9 +89,15 @@ system telemetry already present in the bar.
 
 ### Control panel
 
-The pill carries a small sliders glyph at its right end, ahead of the pill's
-own open/close hit. That glyph opens the popup on the **control panel** body:
-the one surface where Termielle owns state end to end.
+Control Center is a menu-bar item in the right zone, between the status icons
+and the clock, as macOS has it. It opens the popup on the **control panel**
+body: the one surface where Termielle owns state end to end. It is live
+whether or not a card is open, and it is a toggle - one press opens the panel,
+the next hands the card back.
+
+It used to be a glyph inside the pill, ahead of the pill's own open/close hit.
+That made it unreachable the moment hovering the pill opened the card, and it
+could only ever mean "open", never close.
 
 - **Volume row** — the speaker mutes, the `−` and `+` steppers move the level
   in steps of 5, and the wheel over the track adjusts it exactly like the
