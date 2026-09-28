@@ -46,8 +46,14 @@ impl Controller {
     /// Idle faces remain alive but at a restrained 10 fps; active/playing
     /// surfaces retain the asset cadence because another animation already
     /// keeps the compositor active there.
+    ///
+    /// The bar is the exception even when idle. Its tick repaints only the
+    /// center surface off the cached side zones, and holding a resting bar
+    /// face to 10 fps froze it on the GIF's opening frame, which is nearly
+    /// blank - it read as a missing face rather than a still one.
     fn face_min_delay_ms(&self) -> u64 {
-        if self.state == termielle_core::VisualState::Idle && !self.media_playing() {
+        let resting = self.state == termielle_core::VisualState::Idle && !self.media_playing();
+        if resting && !self.island.is_bar() {
             100
         } else {
             20
@@ -64,15 +70,8 @@ impl Controller {
         if self.presentation() == crate::animation::notch::Presentation::Hidden {
             return;
         }
-        // A full-width bar repaint is far more expensive than the small island
-        // surface. Keep its resting face as a polished still; active agent or
-        // media states still animate normally.
-        if self.island.is_bar()
-            && self.state == termielle_core::VisualState::Idle
-            && !self.media_playing()
-        {
-            return;
-        }
+        // A bar face tick is a cached-zone repaint of the center surface, not
+        // a cold rebuild, so it can animate even while the bar rests.
         if self.face_decoder.is_none() && self.face_frames.len() < 2 {
             return;
         }
@@ -113,6 +112,10 @@ impl Controller {
             return;
         }
         self.face_idx = (self.face_idx + 1) % self.face_frames.len();
+        // `face_frame` is what the bar pill and the short card actually blit,
+        // so advancing the index alone left both showing the GIF's first
+        // frame forever: the animation ticked and nothing moved.
+        self.face_frame = self.face_frames[self.face_idx].clone();
         let minimum = self.face_min_delay_ms();
         let delay = self
             .face_delays
@@ -122,7 +125,21 @@ impl Controller {
             .max(minimum as u32);
         self.face_deadline = Some(now_ms.saturating_add(delay as u64));
         let (w, h) = self.current_logical_size();
-        self.current = self.render_island(self.state, w, h, now_ms);
+        // A bar face tick redraws only the center surface. The side zones are
+        // unchanged by a face frame, so taking the cached-zone path here is
+        // what keeps a resting bar animating without a full strip rebuild
+        // every tick.
+        self.current = if self.island.is_bar() {
+            self.render_bar_with_damage(
+                self.state,
+                w,
+                h,
+                now_ms,
+                crate::app::bar::modules::BarDamage::CENTER,
+            )
+        } else {
+            self.render_island(self.state, w, h, now_ms)
+        };
     }
 }
 /// Box-downscales a premultiplied BGRA frame to `size x size`.

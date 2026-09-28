@@ -1068,6 +1068,84 @@ mod tests {
         assert!(c.face_deadline.is_none());
     }
 
+    /// A resting bar face must still advance. Suppressing its deadline pinned
+    /// the pill to the GIF's opening frame, which is nearly blank, so the face
+    /// looked like it had vanished rather than sitting still.
+    #[test]
+    fn a_resting_bar_face_still_schedules_its_next_frame() {
+        let mut c = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: true,
+                ..IslandConfig::default()
+            },
+        );
+        c.set_bar_width(1536);
+        c.face_frames.push(c.face_frame.clone());
+        c.face_delays.push(40);
+        c.face_frames.push(c.face_frame.clone());
+        c.face_delays.push(40);
+
+        c.arm_face_deadline(1_000);
+        let armed = c
+            .face_deadline
+            .expect("a resting bar face must arm its next frame");
+        // The asset's own 40 ms cadence, floored at 20: not the island's
+        // 10 fps resting throttle, which is what froze it.
+        assert_eq!(armed, 1_040);
+
+        let before = c.face_idx;
+        c.advance_face(1_040);
+        assert_ne!(c.face_idx, before, "the face must advance a frame");
+        assert!(c.face_deadline.is_some());
+    }
+
+    /// The bar pill and the short card blit `face_frame`, not `face_idx`.
+    /// Cycling the index without publishing the new frame left both showing
+    /// the GIF's first frame while the tick ran on schedule, which is exactly
+    /// "the animation is playing but nothing moves".
+    #[test]
+    fn advancing_the_face_publishes_the_frame_the_pill_blits() {
+        let mut c = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: true,
+                ..IslandConfig::default()
+            },
+        );
+        c.set_bar_width(1536);
+        let mut frames = Vec::new();
+        for shade in [10u8, 90, 170, 240] {
+            let mut frame = c.face_frame.clone();
+            frame.pixels_pbgra.fill(shade);
+            frames.push(frame);
+        }
+        c.face_frames = frames;
+        c.face_delays = vec![40; 4];
+        c.face_frame = c.face_frames[0].clone();
+
+        c.advance_face(1_000);
+        assert_eq!(c.face_idx, 1);
+        assert_eq!(
+            c.face_frame.pixels_pbgra[0], 90,
+            "the blitted face must be the advanced frame, not frame 0"
+        );
+        c.advance_face(1_040);
+        c.advance_face(1_080);
+        assert_eq!(c.face_idx, 3);
+        assert_eq!(c.face_frame.pixels_pbgra[0], 240);
+    }
+
     #[test]
     fn session_count_retargets_an_active_morph_without_waiting_for_settlement() {
         let mut c = quiet_island();
