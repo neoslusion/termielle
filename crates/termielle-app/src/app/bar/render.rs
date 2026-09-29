@@ -296,6 +296,7 @@ impl Controller {
             bar_y,
             island_x,
             content_x,
+            island_card_open: self.island_card_open(),
             island_y,
             island_w,
             exp_h,

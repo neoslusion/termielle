@@ -62,6 +62,10 @@ pub(crate) struct BarCard {
     pub(crate) bar_y: i32,
     pub(crate) progress: f32,
     pub(crate) island_x: i32,
+    /// Whether the island's *own* card is open, as opposed to the Control
+    /// Center panel. Both make the window tall, so the pill's own visibility
+    /// cannot be read off the height.
+    pub(crate) island_card_open: bool,
     /// Left edge of the full-size card content, in frame coordinates. Same
     /// anchor as `island_x`; carried separately because the card animates its
     /// width while the content inside it is already full size.

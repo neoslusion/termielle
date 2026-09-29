@@ -806,6 +806,15 @@ impl Controller {
         self.morph_to_target(now_ms)
     }
 
+    /// Whether the island's *own* card is open, by click or by hover.
+    ///
+    /// This is the state the pill's visibility belongs to. The Control Center
+    /// is a separate surface that also makes the window tall, so the window's
+    /// height cannot answer it.
+    pub(crate) fn island_card_open(&self) -> bool {
+        self.manually_expanded || self.hover_expanded
+    }
+
     /// Whether the Control Center panel is open. It is a surface of its own,
     /// not a body of the island's card, so callers can ask about it directly.
     pub fn is_panel_open(&self) -> bool {
