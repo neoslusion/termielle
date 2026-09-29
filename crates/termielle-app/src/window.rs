@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -271,6 +271,9 @@ struct WindowState {
     /// Whether the cursor is currently inside the opaque pill. Used to emit
     /// each hover transition exactly once.
     hover_inside: RefCell<bool>,
+    /// Whether a press is outstanding. A release is only honoured for a press
+    /// that was actually seen.
+    press_active: Cell<bool>,
 }
 
 /// Converts an `LPARAM` mouse message payload into client coordinates.
@@ -398,6 +401,7 @@ unsafe extern "system" fn window_proc(
             // Press feedback: swell the pill while the pointer is held.
             // Capture so the release is reported even if the swell moves
             // the pill under the cursor.
+            unsafe { (*state).press_active.set(true) };
             let is_island = unsafe { (*state).is_island };
             if is_island {
                 let (x, y) = lparam_point(lparam);
@@ -413,6 +417,16 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_LBUTTONUP => {
+            // One physical press has been arriving as two releases, a frame
+            // apart. The first is usually swallowed because `is_island` reads
+            // false on it, which is luck rather than a rule: when it reads
+            // true both releases reach the click arm, the surface toggles
+            // twice, and it bounces open and shut on a single click. A release
+            // with no press outstanding is not the end of a click, so it is
+            // dropped here rather than in every arm that could act on it.
+            if !unsafe { (*state).press_active.replace(false) } {
+                return LRESULT(0);
+            }
             let is_island = unsafe { (*state).is_island };
             if is_island {
                 let _ = unsafe { ReleaseCapture() };
@@ -430,7 +444,10 @@ unsafe extern "system" fn window_proc(
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
             // Capture can be revoked without a button-up (Alt-Tab, menus,
-            // another window). Never leave the physical press swell latched.
+            // another window). Never leave the physical press swell latched,
+            // and drop the armed press with it: a release that arrives later
+            // belongs to a press this window never saw the start of.
+            unsafe { (*state).press_active.set(false) };
             let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(false)) };
             return LRESULT(0);
         }
@@ -816,6 +833,7 @@ impl OverlayWindow {
             is_bar: config.island.is_bar(),
             menu_state: RefCell::new(tray::MenuState::from_island(&config.island)),
             hover_inside: RefCell::new(false),
+            press_active: Cell::new(false),
         });
         let state_ptr = &*state as *const WindowState as isize;
         let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr) };
