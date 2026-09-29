@@ -99,17 +99,29 @@ impl Controller {
         if x >= pill_cx && x < pill_cx + pill_w as i32 && y >= top && y < top + pill_h as i32 {
             return true;
         }
-        // With a card open - by hover or by click - the whole window counts as
-        // the surface. Click-outside dismissal asks this same question, and
-        // testing the pill alone made every click inside the panel body look
-        // like a click outside: the card dismissed itself instead of pressing
-        // the switch under the pointer. With nothing open only the pill counts,
-        // so crossing the strip still opens nothing.
-        (self.hover_expanded || self.manually_expanded)
+        // With any surface open the whole window counts as the surface.
+        // Click-outside dismissal asks this same question, and testing the
+        // pill alone made every click inside a surface look like a click
+        // outside: the surface dismissed itself instead of pressing the
+        // control under the pointer.
+        //
+        // `panel_open` has to be in that list. It used to imply
+        // `manually_expanded`, so omitting it looked harmless while the two
+        // were the same surface. Once the panel stopped setting that flag,
+        // the very click that opened it read as a click outside and closed it
+        // again - the panel could be opened but never closed by its own icon.
+        // With nothing open only the pill counts, so crossing the strip still
+        // opens nothing.
+        (self.panel_open || self.hover_expanded || self.manually_expanded)
             && x >= 0
             && x < width as i32
             && y >= 0
             && y < height as i32
+    }
+
+    /// Test-facing alias for the surface test.
+    pub fn point_over_bar_surface_is(&self, point: (i32, i32)) -> bool {
+        self.point_over_bar_surface(point)
     }
 
     /// Whether a bar module name is listed in its zone (`left`, `center`,

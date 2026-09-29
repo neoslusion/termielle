@@ -709,7 +709,12 @@ impl Controller {
             }
         }
 
-        self.interaction_deadline = self.manually_expanded.then(|| now_ms.saturating_add(100));
+        // Either open surface needs this poll, not just the island's card:
+        // outside-click and Escape dismissal run off it, and the panel does
+        // not set `manually_expanded`. It kept working only by accident,
+        // because the face tick wakes the loop anyway.
+        self.interaction_deadline =
+            (self.manually_expanded || self.panel_open).then(|| now_ms.saturating_add(100));
         actions.next_deadline_ms = self.next_deadline_ms();
         actions
     }

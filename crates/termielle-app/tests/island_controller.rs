@@ -1916,6 +1916,59 @@ fn the_panel_is_a_surface_of_its_own() {
     );
 }
 
+/// The panel must be closable by its own icon. It used to be impossible:
+/// opening it no longer set `manually_expanded`, so the surface test fell
+/// back to "is the cursor on the pill" - the icon is not the pill - and the
+/// very click that opened the panel then read as a click outside and closed
+/// it again. Every press re-opened it, which looked like the toggle was
+/// stuck open.
+#[test]
+fn the_panel_closes_on_the_click_that_opened_it() {
+    use termielle_app::app::ClickOutcome;
+
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    c.set_bar_width(1536);
+    let entry = control_center_point(&c);
+
+    c.handle_click(entry.0, entry.1, 1000);
+    for tick in (1000..1400).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(c.is_panel_open());
+    let (_, icon_x, icon_y, icon_w, icon_h) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::app::HIT_CARD_PANEL)
+        .copied()
+        .expect("the strip entry is live while the panel is open");
+    let on_icon = (icon_x + icon_w as i32 / 2, icon_y + icon_h as i32 / 2);
+    assert!(
+        c.point_over_bar_surface_is(on_icon),
+        "the icon that opened the panel is inside the surface it opened"
+    );
+
+    assert_eq!(
+        c.handle_click(on_icon.0, on_icon.1, 2000),
+        ClickOutcome::PanelToggled
+    );
+    for tick in (2000..2400).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(!c.is_panel_open(), "the second press must close the panel");
+
+    // And a third press opens it again: a toggle, not a one-way door.
+    assert_eq!(
+        c.handle_click(entry.0, entry.1, 3000),
+        ClickOutcome::PanelToggled
+    );
+    assert!(c.is_panel_open());
+}
+
 /// The pill lives in the strip and the panel hangs below it, so opening the
 /// panel must leave the pill on screen. They shared one morph driver, so the
 /// panel's height read as "the island has expanded" and the pill faded out
