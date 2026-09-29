@@ -276,6 +276,59 @@ struct WindowState {
     press_active: Cell<bool>,
 }
 
+/// Makes every declared hit region a real mouse target.
+///
+/// The bar draws its modules on transparent glass, so a region's own pixels
+/// are only clickable where something was actually inked. The gaps between an
+/// icon's strokes pass the click through to whatever is behind the bar, and the
+/// target collapses onto the strokes - so a control only responds when the
+/// pointer is on its ink, not on the slot the layout reserved for it.
+///
+/// The surface alpha becomes 1, which is 1/255 and invisible, and is what makes
+/// DWM route the mouse here at all. This is the trick the top sensor strip
+/// already uses, applied to the regions the renderer declares. It does not
+/// widen any region: the module's own slot, with the padding it already
+/// carries, becomes clickable, and its neighbours keep their clicks.
+fn mark_hit_targets(
+    dst: &mut [u8],
+    alpha_map: &mut [u8],
+    w: u32,
+    h: u32,
+    targets: &[(i32, i32, u32, u32)],
+) {
+    for &(tx, ty, tw, th) in targets {
+        let x0 = tx.clamp(0, w as i32);
+        let y0 = ty.clamp(0, h as i32);
+        let x1 = (tx.saturating_add(tw as i32)).clamp(0, w as i32);
+        let y1 = (ty.saturating_add(th as i32)).clamp(0, h as i32);
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let index = yy as usize * w as usize + xx as usize;
+                let pixel = &mut dst[index * 4..][..4];
+                if pixel[3] == 0 {
+                    pixel[3] = 1;
+                }
+                let alpha = &mut alpha_map[index];
+                if *alpha < ALPHA_HIT_THRESHOLD {
+                    *alpha = ALPHA_HIT_THRESHOLD;
+                }
+            }
+        }
+    }
+}
+
+/// Test-facing entry point for [`mark_hit_targets`].
+#[doc(hidden)]
+pub fn mark_hit_targets_for_test(
+    dst: &mut [u8],
+    alpha_map: &mut [u8],
+    w: u32,
+    h: u32,
+    targets: &[(i32, i32, u32, u32)],
+) {
+    mark_hit_targets(dst, alpha_map, w, h, targets);
+}
+
 /// Converts an `LPARAM` mouse message payload into client coordinates.
 fn lparam_point(lparam: LPARAM) -> (i32, i32) {
     let value = lparam.0;
@@ -765,6 +818,9 @@ pub struct OverlayWindow {
     /// follows the display the user is on — but never jumps mid-morph just
     /// because the cursor crossed a screen edge.
     anchor_monitor: Option<windows::Win32::Graphics::Gdi::HMONITOR>,
+    /// The frame's declared hit regions, in device pixels, so the alpha map
+    /// can mark them as mouse targets. Empty when there is nothing to mark.
+    hit_targets: RefCell<Vec<(i32, i32, u32, u32)>>,
 }
 
 impl OverlayWindow {
@@ -850,6 +906,7 @@ impl OverlayWindow {
             glass: config.island.glass.clone(),
             backdrop: RefCell::new(None),
             surface: RefCell::new(None),
+            hit_targets: RefCell::new(Vec::new()),
             last_dest: (0, 0, 1, 1),
         };
         if matches!(config.render, RenderMode::ColorKey) {
@@ -992,6 +1049,21 @@ impl OverlayWindow {
             self.repositioned = true;
         }
         self.draw_color_key(frame)
+    }
+
+    /// Publishes the frame's declared hit regions, in logical coordinates.
+    pub fn set_hit_targets(&self, targets: &[(isize, i32, i32, u32, u32)], scale: f32) {
+        *self.hit_targets.borrow_mut() = targets
+            .iter()
+            .map(|&(_, x, y, w, h)| {
+                (
+                    (x as f32 * scale).round() as i32,
+                    (y as f32 * scale).round() as i32,
+                    (w as f32 * scale).round().max(1.0) as u32,
+                    (h as f32 * scale).round().max(1.0) as u32,
+                )
+            })
+            .collect();
     }
 
     /// Blocks until a window message arrives, dispatches it, and returns the
@@ -1533,6 +1605,14 @@ impl OverlayWindow {
             }
         }
 
+        // The declared regions become real mouse targets before the map is
+        // kept. The surface alpha goes to 1 - 1/255, invisible - which is what
+        // makes DWM route the pointer here at all.
+        if !self.hit_targets.borrow().is_empty() {
+            let targets = self.hit_targets.borrow();
+            mark_hit_targets(dst, &mut alpha_map, w, h, &targets);
+        }
+
         *self.state.alpha.borrow_mut() = AlphaMap {
             bytes: alpha_map,
             width: w,
@@ -1621,6 +1701,15 @@ impl OverlayWindow {
         let _ = unsafe { ReleaseDC(Some(self.hwnd), dc) };
         if lines == 0 {
             return Err(WindowError::Win32(unsafe { GetLastError().0 }));
+        }
+
+        // This path composites through a colour key, so there is no per-pixel
+        // alpha to raise: the map is what the hit test reads, and it is what
+        // decides whether a click reaches the arm at all.
+        if !self.hit_targets.borrow().is_empty() {
+            let targets = self.hit_targets.borrow();
+            let mut no_surface = Vec::new();
+            mark_hit_targets(&mut no_surface, &mut alpha_map, w, h, &targets);
         }
 
         *self.state.alpha.borrow_mut() = AlphaMap {

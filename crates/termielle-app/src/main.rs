@@ -1154,6 +1154,14 @@ fn present_current(
             );
         }
     }
+    // The bar's modules are drawn on transparent glass, so without this the
+    // only clickable pixels are the ones that got inked. The regions the
+    // renderer declared are the layout's own slots, so they become the targets.
+    if controller.island_config().is_bar() {
+        window.set_hit_targets(controller.click_regions(), controller.render_scale());
+    } else {
+        window.set_hit_targets(&[], 1.0);
+    }
     let anchor = controller.island_anchor();
     let attempt = if controller.island_config().is_bar() {
         window.present_with_bar(

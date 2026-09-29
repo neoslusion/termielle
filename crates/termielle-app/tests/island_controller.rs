@@ -2094,6 +2094,87 @@ mod surfaces_are_independent {
     }
 }
 
+/// A module drawn on transparent glass is only clickable on the pixels that
+/// happened to get inked. The control center is two thin slider strokes, so the
+/// gaps between them passed the click through to the bar underneath and the
+/// target collapsed onto the ink: the control only answered on its strokes, not
+/// on the slot the layout reserved for it.
+///
+/// The fix marks the declared regions in the alpha map - the same 1/255 trick
+/// the top sensor strip already uses - so the module's own slot is the target.
+/// It must not widen anything: the neighbours keep their own clicks.
+mod declared_regions_are_clickable {
+    use termielle_app::window::{HitTestResult, alpha_hit_test, mark_hit_targets_for_test};
+
+    fn blank(w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
+        (
+            vec![0u8; w as usize * h as usize * 4],
+            vec![0u8; w as usize * h as usize],
+        )
+    }
+
+    fn hit(alpha: &[u8], w: u32, x: i32, y: i32) -> bool {
+        alpha_hit_test(alpha, w, x, y) == HitTestResult::Caption
+    }
+
+    #[test]
+    fn an_empty_gap_inside_a_region_still_receives_the_click() {
+        let (mut dst, mut alpha) = blank(64, 16);
+        // Only two strokes were inked, as a two-slider glyph would be.
+        for y in 4..8 {
+            for x in [20, 30] {
+                dst[(y * 64 + x) * 4 + 3] = 255;
+            }
+        }
+        for i in 0..alpha.len() {
+            alpha[i] = dst[i * 4 + 3];
+        }
+        assert!(
+            !hit(&alpha, 64, 25, 6),
+            "before: the gap between the strokes is click-through"
+        );
+
+        mark_hit_targets_for_test(&mut dst, &mut alpha, 64, 16, &[(16, 2, 20, 12)]);
+
+        assert!(
+            hit(&alpha, 64, 25, 6),
+            "the gap inside the region is a target"
+        );
+        assert!(hit(&alpha, 64, 20, 6), "and so is the ink");
+        // The plate is 1/255: enough for DWM, invisible on screen.
+        assert_eq!(dst[(6 * 64 + 25) * 4 + 3], 1);
+        // A stroke keeps its real alpha, so nothing is dimmed.
+        assert_eq!(dst[(6 * 64 + 20) * 4 + 3], 255);
+    }
+
+    #[test]
+    fn neighbouring_modules_keep_their_own_clicks() {
+        let (mut dst, mut alpha) = blank(64, 16);
+        // The marking must not spill past the region it was given: the clock
+        // and the tray sit next to the control center, and swallowing their
+        // clicks would be a worse bug than the small target.
+        mark_hit_targets_for_test(&mut dst, &mut alpha, 64, 16, &[(16, 2, 20, 12)]);
+        assert!(hit(&alpha, 64, 20, 6), "inside the region");
+        assert!(!hit(&alpha, 64, 15, 6), "one pixel to the left is not");
+        assert!(!hit(&alpha, 64, 36, 6), "one pixel to the right is not");
+        assert!(!hit(&alpha, 64, 20, 1), "above the region is not");
+        assert!(!hit(&alpha, 64, 20, 14), "below the region is not");
+    }
+
+    #[test]
+    fn a_region_clipped_by_the_window_edge_marks_only_what_fits() {
+        // The right zone's last module can sit flush against the frame edge,
+        // and a region that starts off-screen must not underflow the index.
+        let (mut dst, mut alpha) = blank(64, 16);
+        mark_hit_targets_for_test(&mut dst, &mut alpha, 64, 16, &[(60, 4, 20, 8)]);
+        assert!(
+            hit(&alpha, 64, 62, 6),
+            "the part inside the window is marked"
+        );
+        assert_eq!(dst[0], 0, "and the far side of the window is untouched");
+    }
+}
+
 /// The panel must be closable by its own icon. It used to be impossible:
 /// opening it no longer set `manually_expanded`, so the surface test fell
 /// back to "is the cursor on the pill" - the icon is not the pill - and the
