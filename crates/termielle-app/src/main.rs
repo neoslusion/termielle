@@ -1295,9 +1295,10 @@ fn poll_hover(
     let over = if controller.island_config().is_bar() {
         // Ungated: the alpha-gated read answers None unless the cursor is over
         // an opaque pixel, and in a bar that is the wrong question.
+        // The island's own surface, so an open panel does not widen it.
         window
             .cursor_frame_pos()
-            .is_some_and(|point| controller.point_over_bar_surface(point))
+            .is_some_and(|point| controller.point_over_notch_surface(point))
     } else {
         window.cursor_over_pill()
     };

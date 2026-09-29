@@ -1846,13 +1846,14 @@ fn strip_control_center_toggles_the_panel() {
     }
     assert!(c.current_frame().height > 120, "the panel is open again");
 
-    // Dismissing the panel with the pill must not open the island's card:
-    // the pill is what was pressed, and the pill is not the card.
-    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Collapsed);
-    assert!(!c.is_manually_expanded(), "the island's card stays shut");
+    // The pill is the island's own control. Pressing it while the panel is up
+    // is the island's business, and it must not reach across and dismiss the
+    // panel: the panel is only ever closed by the panel.
+    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::None);
+    assert!(c.is_panel_open(), "the pill must not dismiss the panel");
     assert!(
-        !c.is_panel_open(),
-        "the pill's card must not carry the panel with it"
+        !c.is_manually_expanded(),
+        "and the pill must not open its own card either"
     );
 }
 
@@ -1902,18 +1903,195 @@ fn the_panel_is_a_surface_of_its_own() {
         "hovering the pill must not close a separate panel"
     );
 
-    // The pill dismisses the panel and leaves the island alone. Swapping
-    // straight to the island's card morphed the pill away as it dismissed,
-    // which read as "dismissing the panel collapsed the pill too".
-    assert_eq!(
-        c.handle_click(pill.0, pill.1, 5000),
-        ClickOutcome::Collapsed
-    );
-    assert!(!c.is_panel_open(), "the pill dismisses the panel");
+    // The pill does not dismiss the panel. It used to, which is the coupling
+    // this pair of surfaces is supposed to be free of: one surface's control
+    // was another's off switch.
+    assert_eq!(c.handle_click(pill.0, pill.1, 5000), ClickOutcome::None);
+    assert!(c.is_panel_open(), "the pill must not dismiss the panel");
     assert!(
         !c.is_manually_expanded(),
         "the island's card must stay shut: two surfaces, not a swap"
     );
+
+    // The panel is dismissed the way a panel is: its own key, which is the one
+    // shared path, and it leaves the island exactly as it found it. The old
+    // panel branch also cleared the island's hover deadline and set its
+    // suppression flag, so a dismissal reached into the other surface's
+    // state machine.
+    c.set_hover(false, 5_100);
+    for tick in (5_100..6_000).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(
+        c.collapse_if_expanded(6_000),
+        "Escape dismisses whichever surface is showing"
+    );
+    for tick in (6_000..6_600).step_by(16) {
+        c.on_timer(tick);
+    }
+    assert!(!c.is_panel_open(), "Escape closes the panel");
+    assert!(
+        !c.is_manually_expanded(),
+        "and leaves the island's card shut"
+    );
+}
+
+/// The two surfaces have to be able to open and close without the other one
+/// feeling it. Each test here fails if one surface's lifecycle reaches into
+/// the other's state.
+mod surfaces_are_independent {
+    use super::*;
+    use termielle_app::app::ClickOutcome;
+
+    fn bar() -> IslandConfig {
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..Default::default()
+        };
+        island.bar.height = 36;
+        island
+    }
+
+    fn settle(c: &mut Controller, from: u64, to: u64) {
+        for tick in (from..to).step_by(16) {
+            c.on_timer(tick);
+        }
+    }
+
+    /// The Control Center's close must not reach into the island. It used to
+    /// clear the island's hover deadline and set its suppression flag, so
+    /// dismissing the panel also re-armed or disarmed the island's hover.
+    #[test]
+    fn closing_the_panel_leaves_the_island_hover_alone() {
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
+        c.set_bar_width(1536);
+        let entry = control_center_point(&c);
+
+        c.handle_click(entry.0, entry.1, 1_000);
+        settle(&mut c, 1_000, 1_400);
+        assert!(c.is_panel_open());
+
+        // The pointer is on the panel's control, so the island sees "outside".
+        // Nothing there may arm the island's dwell.
+        c.set_hover(false, 1_500);
+
+        assert!(c.collapse_if_expanded(2_000), "the panel dismisses");
+        // Well past the dwell and the grace. If the panel's close left an
+        // island dwell armed, it fires in here and the card opens behind the
+        // dismissal that was supposed to leave the island at rest.
+        settle(&mut c, 2_000, 4_000);
+        assert!(!c.is_panel_open());
+        assert!(
+            !c.is_manually_expanded() && c.current_frame().height < 100,
+            "dismissing the panel must not leave the island opening behind it"
+        );
+    }
+
+    /// The island's hover machine must keep running while the panel is up.
+    ///
+    /// `set_hover` used to return early whenever the panel was open, so the
+    /// pointer leaving the pill did not clear the island's suppression and a
+    /// dwell armed just before the panel opened sat pending until it closed.
+    /// The panel's close then also set that suppression itself, so between the
+    /// two the island could not hover-open at all until the pointer left -
+    /// which is the panel steering the island's own gesture.
+    ///
+    /// The observable difference: the pointer travels off the pill and back
+    /// while the panel is up, and the island opens its card on the panel's
+    /// close, by its own dwell. Freeze the machine and the leave never lands,
+    /// the suppression stands, and the card never opens.
+    #[test]
+    fn the_island_keeps_hovering_across_the_panels_open_period() {
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
+        c.set_bar_width(1536);
+        let entry = control_center_point(&c);
+
+        c.handle_click(entry.0, entry.1, 1_000);
+        settle(&mut c, 1_000, 1_400);
+        assert!(c.is_panel_open());
+
+        // A dwell is already running when the panel opened, and the panel
+        // dismisses the island, so it starts clean.
+        c.set_hover(false, 1_500);
+        c.set_hover(true, 1_600);
+        settle(&mut c, 1_600, 2_000);
+        assert!(c.is_panel_open(), "the island's hover takes nothing away");
+
+        // The pointer is on the pill and stays there. The island's own dwell
+        // runs on the panel's open period like any other.
+        c.collapse_if_expanded(2_100);
+        settle(&mut c, 2_100, 4_000);
+        assert!(!c.is_panel_open());
+        assert!(
+            c.is_manually_expanded() || c.current_frame().height > 100,
+            "the island's hover was frozen while the panel was up, so it can \
+             never open on its own again: the panel is steering the island's \
+             gesture"
+        );
+    }
+
+    /// Opening the panel dismisses the island through the island's own close,
+    /// and the island is left at rest rather than half-torn-down.
+    #[test]
+    fn opening_the_panel_leaves_the_island_at_rest() {
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
+        c.set_bar_width(1536);
+        let (_, px, py, pw, ph) = c
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+            .copied()
+            .expect("the pill installs its own hit");
+        let pill = (px + pw as i32 / 2, py + ph as i32 / 2);
+
+        // Open the island's card, then open the panel over it.
+        c.handle_click(pill.0, pill.1, 1_000);
+        assert!(c.is_manually_expanded(), "the pill opens the island's card");
+        let entry = control_center_point(&c);
+        assert_eq!(
+            c.handle_click(entry.0, entry.1, 1_200),
+            ClickOutcome::PanelToggled
+        );
+        assert!(c.is_panel_open());
+        assert!(
+            !c.is_manually_expanded(),
+            "one window, one card: opening the panel dismisses the island"
+        );
+        settle(&mut c, 1_200, 1_800);
+
+        // And the reverse: the panel is dismissed by the shared key, and the
+        // island stays shut instead of being handed the panel's space.
+        c.collapse_if_expanded(2_000);
+        settle(&mut c, 2_000, 2_600);
+        assert!(!c.is_panel_open());
+        assert!(
+            !c.is_manually_expanded(),
+            "dismissing the panel must not open the island's card"
+        );
+    }
+
+    /// The island's "is the pointer over me" test must not be widened by the
+    /// panel being open. Hover asks about the surface it drives, so a pointer
+    /// on the panel's control is outside the island even though it is inside
+    /// the window.
+    #[test]
+    fn the_islands_surface_test_ignores_the_panel() {
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
+        c.set_bar_width(1536);
+        let entry = control_center_point(&c);
+        let (ex, ey) = entry;
+
+        assert!(
+            !c.point_over_notch_surface_is((ex, ey)),
+            "the panel's control is not the island's surface"
+        );
+        c.handle_click(entry.0, entry.1, 1_000);
+        settle(&mut c, 1_000, 1_400);
+        assert!(
+            !c.point_over_notch_surface_is((ex, ey)),
+            "and it stops being the island's surface when the panel opens"
+        );
+    }
 }
 
 /// The panel must be closable by its own icon. It used to be impossible:

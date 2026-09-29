@@ -119,6 +119,40 @@ impl Controller {
             && y < height as i32
     }
 
+    /// Whether the point is over the *island's* surface: its pill, or the
+    /// window while the island's own card is up.
+    ///
+    /// [`Self::point_over_bar_surface`] answers that question for whichever
+    /// surface is showing, so a click on the panel's control counted as
+    /// "over the bar" - and the island read it as a pointer on its own
+    /// surface. Hover input has to be asked about the surface it drives, or
+    /// opening the panel silently redefines where the pill is.
+    pub fn point_over_notch_surface(&self, point: (i32, i32)) -> bool {
+        let (x, y) = (self.to_logical(point.0), self.to_logical(point.1));
+        let (pill_cx, pill_off, pill_w, pill_h) = self.bar_pill_rect(self.bar_width);
+        let (width, height) = self.current_logical_size();
+        let bar_h = self.island.bar.height;
+        let bar_y = if self.island.bar.position == termielle_core::BarPosition::Top {
+            0
+        } else {
+            height.saturating_sub(bar_h) as i32
+        };
+        let top = bar_y + pill_off;
+        if x >= pill_cx && x < pill_cx + pill_w as i32 && y >= top && y < top + pill_h as i32 {
+            return true;
+        }
+        (self.hover_expanded || self.manually_expanded)
+            && x >= 0
+            && x < width as i32
+            && y >= 0
+            && y < height as i32
+    }
+
+    /// Test-facing alias for the island's own surface test.
+    pub fn point_over_notch_surface_is(&self, point: (i32, i32)) -> bool {
+        self.point_over_notch_surface(point)
+    }
+
     /// Test-facing alias for the surface test.
     pub fn point_over_bar_surface_is(&self, point: (i32, i32)) -> bool {
         self.point_over_bar_surface(point)

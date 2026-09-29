@@ -688,10 +688,8 @@ impl Controller {
                     }
                     // One surface at a time. They are separate, so opening one
                     // clears the other rather than nesting inside it.
+                    self.claim_window(now_ms);
                     self.panel_open = true;
-                    self.manually_expanded = false;
-                    self.hover_expanded = false;
-                    self.hover_deadline = None;
                     self.interaction_deadline = Some(now_ms.saturating_add(100));
                     self.morph_to_target(now_ms);
                     return ClickOutcome::PanelToggled;
@@ -724,10 +722,11 @@ impl Controller {
                     // morphed the pill away as it dismissed, which read as
                     // "dismissing the panel collapsed the pill too".
                     if self.panel_open {
-                        self.panel_open = false;
-                        self.hover_suppressed = true;
-                        self.morph_to_target(now_ms);
-                        return ClickOutcome::Collapsed;
+                        // The pill is the island's own control. It is not a
+                        // dismiss button for the Control Center: a press here
+                        // while the panel is up is the island's business, and
+                        // the panel is only ever closed by the panel.
+                        return ClickOutcome::None;
                     }
                     if self.manually_expanded || self.hover_expanded {
                         self.collapse_if_expanded(now_ms);
@@ -793,8 +792,9 @@ impl Controller {
         }
         if self.panel_open {
             // Clicking the pill opens the island's card, so the panel steps
-            // aside rather than nesting inside it.
-            self.panel_open = false;
+            // aside rather than nesting inside it - through the panel's own
+            // close, so it is torn down the same way its own icon closes it.
+            self.close_panel(now_ms);
         }
         if self.collapse_if_expanded(now_ms) {
             return true;
@@ -826,25 +826,25 @@ impl Controller {
         self.manually_expanded
     }
 
-    /// Collapses the island if it was manually expanded (e.g. click outside or Escape).
-    pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
-        if !self.island.is_enabled() {
+    /// Closes the Control Center, and only the Control Center.
+    ///
+    /// Every path that ends the panel goes through here, so the panel's close
+    /// cannot pick up a habit of tidying the island's hover state on the way
+    /// out. That tidying is the interference: the panel used to clear
+    /// `hover_deadline` and set `hover_suppressed`, which are the island's
+    /// flags, and the island's hover machine is the thing that decides when
+    /// its card is open.
+    fn close_panel(&mut self, now_ms: u64) -> bool {
+        if !self.panel_open {
             return false;
         }
-        if self.panel_open {
-            // The panel is not the island's card, so it is dismissed on its
-            // own terms and leaves the island exactly as it found it.
-            self.panel_open = false;
-            self.interaction_deadline = None;
-            self.hover_deadline = None;
-            if self.island.is_bar() {
-                self.hover_suppressed = true;
-            }
-            return self.morph_to_target(now_ms);
-        }
-        if !self.manually_expanded {
-            return false;
-        }
+        self.panel_open = false;
+        self.morph_to_target(now_ms)
+    }
+
+    /// Closes the island's card, and only the island's card.
+    fn close_notch(&mut self, now_ms: u64) -> bool {
+        let was_open = self.manually_expanded;
         self.manually_expanded = false;
         self.interaction_deadline = None;
         self.hover_deadline = None;
@@ -852,7 +852,45 @@ impl Controller {
             self.hover_expanded = false;
             self.hover_suppressed = true;
         }
-        self.morph_to_target(now_ms)
+        // Always morph: `||` short-circuits, so folding the flag into the
+        // return value would skip the morph exactly when the card was open
+        // and leave the tall frame on screen.
+        let moved = self.morph_to_target(now_ms);
+        was_open || moved
+    }
+
+    /// The window has one geometry, so only one of the two cards can be drawn.
+    /// This is the single place that says so.
+    ///
+    /// It used to be spread over five arms, each reaching into the other
+    /// surface's flags: opening the panel cleared `manually_expanded`,
+    /// `hover_expanded` and `hover_deadline`, and opening the pill cleared
+    /// `panel_open`. Any of those could be missed by a new arm, and a miss
+    /// left both cards believing they owned the window. Rule: opening one
+    /// surface dismisses the other through the other's own close, so each
+    /// surface is still torn down by the code that belongs to it.
+    fn claim_window(&mut self, now_ms: u64) {
+        self.close_notch(now_ms);
+    }
+
+    /// Dismisses whichever surface is showing, for Escape and click-outside.
+    ///
+    /// This is the one shared entry point, and it is shared on purpose: both
+    /// keys mean "dismiss what I am looking at". It dispatches to each
+    /// surface's own close rather than collapsing them together, so closing
+    /// the panel cannot leave the island half-torn-down and closing the
+    /// island cannot leave the panel open.
+    pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
+        if !self.island.is_enabled() {
+            return false;
+        }
+        if self.panel_open {
+            return self.close_panel(now_ms);
+        }
+        if !self.manually_expanded {
+            return false;
+        }
+        self.close_notch(now_ms)
     }
 
     /// Hover dwell before a bar pill opens its card, in ms. A cursor merely
@@ -883,11 +921,20 @@ impl Controller {
             return self.morph_to_target(now_ms);
         }
         if self.island.is_bar() {
-            if self.panel_open {
-                // The panel is a separate surface: the pill does not take it
-                // away, and the panel does not answer to the pill.
-                return false;
-            }
+            // The panel does not suspend this. It used to: `set_hover`
+            // returned early whenever the panel was up, which froze the
+            // island's dwell wherever it happened to be. A dwell armed a
+            // moment before the panel opened then sat pending for as long as
+            // the panel stayed up and fired the moment it closed, throwing the
+            // card open behind a dismissal - the notch popping out on the
+            // command that closed the panel.
+            //
+            // Running it is also what makes that impossible. The dwell fires
+            // and the grace closes it while the panel is still up, because the
+            // pointer is on the panel's control, not the pill, so by the time
+            // the panel closes the island has already resolved its own hover.
+            // Which card is drawn is decided by `presentation`, not by
+            // freezing the other surface's state machine.
             return self.set_bar_hover(inside, now_ms);
         }
         if self.state != VisualState::Idle || self.manually_expanded {
