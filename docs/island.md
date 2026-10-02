@@ -2,12 +2,16 @@
 
 Fork of Termielle's overlay into a top-center notch or floating island with **custom layered glass** (per-pixel alpha, no DWM acrylic dependency).
 
+For completed desktop refinements, agreed decisions, validation history, and
+local redeployment, see the [development handoff](development-handoff.md).
+Root-cause investigations live in [reported behaviours](reported-behaviours.md).
+
 ## Features (current)
 
-- **Authentic macOS & iOS Presentation Lifecycle**:
-  - **Idle is Hidden**: When idle and unhovered, the island completely hides from view, leaving your workspace unobstructed. An invisible 2px sensor strip along the top screen bezel detects incoming hover gestures.
-  - **Live Activities Ride in Compact** — the real island never auto-expands: an active agent session (`Thinking`, `Working`, `Ready`, ...) keeps the **Compact pill** up, hugging its live content, until the turn ends. Needs-input and failure still get prominent treatment as auto-expanding **notification alert banners** (124px) that spring back after 3.5s.
-  - **Hover to Pop Out**: Bumping or hovering the top bezel pops the island down into the **Compact pill format** with organic Apple spring physics, showing the character face, liquid glass, and status. Leaving smoothly retracts it back into hidden.
+- **macOS- and iOS-inspired presentation lifecycle**:
+  - **Idle stays quiet**: Without agent activity, media, or a notification, hovering leaves the pill collapsed. Clicking the bar pill opens a compact Today card with the date, latest notification, Search, and Notifications; standalone Island keeps its system dashboard. With `auto_hide`, the standalone island can rest as a top-edge sensor strip.
+  - **Live Activities Ride in Compact** — an active agent session (`Thinking`, `Working`, `Ready`, ...) keeps the **Compact pill** up, hugging its live content, until the turn ends. Needs-input and failure get concise **notification alert banners** (96px) that spring back after 3.5s. An alert grows from the resting pill rather than leaving a second pill behind.
+  - **Hover for live content**: Hover reveals available agent, media, or notification content with organic spring physics; an empty pill does not pop out or show an Idle card.
   - **Click to Extend**: Clicking the pill extends it vertically and horizontally into the full **Expanded tall card** (320×154px). Clicking it again collapses it back to the pill or hidden. Tapping the media blob toggles playback.
   - **Press Swell**: Holding the pointer down swells the pill ~3% and it settles back on release — the Dynamic Island under the fingertip.
 - **Liquid Blob Split & Merge** — the signature Dynamic Island morphology. When an agent session and media playback are live at once, the compact pill **splits in two**: the agent blob narrows while the media blob pulls out, connected by a liquid bridge (a smooth-min fillet over both signed-distance fields) that thins and **snaps** as the separation spring extends. When one activity ends, the blobs **flow back and merge** into one pill.
@@ -21,7 +25,7 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 - **Dynamic Content-Based Sizing** — no rigid fixed widths; compact mode automatically scales to hug active content (scaling smoothly as multiple agent sessions or live media sessions activate).
 - **Media Player Card** — expanded mode features 64×64 rounded album art, track/artist typography, a bottom-aligned transport row with evenly spaced previous/play-pause/next controls, and a centered 4-bar equalizer. No timeline is shown because playback-position data is not available.
 - **Transient alert ownership** — fresh `needs_input`/`turn_failed` events and Windows toasts use a bounded queue. A user-action agent alert can temporarily preempt a passive toast; the toast resumes with a fresh visible lifetime. Repeated stable event IDs update rather than multiply banners. Each banner owns 3.5 s (agent) or 6 s (toast) only while it is actually in front. Clicking anywhere dismisses it immediately.
-- **Live timeout countdown** — a visible banner's remaining life drains on its own repaint tick (16 ms) instead of riding the bar's two-second metrics refresh, so the hairline reads as a timer rather than a stutter. The tick stops the frame a banner leaves the screen, so a pending-but-hidden alert costs nothing; the countdown repaints only the card, keeping the bar's cached side zones.
+- **Live timeout countdown** — a visible banner's subtle one-pixel lifetime line drains on its own repaint tick (16 ms) instead of riding the bar's two-second metrics refresh. The tick stops when the banner leaves, and the countdown repaints only the card.
 - **Windows toast forwarding** (`forward_toasts`, default on) — app notifications from Action Center ride the island as transient alert banners (app name plus the first text lines, 6 s). Needs notification-listener access (Settings → Privacy → Notifications); without it the watcher exits silently. Local-only: nothing leaves the machine. Pre-existing toasts never flood on startup — only new arrivals fire.
 - **Motion signatures** — motion stays purposeful: thinking dots bounce, Ready gets a brief 600 ms sparkle burst, failure shakes damped over 300 ms, and needs-input breathes. The animated face carries the working state without an additional orbit competing around it. Procedural motion follows the overlay monitor’s vertical blank through a dedicated DXGI clock. Idle frames do not continuously redraw, and reduced motion disables procedural effects.
 - **Triple-spring morphs** — expands bounce (`animation_ms`), collapses settle critically damped and quicker (`collapse_ms`), alert banners drop in fast (`alert_ms`). Three unseen alerts may wait behind the visible alert without consuming their timeout early.
@@ -32,7 +36,7 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 - **Auto theme** (`theme: "auto"`) — follows the Windows light/dark setting and updates on `WM_SETTINGCHANGE("ImmersiveColorSet")`. Dark mode uses cool-neutral glass at roughly 75% opacity, or opaque glass when transparency is disabled. System-accent tinting is applied only when "show accent color on Start and taskbar" is enabled (40% blend). Explicit `glass` overrides still win.
 - **Animated Termielle face** — the active state's first frame is decoded synchronously, then the remaining GIF frames stream into a bounded 96 px cache on face deadlines. Standalone idle faces run at 10 fps; the full-width native bar keeps its resting face still and animates only during active agent/media states. `face_animated: false` or reduced motion freezes the first frame.
 - **Agent states** — lifecycle events morph the pill; a short 1px marker along the top edge uses a restrained violet/green/amber/teal/red state palette.
-- **Click to expand/collapse** — `WM_LBUTTONUP` toggles manual expansion (idle only); hovering expands when `expand_on_hover` is set. Clicking the media element toggles play/pause.
+- **Click to expand/collapse** — `WM_LBUTTONUP` toggles manual expansion, including when idle; hovering expands only when `expand_on_hover` is set and content is available. Clicking the media element toggles play/pause.
 
 ## Modes
 
@@ -48,7 +52,7 @@ cargo run -p termielle-app --example render_review -- review-motion.bmp thinking
 ```
 
 States: `idle`, `thinking`, `working`, `ready`, `waiting`, `failed`, `media`,
-and `tasks`. Add `--compact` for the compact presentation. The default freezes
+`notification`, and `tasks`. Add `--compact` for the compact presentation. The default freezes
 motion; `--elapsed=N` samples the real spring/controller in 16 ms steps.
 Media and window data are synthetic. BMP output is composited over neutral gray;
 it does not simulate live wallpaper blur or prove real-time presentation cadence.
@@ -60,8 +64,9 @@ left, center, and right module zones. Clicking the center `termielle` module
 opens the focused Termielle popup, and clicking it again closes the popup.
 Escape or an outside click also closes it.
 
-With `expand_on_hover` on, dwelling over the pill opens that same popup: the
-bar's pill *is* the island, so hover reaches the state a click reaches. Both
+With `expand_on_hover` on and live content available, dwelling over the pill
+opens that same popup: the bar's pill *is* the island, so hover reaches the
+state a click reaches. Empty-state hover leaves it collapsed. Both
 edges are deferred - 300 ms to open, so a cursor crossing the strip does not
 throw the card open, and 500 ms to close, so the pointer can travel down into
 the card it just opened. A click that dismissed the card is not undone by the
@@ -71,9 +76,18 @@ Island keeps its own smaller hover step, so the two layouts differ here.
 The module shows the face when enabled, a consistent agent state label, and
 media metadata when a playing or paused media session is available. Media
 artwork and transport controls remain available after Pause so the user can
-resume playback. Workspace buttons select virtual desktops; the speaker
-toggles mute and the wheel adjusts volume. CPU, memory, battery, clock, and
-window title remain passive status modules.
+resume playback. The default left rail switches between open windows;
+`workspaces` can be configured instead for virtual desktops. The speaker
+toggles mute and the wheel adjusts volume. Network, battery, and the current
+window title remain passive readouts. CPU and memory are shown in Control
+Center by default and can be pinned to the strip from the tray menu.
+
+Changing the system output volume or mute state briefly replaces the resting
+center pill's label with a speaker, level track, and percentage (or “Muted”).
+Core Audio change notifications wake the metrics worker immediately, including
+changes made with media keys or Windows sound controls. The feedback clears
+1.5 seconds after the last change; startup does not show it. Alerts and expanded
+island cards take priority, and Control Center keeps its independent open state.
 
 Right-zone modules are a glyph plus its number and no label word: the icon
 names the metric, the number is the thing being read. The glyphs are
@@ -83,38 +97,82 @@ from a distance field, so they stay sharp at any scale and a new icon is one
 line of path data. `draw_icon` lives in `animation/icons.rs`.
 
 The bar keeps a fixed strip height while the focused Termielle popup opens
-below or above it. This is a persistent Waybar-style surface, not a macOS menu
-bar clone. The popup is a focused detail view; it does not duplicate the
-system telemetry already present in the bar.
+below or above it. This is a macOS-inspired status strip on Windows rather than
+a replacement for Windows' native taskbar. The popup is a focused detail view.
 
 ### Control panel
 
 Control Center is a menu-bar item in the right zone, between the status icons
-and the clock, as macOS has it. It opens the popup on the **control panel**
-body: the one surface where Termielle owns state end to end. It is live
-whether or not a card is open, and it is a toggle - one press opens the panel,
-the next hands the card back.
+and the clock, as macOS has it. Its panel drops from that icon independently
+of the centered notch/pill card. Either popover can be open while the other
+stays open, and each icon toggles only its own popover. An incoming island
+alert can expand beside an open Control Center without hiding its controls.
 
 It used to be a glyph inside the pill, ahead of the pill's own open/close hit.
 That made it unreachable the moment hovering the pill opened the card, and it
 could only ever mean "open", never close.
 
-- **Volume row** — the speaker mutes, the `−` and `+` steppers move the level
-  in steps of 5, and the wheel over the track adjusts it exactly like the
-  bar's speaker. The steppers emit an absolute level rather than a delta, so
-  the row can never drift from the target it shows.
-- **Termielle rows** — `Expand on hover`, `Termielle face`, and `Media` are
-  switches over Termielle's own config. They route through the *same*
-  mutation the tray menu uses (`apply_setting` in `main.rs`), so the panel and
-  the tray's checkmarks can never disagree about the same setting.
-- **System tray** — one row that opens Windows' own quick-settings flyout
-  (`Win+A`). Windows exposes no API for the rest of a Control Center's
-  contents — Wi-Fi, Bluetooth, AirDrop and Focus toggles, brightness, per-app
-  quick settings — so the panel delegates instead of faking them.
+- **Quick-control tiles** — Network and Bluetooth show live Windows status
+  when available; Focus and Display remain clearly labeled Settings links.
+  Clicking any tile opens its Windows Settings page. This unpackaged app does
+  not pretend to control radio state without permission.
+- **Sound card** — the speaker mutes, clicking the slider sets an absolute
+  level, and the wheel over it adjusts volume.
+- **Now Playing card** — shows the current media session with play/pause when
+  one exists; otherwise it says `Nothing playing` without an inactive button.
+- **System readouts** — CPU and memory remain available in the panel while
+  staying off the default strip.
+- **Windows Settings** — footer opens the Settings home page. The native
+  Windows taskbar and notification-area icons remain visible; this panel does
+  not replace the system tray. Termielle's own preferences remain in its tray
+menu.
+
+The tray menu's **Menu Bar Items** submenu pins or hides Network, Volume,
+Battery, CPU, and Memory. The clock and Control Center stay on the strip so
+their popovers remain reachable.
+
+### App launcher
+
+**Alt+Space** opens Termielle's Spotlight-style app launcher. The **Search**
+shortcut in Today and the replacement bar's Find button open the same window;
+neither invokes Windows Search. Type an app name, use **Up/Down** to select,
+then **Enter** to launch. Clicking a result also launches it. **Esc**, clicking
+outside, or pressing Alt+Space again dismisses it. Ctrl+A selects the query.
+
+Desktop and Store apps come from Windows' registered AppsFolder catalog,
+indexed on a background worker at startup and refreshed on opening after a
+minute. Filtering is entirely in-memory, with exact/prefix matches before fuzzy
+abbreviations; no file indexing, web search, query logging, or arbitrary command
+execution. Native text input supports normal editing and IME composition.
+Only visible results request icons, asynchronously; icon extraction never
+holds up app discovery, typing, or launching.
+
+The launcher is a separate focusable window, not another notch card. It follows
+the bar's colours and current monitor DPI without changing the island or Control
+Center's open/hover state. If another program owns Alt+Space, Termielle doesn't
+take it over: open the launcher from Today instead, or disable the conflicting
+program's shortcut. Windows' normal Win+S shortcut remains unchanged.
+
+### Recent notifications
+
+Clicking the clock opens a separate recent-notifications popover anchored to
+the clock. It keeps the latest four alerts observed by Termielle in memory,
+shows their source and local arrival time, and marks new arrivals with a small
+dot on the clock. A close button remains visible, and a full-width Clear All
+action appears when the list has items. Clear All affects only Termielle's
+recent list. It is
+not a mirror of the entire Windows Notification Center, and its history does
+not persist across restarts. The notification popover and Control Center
+replace each other; neither opens or closes the centered notch card.
+
+Outside dismissal checks the popup's own visible rectangle and its entry
+controls, not the full transparent overlay window. When a right popover and a
+manually opened notch are both open, shared Escape/outside dismissal closes the
+right popover first; a later dismissal can close the notch.
 
 The panel is a deliberate body, never a takeover: media, agent activity, and
-the task switcher keep their priority when they arrive, and closing the popup
-drops the panel with it, so the next open shows the card the user came for.
+the task switcher keep their own card, while the Control Center keeps its own
+panel and hit targets.
 
 
 ### Taskbar replacement mode
@@ -125,11 +183,12 @@ and the bar gains the affordances the shell used to own.
 
 **Replaced.** Five shell controls on the left, each sized to its label and
 each with its own hit target: **Start**, **Find** (search), **Task View**, the
-**system tray** overflow, and **Show Desktop**. Live application buttons for
+**Quick Settings**, and **Show Desktop**. Live application buttons for
 visible, non-cloaked windows sit next to them and activate the window. The
-clock module opens the shell clock flyout. Start, Find, Task View, the tray,
-and Show Desktop are the chords the taskbar itself uses (`Win`, `Win+S`,
-`Win+Tab`, `Win+A`, `Win+D`); the clock is the `ms-clock:` flyout. `shell:`
+clock module opens Termielle's recent notifications; Find opens the app launcher.
+Start, Task View,
+Quick Settings, and Show Desktop are the chords the taskbar itself uses
+(`Win`, `Win+Tab`, `Win+A`, `Win+D`). `shell:`
 namespace URIs are deliberately avoided — they open File Explorer windows
 instead of the surface the user asked for.
 
@@ -138,8 +197,7 @@ Start menu's own pin list, jump lists, and per-app "recent" entries; taskbar
 thumbnails and window previews on hover; right-click context menus on taskbar
 buttons (jump lists, pinned-app verbs, workspace rename, cascade windows);
 dragging windows onto or between desktops; the notification-area icons
-themselves — the control opens the shell's own overflow panel rather than
-drawing the icons; per-monitor secondary taskbars beyond the one bar this
+themselves — `Win+A` opens Quick Settings, not the icon overflow; per-monitor secondary taskbars beyond the one bar this
 process draws; taskbar auto-hide and peek behavior; and live badge counts on
 taskbar buttons. Virtual desktops are addressed by number, because the shell
 does not expose desktop names to a bar process.
@@ -147,7 +205,7 @@ does not expose desktop names to a bar process.
 **Layout rules.** The left zone is anchored to the same place in both modes,
 so nothing existing moves when replacement is turned on. Content is laid out
 from that anchor and dropped, in reverse priority, when the center pill runs
-out of room: window title first, then workspaces, then application buttons,
+out of room: window title first, then the apps or workspaces rail,
 and the shell controls last to go. Anything dropped is not painted and gets
 no hit target — a narrow bar never leaves an invisible live control under the
 pill, and never silently shifts the pill or the right zone.
@@ -191,7 +249,7 @@ does not change Windows display settings.
 | `island` | pill, all corners rounded | top-center, `y = y_offset` | floating Dynamic Island |
 
 The tray switches layouts live. Classic, Notch, and Island are explicit
-alternate surfaces; they do not inherit the Bar's click-only popup behavior.
+alternate surfaces; live-content hover may use a smaller compact step than Bar.
 
 ## Customization
 
@@ -239,12 +297,14 @@ remain explicit choices.
 ### Interactivity
 
 - **Bar module**: the persistent bar is always visible; the Termielle module
-  opens its focused popup only on click.
-- **Standalone Island/Notch**: hover and click retain their compact-to-expanded
-  behavior when enabled.
+  opens its focused popup on click. Empty-state hover leaves the pill collapsed.
+- **Left apps rail**: shows up to six open windows; click an icon to focus it.
+  Replace `"apps"` with `"workspaces"` in `bar.modules_left` to use virtual desktops instead.
+- **Standalone Island/Notch**: hover reveals live content when enabled; empty
+  hover stays collapsed, and clicking opens the dashboard.
 - **Alerts**: fresh agent input/failure events and Windows toasts appear as
   dismissible transient banners. Clicking anywhere on the banner dismisses it
-  immediately; the `×` is a visual affordance, not a separate-only action.
+  immediately. The banner shows the source, a clear headline, and a subtle lifetime indicator.
 - **Controls**: transparent pixels pass through, while visible module controls
   use explicit hit targets. Media transport hit targets are inset from their
   painted circles and share the same DPI-scaled geometry as the glyphs.
@@ -302,6 +362,7 @@ Preset files ship in `themes/`:
 
 - `liquid-dark` — `[30,22,18,190]` (BGRA), border 24, highlight 42, shadow 48 (cool neutral dark default)
 - `midnight` — navy `[12,18,32,200]`, stronger shadow
+- `catppuccin-macchiato` — dark plum glass with a grouped apps rail, focused-window context, and padded mauve status capsules with 18px vector glyphs in Bar layout; inspired by SketchyBar showcase layouts. A workspace rail remains optional.
 - `light` — `[245,245,245,160]` for dark wallpapers
 - `transparent` — `[30,30,30,70]`, blur 0
 - `auto` — follows Windows light/dark

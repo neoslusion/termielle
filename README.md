@@ -12,6 +12,13 @@ output are ever captured.
 The bar is a native Windows surface inspired by Waybar's information layout;
 Termielle does not run Waybar, parse Waybar JSON/CSS, or use GTK/Wayland.
 
+The current desktop refinements add a Macchiato menu bar, independent Control
+Center and activity-pill cards, recent notifications, volume feedback, and an
+**Alt+Space app launcher** that does not invoke Windows Search. See the
+[development handoff](docs/development-handoff.md) for delivered features,
+decisions, validation, and local redeployment; the
+[island and bar guide](docs/island.md) covers detailed configuration and usage.
+
 Any other agent CLI works too: the emitter's `--source` accepts any short
 lowercase identifier and its session extraction recognizes every common
 identifier key, so wiring up a new agent is pure configuration, following the
@@ -135,16 +142,17 @@ asset is missing or undecodable.
 ## Rendering and tray
 
 The default surface is a Waybar-style persistent system bar with a compact
-Termielle module. The module is click-only: clicking it opens a focused popup
-for agent and media detail; hovering never changes the bar height. Workspace
-buttons and the speaker are controls; CPU, memory, battery, clock, and the
-window title are passive status modules.
+Termielle module. Clicking it opens a focused popup for agent and media detail;
+hovering opens it only when content is available. The default apps rail switches
+open windows, and the speaker is a control. The default right side keeps
+Network, Volume, Battery, Control Center, and the clock; CPU and Memory live
+in Control Center unless pinned to the strip.
 
 The overlay composites its layered window with per-pixel alpha via
 `UpdateLayeredWindow` by default. `--render color-key` (or
 `{"render": "color_key"}` in the config file) falls back to GDI color-keying
 for display drivers whose layered DIB redirection renders black. The tray menu
-switches layout, theme, position, and widget state; it marks the active choices
+switches layout, theme, position, widget state, and pinned menu-bar items; it marks the active choices
 and offers `Restart` and `Exit`. `Exit` terminates with code 0 so the external
 watchdog does not relaunch it.
 
