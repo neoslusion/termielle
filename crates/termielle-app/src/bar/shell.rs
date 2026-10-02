@@ -1,12 +1,13 @@
 //! Windows shell affordances used by full taskbar-replacement mode.
 //!
 //! These actions reuse shell-owned surfaces and hotkeys. Termielle does not
-//! reimplement the Start menu, search UI, or notification area.
+//! reimplement the Start menu or Windows Quick Settings. Search is owned by
+//! the app's launcher, not the shell hotkey handoff.
 
 use std::process::Command;
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_A, VK_D, VK_LWIN, VK_S, VK_TAB, keybd_event,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_A, VK_D, VK_LWIN, VK_TAB, keybd_event,
 };
 
 /// A taskbar-equivalent shell action.
@@ -15,9 +16,14 @@ pub enum ShellAction {
     Start,
     Search,
     TaskView,
-    SystemTray,
+    QuickSettings,
     ShowDesktop,
     Clock,
+    Network,
+    Bluetooth,
+    Focus,
+    Display,
+    Settings,
 }
 
 impl ShellAction {
@@ -33,9 +39,14 @@ impl ShellAction {
             0 => Some(Self::Start),
             1 => Some(Self::Search),
             2 => Some(Self::TaskView),
-            3 => Some(Self::SystemTray),
+            3 => Some(Self::QuickSettings),
             4 => Some(Self::ShowDesktop),
             5 => Some(Self::Clock),
+            6 => Some(Self::Network),
+            7 => Some(Self::Bluetooth),
+            8 => Some(Self::Focus),
+            9 => Some(Self::Display),
+            10 => Some(Self::Settings),
             _ => None,
         }
     }
@@ -45,9 +56,14 @@ impl ShellAction {
             Self::Start => "Start",
             Self::Search => "Find",
             Self::TaskView => "View",
-            Self::SystemTray => "Tray",
+            Self::QuickSettings => "Quick",
             Self::ShowDesktop => "Desk",
             Self::Clock => "Clock",
+            Self::Network => "Network",
+            Self::Bluetooth => "Bluetooth",
+            Self::Focus => "Focus",
+            Self::Display => "Display",
+            Self::Settings => "Settings",
         }
     }
 
@@ -57,7 +73,7 @@ impl ShellAction {
         Self::Start,
         Self::Search,
         Self::TaskView,
-        Self::SystemTray,
+        Self::QuickSettings,
         Self::ShowDesktop,
     ];
 
@@ -78,7 +94,7 @@ fn open_shell_uri(uri: &str) {
 }
 
 /// Taps one key with the Windows key held: the chords the taskbar itself
-/// uses. Windows 11's Start, Search, Task View, tray, and Show Desktop are
+/// uses. Windows 11's Start, Task View, Quick Settings, and Show Desktop are
 /// shell-owned flyouts, not shell namespaces — `shell:` URIs open File
 /// Explorer windows instead of the surface the user asked for.
 fn tap_with_win(key: u8) {
@@ -106,12 +122,17 @@ fn tap(key: u8) {
 pub fn activate(action: ShellAction) {
     match action {
         ShellAction::Start => tap(VK_LWIN.0 as u8),
-        ShellAction::Search => tap_with_win(VK_S.0 as u8),
+        ShellAction::Search => {}
         ShellAction::TaskView => tap_with_win(VK_TAB.0 as u8),
-        ShellAction::SystemTray => tap_with_win(VK_A.0 as u8),
+        ShellAction::QuickSettings => tap_with_win(VK_A.0 as u8),
         ShellAction::ShowDesktop => tap_with_win(VK_D.0 as u8),
         // The clock flyout is a real shell URI, not a key chord.
         ShellAction::Clock => open_shell_uri("ms-clock:"),
+        ShellAction::Network => open_shell_uri("ms-settings:network-status"),
+        ShellAction::Bluetooth => open_shell_uri("ms-settings:bluetooth"),
+        ShellAction::Focus => open_shell_uri("ms-settings:quiethours"),
+        ShellAction::Display => open_shell_uri("ms-settings:display"),
+        ShellAction::Settings => open_shell_uri("ms-settings:"),
     }
 }
 
@@ -122,6 +143,15 @@ mod tests {
     #[test]
     fn shell_hit_ids_round_trip() {
         for action in ShellAction::ALL {
+            assert_eq!(ShellAction::from_hit(action.hit_id()), Some(action));
+        }
+        for action in [
+            ShellAction::Network,
+            ShellAction::Bluetooth,
+            ShellAction::Focus,
+            ShellAction::Display,
+            ShellAction::Settings,
+        ] {
             assert_eq!(ShellAction::from_hit(action.hit_id()), Some(action));
         }
         assert_eq!(ShellAction::from_hit(0), None);

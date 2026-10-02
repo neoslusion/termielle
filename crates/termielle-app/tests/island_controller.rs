@@ -37,6 +37,14 @@ fn island_140_320() -> IslandConfig {
     }
 }
 
+fn visible_idle_island() -> IslandConfig {
+    IslandConfig {
+        auto_hide: false,
+        minimal_width: 140,
+        ..island_140_320()
+    }
+}
+
 #[test]
 fn switcher_hover_repaints_on_entry_transfer_and_exit() {
     use termielle_app::tasks::{TaskIcon, WorkerUpdate};
@@ -193,24 +201,28 @@ fn classic_controller_still_uses_fallback_size() {
 }
 
 #[test]
-fn hover_pops_out_to_pill_and_leave_collapses() {
+fn empty_hover_stays_hidden_and_click_opens() {
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
     // Idle with nothing live rests hidden.
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 2);
 
-    // Hover pops it out in pill format!
-    assert!(c.set_hover(true, 10000));
-    let actions = c.on_timer(10050);
-    assert!(actions.present_frame);
-    assert!(c.current_frame().height > 2);
+    assert!(!c.set_hover(true, 10000));
     c.on_timer(10160);
     assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 36);
+    assert_eq!(c.current_frame().height, 2);
 
-    // Leaving collapses back to hidden (no live sessions).
-    assert!(c.set_hover(false, 10200));
+    assert_eq!(
+        c.handle_click(70, 1, 10200),
+        termielle_app::app::ClickOutcome::Expanded
+    );
     c.on_timer(10360);
+    assert_eq!(c.current_frame().height, 154);
+    assert_eq!(
+        c.handle_click(70, 18, 10400),
+        termielle_app::app::ClickOutcome::Collapsed
+    );
+    c.on_timer(10560);
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 2);
 }
@@ -228,15 +240,12 @@ fn hover_is_ignored_when_expand_on_hover_is_off() {
 #[test]
 fn click_extends_to_tall_card_and_second_click_collapses() {
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
-    // Hover pops out into pill format
-    c.set_hover(true, 10000);
-    c.on_timer(10160);
     assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 36);
+    assert_eq!(c.current_frame().height, 2);
 
     // Click to extend vertically and horizontally into tall card!
     assert_eq!(
-        c.handle_click(70, 18, 10200),
+        c.handle_click(70, 1, 10200),
         termielle_app::app::ClickOutcome::Expanded
     );
     c.on_timer(10360);
@@ -248,7 +257,7 @@ fn click_extends_to_tall_card_and_second_click_collapses() {
     assert_eq!(c.current_frame().width, 320);
     assert_eq!(c.current_frame().height, 154);
 
-    // Second click collapses back to pill format!
+    // Second click collapses back to hidden.
     assert_eq!(
         c.handle_click(70, 18, 10500),
         termielle_app::app::ClickOutcome::Collapsed
@@ -278,13 +287,12 @@ fn set_task_update_repaints_only_when_visible() {
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
     assert!(!c.set_task_update(update()));
 
-    // With music widget enabled and hovered (pill format visible), media arrival repaints.
+    // With music widget enabled, media arrival reveals and repaints the pill.
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
-    c.set_hover(true, 10000);
-    c.on_timer(10160);
-    assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 36);
     assert!(c.set_task_update(update()));
+    c.on_timer(10160);
+    assert_eq!(c.current_frame().height, 36);
+    assert!(!c.set_task_update(update()));
 }
 
 #[test]
@@ -295,10 +303,15 @@ fn island_without_face_widget_still_renders() {
     // Idle rests hidden even without a face.
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 2);
-    assert!(c.set_hover(true, 10000));
+    assert!(!c.set_hover(true, 10000));
+    assert_eq!(c.current_frame().height, 2);
+    assert_eq!(
+        c.handle_click(70, 1, 10000),
+        termielle_app::app::ClickOutcome::Expanded
+    );
     c.on_timer(10160);
-    assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 36);
+    assert_eq!(c.current_frame().width, 320);
+    assert_eq!(c.current_frame().height, 154);
 }
 
 #[test]
@@ -369,12 +382,9 @@ fn animated_face_repaints_on_its_own_deadline() {
     let dir = tempfile::tempdir().unwrap();
     write_gif(dir.path(), "standby.gif", &[(4, 0), (4, 1), (4, 2)]);
     let catalog = AssetCatalog::new(vec![dir.path().to_path_buf()]);
-    let mut cfg = island_140_320();
+    let mut cfg = visible_idle_island();
     cfg.face_animated = true;
     let mut c = Controller::new_with_island(5000, 60000, catalog, false, None, cfg);
-    // Pop out into pill format via hover
-    c.set_hover(true, 10000);
-    c.on_timer(10160);
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 36);
 
@@ -405,14 +415,8 @@ fn static_face_never_advances() {
 
 #[test]
 fn island_morphs_height_and_width_on_expand() {
-    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
-    // Starts hidden
-    assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 2);
-
-    // Hover pops out to pill format
-    assert!(c.set_hover(true, 10000));
-    c.on_timer(10160);
+    let mut c =
+        Controller::new_with_island(5000, 60000, catalog(), false, None, visible_idle_island());
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 36);
 
@@ -434,11 +438,10 @@ fn island_morphs_height_and_width_on_expand() {
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 36);
 
-    // Leave collapses both width and height to hidden
-    assert!(c.set_hover(false, 10600));
+    assert!(!c.set_hover(false, 10600));
     c.on_timer(10760);
     assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 2);
+    assert_eq!(c.current_frame().height, 36);
 }
 
 #[test]
@@ -453,7 +456,7 @@ fn island_notification_alert_expands_and_expires() {
 
     // Island auto-expands in both dimensions to show the notification alert
     assert!(c.current_frame().width >= 320);
-    assert_eq!(c.current_frame().height, 124); // Alert banner layout is 124px tall
+    assert_eq!(c.current_frame().height, 96);
 
     // After 3500ms, alert expires and if state goes idle, collapses back
     c.on_timer(13600);
@@ -491,6 +494,89 @@ fn bar_alert_click_returns_to_the_bar() {
         termielle_app::app::ClickOutcome::AlertDismiss
     );
     assert_eq!(c.current_frame().height, 36);
+}
+
+#[test]
+fn bar_alert_grows_from_the_resting_pill_and_returns() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.face_animated = false;
+    let mut controller = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    controller.set_bar_width(1920);
+    let pill_center = (960usize, 18usize);
+    let alpha_at_pill = |controller: &Controller| {
+        let frame = controller.current_frame();
+        frame.pixels_pbgra[(pill_center.1 * frame.width as usize + pill_center.0) * 4 + 3]
+    };
+    assert!(alpha_at_pill(&controller) > 0);
+
+    controller.handle_event(event("s1", EventKind::NeedsInput, 10_000), 10_000);
+    for tick in (10_016..10_800).step_by(16) {
+        controller.on_timer(tick);
+    }
+    assert!(controller.current_frame().height > 36);
+    assert!(
+        alpha_at_pill(&controller) > 0,
+        "the alert stays attached to the pill"
+    );
+
+    controller.handle_click(960, 80, 10_800);
+    for tick in (10_816..11_600).step_by(16) {
+        controller.on_timer(tick);
+    }
+    assert_eq!(controller.current_frame().height, 36);
+    assert!(
+        alpha_at_pill(&controller) > 0,
+        "the pill returns after dismissal"
+    );
+}
+
+#[test]
+fn bar_alert_and_control_center_keep_separate_surfaces() {
+    let mut island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    island.bar.height = 36;
+    island.face_animated = false;
+    let mut controller = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    controller.set_bar_width(1536);
+    let control_center = control_center_point(&controller);
+    controller.handle_click(control_center.0, control_center.1, 1_000);
+    for tick in (1_016..1_800).step_by(16) {
+        controller.on_timer(tick);
+    }
+    assert!(controller.is_panel_open());
+
+    controller.handle_event(event("s1", EventKind::NeedsInput, 2_000), 2_000);
+    for tick in (2_016..2_800).step_by(16) {
+        controller.on_timer(tick);
+    }
+    let frame = controller.current_frame();
+    let alpha = |x: usize, y: usize| frame.pixels_pbgra[(y * frame.width as usize + x) * 4 + 3];
+    assert!(alpha(768, 18) > 0, "the alert grows from the center pill");
+    assert!(alpha(768, 80) > 0, "the alert stays centered on the notch");
+    assert!(
+        alpha(control_center.0 as usize, 80) > 0,
+        "Control Center stays visible beside the alert"
+    );
+    assert!(controller.is_panel_open());
+    assert!(
+        controller
+            .click_regions()
+            .iter()
+            .any(|(_, x, y, _, _)| *x > 1000 && *y > 120),
+        "Control Center controls remain clickable during the alert"
+    );
+
+    controller.on_timer(6_000);
+    assert!(controller.is_panel_open());
+    let frame = controller.current_frame();
+    let center_alpha = frame.pixels_pbgra[(80 * frame.width as usize + 768) * 4 + 3];
+    assert_eq!(center_alpha, 0, "the expired alert leaves no center ghost");
 }
 
 #[test]
@@ -811,7 +897,7 @@ fn duplicate_critical_events_do_not_requeue_an_alert() {
         let mut c =
             Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
         c.handle_event(event("s1", kind, 10000), 10000);
-        assert_eq!(c.current_frame().height, 124);
+        assert_eq!(c.current_frame().height, 96);
         assert_eq!(
             c.handle_click(10, 10, 10100),
             termielle_app::app::ClickOutcome::AlertDismiss
@@ -877,9 +963,8 @@ fn same_size_state_changes_crossfade_content_without_container_restart() {
 
 #[test]
 fn press_swell_grows_the_pill_and_release_restores_it() {
-    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
-    c.set_hover(true, 10000);
-    let _ = c.on_timer(10160);
+    let mut c =
+        Controller::new_with_island(5000, 60000, catalog(), false, None, visible_idle_island());
     assert_eq!(c.current_frame().width, 140);
     assert_eq!(c.current_frame().height, 36);
 
@@ -899,23 +984,19 @@ fn press_swell_grows_the_pill_and_release_restores_it() {
 #[test]
 fn notch_material_is_true_black_island_is_glass() {
     // Attached notch: opaque true black, fused with the bezel.
-    let mut notch = island_140_320();
+    let mut notch = visible_idle_island();
     notch.layout = IslandLayout::Notch;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, notch);
-    c.set_hover(true, 10000);
-    let _ = c.on_timer(10160);
     let frame = c.current_frame();
-    let idx = ((18 * frame.width + 70) * 4) as usize;
+    let idx = ((18 * frame.width + 20) * 4) as usize;
     assert_eq!(frame.pixels_pbgra[idx..idx + 4], [0, 0, 0, 255]);
 
     // Floating island: glass, not black.
-    let mut island = island_140_320();
+    let mut island = visible_idle_island();
     island.layout = IslandLayout::Island;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
-    c.set_hover(true, 10000);
-    let _ = c.on_timer(10160);
     let frame = c.current_frame();
-    let idx = ((18 * frame.width + 70) * 4) as usize;
+    let idx = ((18 * frame.width + 20) * 4) as usize;
     let pixel = &frame.pixels_pbgra[idx..idx + 4];
     assert!(pixel[3] > 150);
     assert!(pixel[0] + pixel[1] + pixel[2] > 30, "glass tint must show");
@@ -990,7 +1071,9 @@ fn island_anchor_scales_y_offset_with_dpi() {
         Some((false, 0)),
         "hidden sensor stays on the bezel"
     );
-    c.set_hover(true, 0);
+    assert!(!c.set_hover(true, 0));
+    assert_eq!(c.island_anchor(), Some((false, 0)));
+    c.toggle_expand(0);
     assert_eq!(c.island_anchor(), Some((false, 12)));
     c.set_dpi_scale(2.0);
     assert_eq!(c.island_anchor(), Some((false, 24)));
@@ -1076,7 +1159,7 @@ fn critical_agent_alert_yields_back_to_a_deferred_system_toast() {
     );
     assert_eq!(
         c.current_frame().height,
-        124,
+        96,
         "the preempted system toast must resume in front"
     );
 }
@@ -1102,7 +1185,7 @@ fn alert_freshness_boundary_still_banners() {
     c.handle_event(event("s1", EventKind::NeedsInput, 10000), 70000);
     c.on_timer(70200);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
 }
 
 #[test]
@@ -1113,7 +1196,7 @@ fn alert_queue_plays_second_banner_after_first_expires() {
     c.handle_event(event("s2", EventKind::NeedsInput, 10400), 10400);
     c.on_timer(10600);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
     let first = c.current_frame().pixels_pbgra.clone();
 
     // Past the first banner's 3.5 s life the second takes over instead of
@@ -1121,7 +1204,7 @@ fn alert_queue_plays_second_banner_after_first_expires() {
     c.on_timer(13600);
     c.on_timer(13700);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
     assert_ne!(
         c.current_frame().pixels_pbgra,
         first,
@@ -1146,11 +1229,11 @@ fn queued_alert_timeout_starts_when_it_reaches_the_front() {
     // The first banner owns the screen until 13.5 s. The second then receives
     // its own full 3.5 s lifetime rather than silently aging out in queue.
     c.on_timer(13600);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
     c.on_timer(16400);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
     c.on_timer(16900);
-    assert_eq!(c.current_frame().height, 124);
+    assert_eq!(c.current_frame().height, 96);
     c.on_timer(17500);
     assert_eq!(c.current_frame().height, 36);
 }
@@ -1160,12 +1243,11 @@ fn collapse_settles_on_its_own_faster_timing() {
     // settled 200 ms later, which the shared slow spring could never do.
     // No agent events: NeedsInput would raise its own alert card and hide
     // the manual-expansion target this measures.
-    let mut cfg = island_140_320();
+    let mut cfg = visible_idle_island();
     cfg.animation_ms = 500;
     cfg.collapse_ms = 50;
     cfg.alert_ms = 50;
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, cfg);
-    c.set_hover(true, 10000);
     for t in (10000..12000).step_by(50) {
         c.on_timer(t);
     }
@@ -1189,7 +1271,7 @@ fn collapse_settles_on_its_own_faster_timing() {
         c.on_timer(t);
     }
     assert_eq!(c.current_frame().width, 140);
-    assert_eq!(c.current_frame().height, 2);
+    assert_eq!(c.current_frame().height, 36);
 }
 
 #[test]
@@ -1364,8 +1446,8 @@ fn bar_layout_sizing_and_interaction() {
     let (exp_w, exp_h) = c.target_size(termielle_core::VisualState::Idle);
     assert_eq!(exp_w, 1920);
     assert_eq!(
-        exp_h, 118,
-        "agent-only popup includes a transparent six-pixel breathing gap"
+        exp_h, 206,
+        "Today popup includes a transparent six-pixel breathing gap"
     );
 
     // Settle spring
@@ -1501,6 +1583,7 @@ fn bar_layout_click_dispatch() {
         ..Default::default()
     };
     island.bar.height = 36;
+    island.bar.modules_left = vec!["workspaces".into(), "window".into()];
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.set_bar_width(1920);
     c.set_bar_metrics(
@@ -1542,6 +1625,7 @@ fn right_metric_damage_preserves_left_pixels_and_workspace_hits() {
         ..Default::default()
     };
     island.bar.height = 36;
+    island.bar.modules_left = vec!["workspaces".into(), "window".into()];
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.set_bar_width(1920);
     c.set_bar_metrics(
@@ -1664,12 +1748,12 @@ fn bar_module_list_gates_volume_hit() {
     island2.bar.modules_right = vec!["clock".to_string()];
     c.set_island_config(island2, 1100);
     assert!(!c.volume_at(1896, 18));
-    // The clock module owns its own hit now: it opens the shell clock
-    // flyout, so the same point resolves to that action, not to nothing.
+    // The clock opens recent notifications rather than the sound control.
     assert_eq!(
         c.handle_click(1896, 18, 1200),
-        termielle_app::app::ClickOutcome::Shell(termielle_app::bar::shell::ShellAction::Clock)
+        termielle_app::app::ClickOutcome::PanelToggled
     );
+    assert!(c.is_notification_center_open());
 }
 
 /// Replacement-mode bar: the shell controls each resolve to their own Windows
@@ -1786,12 +1870,8 @@ fn left_zone_drops_overflow_instead_of_crossing_the_center_pill() {
     );
 }
 
-/// The pill's panel glyph opens the popup on the panel body, and the popup's
-/// own click closes the popup and hands the next open back to the default
-/// card.
-/// The pill's panel glyph opens the popup on the panel body, and the popup's
-/// own click closes the popup and hands the next open back to the default
-/// card.
+/// The strip's Control Center entry toggles its own panel while the pill
+/// retains its own click behavior.
 #[test]
 fn strip_control_center_toggles_the_panel() {
     use termielle_app::app::ClickOutcome;
@@ -1827,6 +1907,12 @@ fn strip_control_center_toggles_the_panel() {
         ClickOutcome::PanelToggled,
         "the strip entry must close the panel it opened, as a panel"
     );
+    let frame = c.current_frame();
+    let panel_alpha = frame.pixels_pbgra[(80 * frame.width as usize + 1800) * 4 + 3];
+    assert!(
+        panel_alpha > 0,
+        "the panel retracts rather than disappearing instantly"
+    );
     for tick in (1500..2100).step_by(16) {
         c.on_timer(tick);
     }
@@ -1836,7 +1922,7 @@ fn strip_control_center_toggles_the_panel() {
         "the second press of the strip entry closes the panel"
     );
 
-    // Open it again, then hand the card back to the pill.
+    // Open it again, then open the island without dismissing the panel.
     assert_eq!(
         c.handle_click(control_center_point(&c).0, control_center_point(&c).1, 2200),
         ClickOutcome::PanelToggled
@@ -1846,14 +1932,11 @@ fn strip_control_center_toggles_the_panel() {
     }
     assert!(c.current_frame().height > 120, "the panel is open again");
 
-    // The pill is the island's own control. Pressing it while the panel is up
-    // is the island's business, and it must not reach across and dismiss the
-    // panel: the panel is only ever closed by the panel.
-    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::None);
+    assert_eq!(c.handle_click(960, 18, 2700), ClickOutcome::Expanded);
     assert!(c.is_panel_open(), "the pill must not dismiss the panel");
     assert!(
-        !c.is_manually_expanded(),
-        "and the pill must not open its own card either"
+        c.is_manually_expanded(),
+        "the pill must still open its own card"
     );
 }
 
@@ -1903,14 +1986,17 @@ fn the_panel_is_a_surface_of_its_own() {
         "hovering the pill must not close a separate panel"
     );
 
-    // The pill does not dismiss the panel. It used to, which is the coupling
-    // this pair of surfaces is supposed to be free of: one surface's control
-    // was another's off switch.
-    assert_eq!(c.handle_click(pill.0, pill.1, 5000), ClickOutcome::None);
+    assert_eq!(c.handle_click(pill.0, pill.1, 5000), ClickOutcome::Expanded);
     assert!(c.is_panel_open(), "the pill must not dismiss the panel");
+    assert!(c.is_manually_expanded());
+    assert!(c.point_over_open_popup(pill));
+    assert_eq!(
+        c.handle_click(pill.0, pill.1, 5_050),
+        ClickOutcome::Collapsed
+    );
     assert!(
         !c.is_manually_expanded(),
-        "the island's card must stay shut: two surfaces, not a swap"
+        "the pill only closes its own card"
     );
 
     // The panel is dismissed the way a panel is: its own key, which is the one
@@ -2004,6 +2090,17 @@ mod surfaces_are_independent {
     fn the_island_keeps_hovering_across_the_panels_open_period() {
         let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
         c.set_bar_width(1536);
+        c.set_task_update_at(
+            termielle_app::tasks::WorkerUpdate {
+                media: Some(termielle_app::tasks::MediaInfo {
+                    title: "Test song".into(),
+                    playing: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            0,
+        );
         let entry = control_center_point(&c);
 
         c.handle_click(entry.0, entry.1, 1_000);
@@ -2033,7 +2130,7 @@ mod surfaces_are_independent {
     /// Opening the panel dismisses the island through the island's own close,
     /// and the island is left at rest rather than half-torn-down.
     #[test]
-    fn opening_the_panel_leaves_the_island_at_rest() {
+    fn opening_and_closing_the_panel_preserves_the_island_card() {
         let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, bar());
         c.set_bar_width(1536);
         let (_, px, py, pw, ph) = c
@@ -2044,7 +2141,6 @@ mod surfaces_are_independent {
             .expect("the pill installs its own hit");
         let pill = (px + pw as i32 / 2, py + ph as i32 / 2);
 
-        // Open the island's card, then open the panel over it.
         c.handle_click(pill.0, pill.1, 1_000);
         assert!(c.is_manually_expanded(), "the pill opens the island's card");
         let entry = control_center_point(&c);
@@ -2054,20 +2150,63 @@ mod surfaces_are_independent {
         );
         assert!(c.is_panel_open());
         assert!(
-            !c.is_manually_expanded(),
-            "one window, one card: opening the panel dismisses the island"
+            c.is_manually_expanded(),
+            "opening Control Center must not dismiss the island"
         );
         settle(&mut c, 1_200, 1_800);
+        assert!(
+            c.click_regions()
+                .iter()
+                .any(|(_, x, y, _, _)| *x > pill.0 + 180 && *y > 36),
+            "the Control Center must remain interactive beside the island"
+        );
+        let frame = c.current_frame();
+        let alpha = |x: usize| frame.pixels_pbgra[(80 * frame.width as usize + x) * 4 + 3];
+        assert!(alpha(pill.0 as usize) > 0, "the island card stays visible");
+        assert!(
+            alpha(entry.0 as usize) > 0,
+            "the Control Center stays visible beside it"
+        );
+        assert!(
+            !c.point_over_notch_surface_is(entry),
+            "the Control Center is outside the island's hover surface"
+        );
 
-        // And the reverse: the panel is dismissed by the shared key, and the
-        // island stays shut instead of being handed the panel's space.
         c.collapse_if_expanded(2_000);
         settle(&mut c, 2_000, 2_600);
         assert!(!c.is_panel_open());
         assert!(
-            !c.is_manually_expanded(),
-            "dismissing the panel must not open the island's card"
+            c.is_manually_expanded(),
+            "dismissing the panel must leave the island's card alone"
         );
+    }
+
+    #[test]
+    fn bottom_bar_keeps_both_popovers_attached_to_the_strip() {
+        let mut island = bar();
+        island.bar.position = termielle_core::BarPosition::Bottom;
+        let mut controller =
+            Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+        controller.set_bar_width(1536);
+        let pill = controller
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+            .map(|(_, x, y, w, h)| (x + *w as i32 / 2, y + *h as i32 / 2))
+            .expect("pill hit region");
+        controller.handle_click(pill.0, pill.1, 1_000);
+        settle(&mut controller, 1_000, 1_600);
+        let entry = control_center_point(&controller);
+        controller.handle_click(entry.0, entry.1, 1_600);
+        settle(&mut controller, 1_600, 2_200);
+
+        let frame = controller.current_frame();
+        let bar_y = frame.height as usize - 36;
+        let alpha = |x: usize, y: usize| frame.pixels_pbgra[(y * frame.width as usize + x) * 4 + 3];
+        assert!(alpha(pill.0 as usize, bar_y - 30) > 0);
+        assert!(alpha(entry.0 as usize, bar_y - 30) > 0);
+        assert!(controller.point_over_notch_surface_is((pill.0, (bar_y - 30) as i32)));
+        assert!(!controller.point_over_notch_surface_is((entry.0, (bar_y - 30) as i32)));
     }
 
     /// The island's "is the pointer over me" test must not be widened by the
@@ -2307,16 +2446,16 @@ fn the_panel_hangs_from_the_control_center_icon() {
     for tick in (1000..1400).step_by(16) {
         c.on_timer(tick);
     }
-    let (_, row_x, _, row_w, _) = c
+    let (_, tile_x, _, tile_w, _) = c
         .click_regions()
         .iter()
-        .find(|(id, ..)| *id == termielle_app::app::HIT_PANEL_TOGGLE_BASE - 2)
+        .find(|(id, ..)| *id == termielle_app::bar::shell::ShellAction::Network.hit_id())
         .copied()
-        .expect("the open panel installs its rows");
-    let card_left = row_x - 18;
-    let card_centre = card_left + (row_w / 2) as i32;
+        .expect("the open panel installs its quick controls");
+    let card_left = tile_x - 16;
+    let card_centre = card_left + tile_w as i32 + 20;
     assert!(
-        (card_centre - icon_centre).abs() < row_w as i32,
+        (card_centre - icon_centre).abs() < tile_w as i32,
         "the panel should hang from the icon: card centre {card_centre}, icon {icon_centre}"
     );
     assert!(
@@ -2325,14 +2464,13 @@ fn the_panel_hangs_from_the_control_center_icon() {
     );
 }
 
-/// The volume row is an absolute level, a wheel target, and a mute button, and
-/// each Termielle row names the setting it owns. Windows' own quick settings
-/// stay delegated to the shell.
+/// Quick controls hand off to the matching Windows settings pages. Sound
+/// controls own live volume while the native taskbar and tray remain intact.
 #[test]
-fn panel_rows_drive_the_level_and_name_their_settings() {
+fn panel_quick_controls_and_sound_targets_work() {
     use termielle_app::app::ClickOutcome;
-    use termielle_app::app::PanelToggle;
     use termielle_app::bar::metrics::Snapshot;
+    use termielle_app::bar::shell::ShellAction;
     use termielle_app::bar::volume::VolumeSnapshot;
 
     let mut island = IslandConfig {
@@ -2366,59 +2504,281 @@ fn panel_rows_drive_the_level_and_name_their_settings() {
     // instead: a hand-computed position that misses reports `None` or, worse,
     // a different control's outcome, and the test would pass for the wrong
     // reason.
+    let regions = c.click_regions().to_vec();
     let region = |id: isize| {
-        c.click_regions()
+        regions
             .iter()
             .find(|(found, ..)| *found == id)
             .copied()
             .unwrap_or_else(|| panic!("frame must install region {id}"))
     };
-    let card_top = 36 + 6;
-    let row = |index: i32| card_top + 40 + 36 * index + 14;
-    let (_, down_x, _, _, _) = region(termielle_app::app::HIT_PANEL_VOLUME_DOWN);
-    let (_, up_x, _, _, _) = region(termielle_app::app::HIT_PANEL_VOLUME_UP);
-    let down = down_x + 7;
-    let up = up_x + 7;
-    // A panel row's toggle sits at the card's pad, so it locates the card.
-    let (_, toggle_x, _, _, _) = region(termielle_app::app::HIT_PANEL_TOGGLE_BASE - 2);
-    let card_left = toggle_x - 18;
+    for action in [
+        ShellAction::Network,
+        ShellAction::Bluetooth,
+        ShellAction::Focus,
+        ShellAction::Display,
+        ShellAction::Settings,
+    ] {
+        let (_, x, y, w, h) = region(action.hit_id());
+        assert_eq!(
+            c.handle_click(x + w as i32 / 2, y + h as i32 / 2, 1500),
+            ClickOutcome::Shell(action)
+        );
+    }
+    let (_, track_x, track_y, track_w, track_h) =
+        region(termielle_app::app::HIT_PANEL_VOLUME_TRACK);
     assert_eq!(
-        c.handle_click(down, row(0), 1500),
-        ClickOutcome::VolumeSet(55),
-        "the down stepper lowers the level the row showed"
+        c.handle_click(
+            track_x + track_w as i32 / 2,
+            track_y + track_h as i32 / 2,
+            1600
+        ),
+        ClickOutcome::VolumeSet(50),
+        "the slider sets an absolute level"
     );
     assert_eq!(
-        c.handle_click(up, row(0), 1600),
-        ClickOutcome::VolumeSet(65),
-        "the up stepper raises it by the same step"
+        c.handle_click(track_x, track_y + track_h as i32 / 2, 1601),
+        ClickOutcome::VolumeSet(0)
+    );
+    assert_eq!(
+        c.handle_click(
+            track_x + track_w as i32 - 1,
+            track_y + track_h as i32 / 2,
+            1602
+        ),
+        ClickOutcome::VolumeSet(100)
     );
     assert!(
-        c.panel_volume_at(card_left + 100, row(0)),
+        c.panel_volume_at(track_x + 10, track_y + track_h as i32 / 2),
         "the volume track answers the wheel"
     );
+    let (_, mute_x, mute_y, mute_w, mute_h) = regions
+        .iter()
+        .rev()
+        .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_VOLUME_TOGGLE)
+        .copied()
+        .expect("panel speaker must be clickable");
     assert_eq!(
-        c.handle_click(card_left + 30, row(0), 1650),
+        c.handle_click(mute_x + mute_w as i32 / 2, mute_y + mute_h as i32 / 2, 1650),
         ClickOutcome::VolumeToggle,
         "the speaker glyph is the mute button"
     );
-
-    // Each Termielle row reports the setting it owns, in row order.
-    for (index, setting) in [
-        (1, PanelToggle::HoverExpand),
-        (2, PanelToggle::Face),
-        (3, PanelToggle::Music),
-    ] {
-        assert_eq!(
-            c.handle_click(card_left + 40, row(index), 1700 + index as u64 * 10),
-            ClickOutcome::PanelToggle(setting),
-            "row {index} owns {setting:?}"
-        );
-    }
-    assert_eq!(
-        c.handle_click(card_left + 40, row(4), 2000),
-        ClickOutcome::Shell(termielle_app::bar::shell::ShellAction::SystemTray),
-        "the shell's own quick settings stay delegated"
+    assert!(
+        !c.click_regions()
+            .iter()
+            .any(|(id, ..)| *id == termielle_app::app::HIT_MEDIA_PLAY_PAUSE),
+        "an empty media card must not offer fake playback"
     );
+    c.set_task_update(termielle_app::tasks::WorkerUpdate {
+        media: Some(termielle_app::tasks::MediaInfo {
+            title: "Test track".into(),
+            artist: "Test artist".into(),
+            playing: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let (_, play_x, play_y, play_w, play_h) = c
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::app::HIT_MEDIA_PLAY_PAUSE)
+        .copied()
+        .expect("a live media session gets a playback button");
+    assert_eq!(
+        c.handle_click(play_x + play_w as i32 / 2, play_y + play_h as i32 / 2, 1700),
+        ClickOutcome::MediaToggle
+    );
+}
+
+#[test]
+fn clock_opens_recent_notifications_and_clear_all() {
+    use termielle_app::app::{
+        AlertKind, ClickOutcome, HIT_CARD_NOTIFICATIONS, HIT_NOTIFICATIONS_CLEAR,
+    };
+
+    let island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    let mut controller = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    controller.set_bar_width(1536);
+    controller.trigger_alert(
+        AlertKind::System,
+        "A message",
+        "First notification",
+        [200, 120, 80, 255],
+        6000,
+        1000,
+        "toast:one",
+    );
+    controller.trigger_alert(
+        AlertKind::System,
+        "Another message",
+        "Second notification",
+        [200, 120, 80, 255],
+        6000,
+        1010,
+        "toast:two",
+    );
+    assert_eq!(controller.recent_notification_count(), 2);
+    assert_eq!(controller.unread_notification_count(), 2);
+
+    let (_, clock_x, clock_y, clock_w, clock_h) = controller
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == HIT_CARD_NOTIFICATIONS)
+        .copied()
+        .expect("clock has its own hit");
+    assert_eq!(
+        controller.handle_click(
+            clock_x + clock_w as i32 / 2,
+            clock_y + clock_h as i32 / 2,
+            1100
+        ),
+        ClickOutcome::PanelToggled
+    );
+    for tick in (1100..1500).step_by(16) {
+        controller.on_timer(tick);
+    }
+    assert!(controller.is_notification_center_open());
+    assert_eq!(controller.unread_notification_count(), 0);
+    let (_, clear_x, clear_y, clear_w, clear_h) = controller
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == HIT_NOTIFICATIONS_CLEAR)
+        .copied()
+        .expect("recent notifications have a clear action");
+    assert_eq!(
+        controller.handle_click(
+            clear_x + clear_w as i32 / 2,
+            clear_y + clear_h as i32 / 2,
+            1510
+        ),
+        ClickOutcome::NotificationsCleared
+    );
+    assert!(controller.is_notification_center_open());
+    assert_eq!(controller.recent_notification_count(), 0);
+    assert!(
+        !controller
+            .click_regions()
+            .iter()
+            .any(|(id, ..)| *id == HIT_NOTIFICATIONS_CLEAR)
+    );
+    let (_, close_x, close_y, close_w, close_h) = controller
+        .click_regions()
+        .iter()
+        .find(|(id, _, y, ..)| *id == HIT_CARD_NOTIFICATIONS && *y > 36)
+        .copied()
+        .expect("empty Notifications still has a close button");
+    assert_eq!(
+        controller.handle_click(
+            close_x + close_w as i32 / 2,
+            close_y + close_h as i32 / 2,
+            1600
+        ),
+        ClickOutcome::PanelToggled
+    );
+    assert!(!controller.is_notification_center_open());
+}
+
+#[test]
+fn notification_center_only_claims_its_popup_and_bar_entries_for_outside_clicks() {
+    use termielle_app::app::{ClickOutcome, HIT_CARD_NOTIFICATIONS};
+
+    for position in [
+        termielle_core::BarPosition::Top,
+        termielle_core::BarPosition::Bottom,
+    ] {
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..Default::default()
+        };
+        island.bar.position = position;
+        let mut controller =
+            Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+        controller.set_bar_width(1536);
+        let (_, clock_x, clock_y, clock_width, clock_height) = controller
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == HIT_CARD_NOTIFICATIONS)
+            .copied()
+            .expect("clock opens Notifications");
+        let clock_point = (
+            clock_x + clock_width as i32 / 2,
+            clock_y + clock_height as i32 / 2,
+        );
+        assert_eq!(
+            controller.handle_click(clock_point.0, clock_point.1, 1_000),
+            ClickOutcome::PanelToggled
+        );
+        for tick in (1_000..1_500).step_by(16) {
+            controller.on_timer(tick);
+        }
+        assert!(controller.is_notification_center_open());
+        let panel_y = 60;
+        assert!(controller.point_over_open_popup(clock_point));
+        assert!(controller.point_over_open_popup((clock_point.0, panel_y)));
+        assert!(!controller.point_over_open_popup((10, panel_y)));
+        let (_, pill_x, pill_y, pill_width, pill_height) = controller
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+            .copied()
+            .expect("pill remains visible beside Notifications");
+        assert!(!controller.point_over_open_popup((
+            pill_x + pill_width as i32 / 2,
+            pill_y + pill_height as i32 / 2,
+        )));
+        assert!(controller.point_over_bar_surface_is((10, panel_y)));
+        assert!(controller.collapse_if_expanded(1_600));
+        assert!(!controller.is_notification_center_open());
+    }
+}
+
+#[test]
+fn control_center_and_notifications_switch_without_closing_the_notch() {
+    use termielle_app::app::{ClickOutcome, HIT_CARD_NOTIFICATIONS};
+
+    let island = IslandConfig {
+        layout: IslandLayout::Bar,
+        ..Default::default()
+    };
+    let mut controller = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    controller.set_bar_width(1536);
+    let (_, pill_x, pill_y, pill_w, pill_h) = controller
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == termielle_app::bar::HIT_BAR_TERMIELLE_MODULE)
+        .copied()
+        .expect("notch has its own hit");
+    assert_eq!(
+        controller.handle_click(pill_x + pill_w as i32 / 2, pill_y + pill_h as i32 / 2, 1000),
+        ClickOutcome::Expanded
+    );
+    let (_, clock_x, clock_y, clock_w, clock_h) = controller
+        .click_regions()
+        .iter()
+        .find(|(id, ..)| *id == HIT_CARD_NOTIFICATIONS)
+        .copied()
+        .expect("clock has its own hit");
+    assert_eq!(
+        controller.handle_click(
+            clock_x + clock_w as i32 / 2,
+            clock_y + clock_h as i32 / 2,
+            1100
+        ),
+        ClickOutcome::PanelToggled
+    );
+    assert!(controller.is_manually_expanded());
+    assert!(controller.is_notification_center_open());
+    let center = control_center_point(&controller);
+    assert_eq!(
+        controller.handle_click(center.0, center.1, 1200),
+        ClickOutcome::PanelToggled
+    );
+    assert!(controller.is_manually_expanded());
+    assert!(controller.is_panel_open());
+    assert!(!controller.is_notification_center_open());
 }
 
 /// The glyph's x follows the pill's right end, so the tests never hard-code

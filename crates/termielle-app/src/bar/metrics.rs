@@ -7,10 +7,13 @@ use termielle_core::IslandConfig;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub workspaces: super::workspaces::WorkspaceSnapshot,
+    pub foreground_hwnd: isize,
     pub window_title: String,
+    pub foreground_icon: Option<crate::tasks::TaskIcon>,
     pub time_str: String,
     pub battery: (Option<u8>, bool, bool),
     pub volume: super::volume::VolumeSnapshot,
+    pub connectivity: super::connectivity::ConnectivitySnapshot,
     pub memory_pct: u8,
     pub cpu_pct: u8,
 }
@@ -22,13 +25,16 @@ impl Snapshot {
                 total: 0,
                 active: 0,
             },
+            foreground_hwnd: 0,
             window_title: String::new(),
+            foreground_icon: None,
             time_str: String::new(),
             battery: (None, false, false),
             volume: super::volume::VolumeSnapshot {
                 level: 0,
                 muted: true,
             },
+            connectivity: Default::default(),
             memory_pct: 0,
             cpu_pct: 0,
         }
@@ -49,10 +55,12 @@ pub enum Command {
     /// Set an absolute level. The panel's steppers send this instead of a
     /// delta, so the target matches the level the user last saw.
     SetVolume(u8),
+    RefreshConnectivity,
+    RefreshVolume,
 }
 
 pub struct Service {
-    sender: mpsc::Sender<Command>,
+    sender: Arc<mpsc::Sender<Command>>,
     latest: Arc<Mutex<Option<Snapshot>>>,
     config: IslandConfig,
 }
@@ -60,24 +68,61 @@ pub struct Service {
 impl Service {
     pub fn spawn(wake: crate::window::WakeHandle, config: IslandConfig) -> Self {
         let (sender, receiver) = mpsc::channel();
+        let sender = Arc::new(sender);
+        let volume_sender = Arc::downgrade(&sender);
         let latest = Arc::new(Mutex::new(None));
         let mailbox = latest.clone();
         let initial = config.clone();
         std::thread::spawn(move || {
+            let _apartment = match crate::apartment::Apartment::new(
+                windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+            ) {
+                Ok(apartment) => apartment,
+                Err(error) => {
+                    eprintln!("bar worker apartment failed: {error}");
+                    return;
+                }
+            };
+            let mut volume_watcher = None;
             let mut config = initial;
             let mut previous = Snapshot::empty();
             let mut wheel_remainder = 0i32;
+            let mut connectivity_ticks = 0u8;
             loop {
                 // Audio and virtual desktop proxies are acquired and consumed
                 // on this worker; none cross into the UI apartment.
                 let mut fresh = previous.clone();
                 if config.is_bar() {
+                    let _ = super::volume::watch_volume(&mut volume_watcher, volume_sender.clone());
                     let has = |zone: &[String], name| zone.iter().any(|m| m == name);
                     if has(&config.bar.modules_left, "workspaces") {
                         fresh.workspaces = super::workspaces::query_workspaces();
                     }
-                    if has(&config.bar.modules_left, "window") {
-                        fresh.window_title = crate::media::foreground_title();
+                    if has(&config.bar.modules_left, "window")
+                        || has(&config.bar.modules_left, "apps")
+                        || (config.theme == "catppuccin-macchiato"
+                            && has(&config.bar.modules_left, "workspaces"))
+                    {
+                        let (hwnd, title) = crate::media::foreground_window();
+                        fresh.foreground_hwnd = hwnd;
+                        fresh.window_title = title;
+                        fresh.foreground_icon = if config.theme == "catppuccin-macchiato"
+                            && has(&config.bar.modules_left, "workspaces")
+                            && hwnd != 0
+                            && !fresh.window_title.is_empty()
+                        {
+                            fresh
+                                .foreground_icon
+                                .take()
+                                .filter(|icon| icon.hwnd == hwnd)
+                                .or_else(|| crate::tasks::window_icon(hwnd, &fresh.window_title))
+                        } else {
+                            None
+                        };
+                    } else {
+                        fresh.foreground_hwnd = 0;
+                        fresh.window_title.clear();
+                        fresh.foreground_icon = None;
                     }
                     if has(&config.bar.modules_right, "clock") {
                         fresh.time_str = crate::system::current_time_text();
@@ -92,12 +137,14 @@ impl Service {
                             fresh.volume = volume;
                         }
                     }
-                    if has(&config.bar.modules_right, "memory") {
-                        fresh.memory_pct = crate::system::mem_percent();
+                    if connectivity_ticks == 0 {
+                        fresh.connectivity = super::connectivity::query_connectivity();
                     }
-                    if has(&config.bar.modules_right, "cpu") {
-                        fresh.cpu_pct = crate::system::cpu_percent();
-                    }
+                    connectivity_ticks = (connectivity_ticks + 1) % 15;
+                    fresh.memory_pct = crate::system::mem_percent();
+                    fresh.cpu_pct = crate::system::cpu_percent();
+                } else {
+                    volume_watcher = None;
                 }
                 if fresh != previous {
                     previous = fresh.clone();
@@ -130,6 +177,8 @@ impl Service {
                     wheel = 0;
                     match command {
                         Command::Configure(next) => config = *next,
+                        Command::RefreshConnectivity => connectivity_ticks = 0,
+                        Command::RefreshVolume => {}
                         Command::ToggleMute => {
                             if let Err(error) = super::volume::toggle_mute() {
                                 eprintln!("volume toggle failed: {error}");

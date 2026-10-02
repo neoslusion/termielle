@@ -362,8 +362,7 @@ fn main() {
     let thumb_cfg = std::sync::Arc::new(termielle_app::tasks::WorkerConfig::new(
         config.island.is_enabled(),
         config.island.has_widget("music"),
-        (config.island.has_widget("tasks") && config.island.show_tasks)
-            || (config.island.is_bar() && config.island.bar.replace_taskbar),
+        termielle_app::tasks::should_poll_tasks(&config.island),
     ));
     let (thumb_sender, thumb_receiver) = channel();
     let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
@@ -738,8 +737,7 @@ fn reload_config(
         std::sync::atomic::Ordering::Relaxed,
     );
     thumb_cfg.poll_tasks.store(
-        (config.island.has_widget("tasks") && config.island.show_tasks)
-            || (config.island.is_bar() && config.island.bar.replace_taskbar),
+        termielle_app::tasks::should_poll_tasks(&config.island),
         std::sync::atomic::Ordering::Relaxed,
     );
     true
@@ -1058,9 +1056,7 @@ fn backdrop_request_rect(
 }
 
 /// The mutation half of one of Termielle's own setting toggles: no I/O, no
-/// window, no controller. Both the tray menu and the control panel end up
-/// here, so the field a toggle flips is the same field the other surface
-/// reads. Returns false for events that are not setting toggles.
+/// window, no controller. Returns false for events that are not setting toggles.
 fn apply_setting(event: &WindowEvent, island: &mut termielle_core::IslandConfig) -> bool {
     match *event {
         WindowEvent::ToggleMusic => {
@@ -1082,6 +1078,16 @@ fn apply_setting(event: &WindowEvent, island: &mut termielle_core::IslandConfig)
                 island.widgets.push("face".to_string());
             }
             island.clamp();
+            true
+        }
+        WindowEvent::ToggleBarModule(module)
+            if ["cpu", "memory", "volume", "battery", "network"].contains(&module) =>
+        {
+            if island.bar.modules_right.iter().any(|item| item == module) {
+                island.bar.modules_right.retain(|item| item != module);
+            } else {
+                island.bar.modules_right.push(module.to_string());
+            }
             true
         }
         _ => false,
@@ -1300,7 +1306,7 @@ fn poll_hover(
     // pixel - module text, an open card - so "over an opaque pixel" would
     // open the card when the pointer merely crosses the clock. Hover needs the
     // pill's own rect.
-    let over = if controller.island_config().is_bar() {
+    let over_notch = if controller.island_config().is_bar() {
         // Ungated: the alpha-gated read answers None unless the cursor is over
         // an opaque pixel, and in a bar that is the wrong question.
         // The island's own surface, so an open panel does not widen it.
@@ -1310,7 +1316,7 @@ fn poll_hover(
     } else {
         window.cursor_over_pill()
     };
-    if controller.set_hover(over, now) {
+    if controller.set_hover(over_notch, now) {
         actions.present_frame = true;
     }
     // A hover can arm a dwell or a grace without changing anything on screen,
@@ -1319,15 +1325,27 @@ fn poll_hover(
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_ESCAPE, VK_LBUTTON, VK_RBUTTON,
     };
-    // Either surface counts as open. The panel no longer sets
+    // A right panel or the island card counts as open. The panel no longer sets
     // `manually_expanded` - it is not the island's card - so gating
     // dismissal on that alone left it dismissible only by pressing its own
     // icon: no Escape, no click outside.
-    if controller.is_manually_expanded() || controller.is_panel_open() {
-        let l_click = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } < 0;
-        let r_click = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } < 0;
+    if controller.is_manually_expanded()
+        || controller.is_panel_open()
+        || controller.is_notification_center_open()
+    {
+        let over_open_surface = if controller.island_config().is_bar() {
+            window
+                .cursor_frame_pos()
+                .is_some_and(|point| controller.point_over_open_popup(point))
+        } else {
+            over_notch
+        };
+        let l_click = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } != 0;
+        let r_click = unsafe { GetAsyncKeyState(VK_RBUTTON.0 as i32) } != 0;
         let esc = unsafe { GetAsyncKeyState(VK_ESCAPE.0 as i32) } < 0;
-        if ((!over && (l_click || r_click)) || esc) && controller.collapse_if_expanded(now) {
+        if ((!over_open_surface && (l_click || r_click)) || esc)
+            && controller.collapse_if_expanded(now)
+        {
             actions.present_frame = true;
             actions.next_deadline_ms = controller.next_deadline_ms();
         }
@@ -1388,8 +1406,9 @@ fn drain_toasts(
     while let Ok(batch) = receiver.try_recv() {
         for event in batch.events {
             let key = format!("toast:{}", event.id);
-            present |= controller.trigger_alert(
+            present |= controller.trigger_alert_from(
                 termielle_app::app::AlertKind::System,
+                &event.app,
                 event.display_title(),
                 event.display_subtitle(),
                 termielle_app::system::accent_color_bgra(),
@@ -1478,6 +1497,13 @@ fn run_gui(
     let clock = AnimationClock::spawn(window.wake_handle());
     let mut bar_service =
         termielle_app::bar::metrics::Service::spawn(window.wake_handle(), config.island.clone());
+    let launcher = match termielle_app::launcher::LauncherWindow::create(&config.island) {
+        Ok(launcher) => Some(launcher),
+        Err(error) => {
+            eprintln!("launcher creation failed: {error}");
+            None
+        }
+    };
     controller.enable_display_pacing();
     // Windows toast forwarding: own STA thread plus channel. Gated on
     // config only — smoke runs never reach run_gui, so diagnostics stays
@@ -1496,6 +1522,9 @@ fn run_gui(
         // Only the display clock advances animation. Unrelated window/worker
         // messages must not bypass vertical-blank pacing.
         bar_service.configure(&config.island);
+        if let Some(launcher) = &launcher {
+            launcher.configure(&config.island);
+        }
         if now_ms() >= next_taskbar_reassert {
             next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);
             if config.island.is_bar() && config.island.bar.replace_taskbar {
@@ -1513,7 +1542,15 @@ fn run_gui(
                 );
             }
         }
-        clock.arm(controller.next_deadline_ms());
+        let mut deadline = controller.next_deadline_ms();
+        if controller.is_manually_expanded()
+            || controller.is_panel_open()
+            || controller.is_notification_center_open()
+        {
+            let click_poll_at = now_ms().saturating_add(32);
+            deadline = Some(deadline.map_or(click_poll_at, |at| at.min(click_poll_at)));
+        }
+        clock.arm(deadline);
 
         let event = match window.next_event() {
             Ok(Some(event)) => event,
@@ -1658,8 +1695,7 @@ fn run_gui(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 thumb_cfg.poll_tasks.store(
-                    (config.island.has_widget("tasks") && config.island.show_tasks)
-                        || (config.island.is_bar() && config.island.bar.replace_taskbar),
+                    termielle_app::tasks::should_poll_tasks(&config.island),
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 ControllerActions {
@@ -1765,25 +1801,27 @@ fn run_gui(
                         ..Default::default()
                     }
                 }
-                termielle_app::app::ClickOutcome::PanelToggled => ControllerActions {
+                termielle_app::app::ClickOutcome::PanelToggled => {
+                    if controller.is_panel_open() {
+                        bar_service.send(termielle_app::bar::metrics::Command::RefreshConnectivity);
+                    }
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::NotificationsCleared => ControllerActions {
                     present_frame: true,
                     ..Default::default()
                 },
-                termielle_app::app::ClickOutcome::PanelToggle(setting) => {
-                    // The panel sends the same commands the tray menu sends,
-                    // so one owner (this config) serves both surfaces and the
-                    // menu's checkmarks can never disagree with the panel.
-                    let event = match setting {
-                        termielle_app::app::PanelToggle::HoverExpand => {
-                            WindowEvent::ToggleHoverExpand
-                        }
-                        termielle_app::app::PanelToggle::Face => WindowEvent::ToggleFace,
-                        termielle_app::app::PanelToggle::Music => WindowEvent::ToggleMusic,
-                    };
-                    apply_settings_event(event, config, controller, thumb_cfg).unwrap_or_default()
-                }
                 termielle_app::app::ClickOutcome::Shell(action) => {
-                    termielle_app::bar::shell::activate(action);
+                    if action == termielle_app::bar::shell::ShellAction::Search {
+                        if let Some(launcher) = &launcher {
+                            launcher.show();
+                        }
+                    } else {
+                        termielle_app::bar::shell::activate(action);
+                    }
                     ControllerActions::default()
                 }
                 termielle_app::app::ClickOutcome::AlertDismiss
@@ -1808,19 +1846,22 @@ fn run_gui(
                     ..Default::default()
                 }
             }
-            WindowEvent::ToggleMusic | WindowEvent::ToggleHoverExpand | WindowEvent::ToggleFace => {
-                apply_settings_event(
-                    match event {
-                        WindowEvent::ToggleMusic => WindowEvent::ToggleMusic,
-                        WindowEvent::ToggleHoverExpand => WindowEvent::ToggleHoverExpand,
-                        _ => WindowEvent::ToggleFace,
-                    },
-                    config,
-                    controller,
-                    thumb_cfg,
-                )
-                .unwrap_or_default()
-            }
+            WindowEvent::ToggleMusic
+            | WindowEvent::ToggleHoverExpand
+            | WindowEvent::ToggleFace
+            | WindowEvent::ToggleBarModule(_) => apply_settings_event(
+                match event {
+                    WindowEvent::ToggleMusic => WindowEvent::ToggleMusic,
+                    WindowEvent::ToggleHoverExpand => WindowEvent::ToggleHoverExpand,
+                    WindowEvent::ToggleFace => WindowEvent::ToggleFace,
+                    WindowEvent::ToggleBarModule(module) => WindowEvent::ToggleBarModule(module),
+                    _ => unreachable!(),
+                },
+                config,
+                controller,
+                thumb_cfg,
+            )
+            .unwrap_or_default(),
             WindowEvent::SystemThemeChanged => {
                 // The Windows light/dark setting flipped: re-resolve `auto`
                 // and repaint. The persisted config keeps `theme: auto`.
@@ -1936,7 +1977,8 @@ fn run_smoke(
                 | WindowEvent::HoverChanged(_)
                 | WindowEvent::ToggleMusic
                 | WindowEvent::ToggleHoverExpand
-                | WindowEvent::ToggleFace,
+                | WindowEvent::ToggleFace
+                | WindowEvent::ToggleBarModule(_),
             )) => {}
             Ok(None) => {}
             Err(error) => {
@@ -2017,11 +2059,7 @@ fn config_error_code(error: &termielle_core::ConfigError) -> i32 {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
-    use termielle_app::app::PanelToggle;
 
-    /// The panel's rows and the tray menu are two surfaces over one config.
-    /// Each toggle must flip exactly the field the tray menu renders, so the
-    /// two can never show different states for the same setting.
     /// The glass samples a captured image, and anything outside it falls back
     /// to a flat tint. A surface mid-morph must therefore be covered for its
     /// whole travel, or the area it is growing into shows flat colour.
@@ -2071,31 +2109,51 @@ mod settings_tests {
     }
 
     #[test]
-    fn panel_toggles_flip_the_fields_the_tray_menu_renders() {
-        for (setting, event) in [
-            (PanelToggle::HoverExpand, WindowEvent::ToggleHoverExpand),
-            (PanelToggle::Face, WindowEvent::ToggleFace),
-            (PanelToggle::Music, WindowEvent::ToggleMusic),
+    fn settings_events_flip_the_fields_the_tray_menu_renders() {
+        for event in [
+            WindowEvent::ToggleHoverExpand,
+            WindowEvent::ToggleFace,
+            WindowEvent::ToggleMusic,
         ] {
             let mut island = termielle_core::IslandConfig::default();
             let before = termielle_app::tray::MenuState::from_island(&island);
-            assert!(apply_setting(&event, &mut island), "{setting:?} must apply");
+            assert!(apply_setting(&event, &mut island), "{event:?} must apply");
             let after = termielle_app::tray::MenuState::from_island(&island);
-            match setting {
-                PanelToggle::HoverExpand => assert_ne!(before.hover, after.hover),
-                PanelToggle::Face => assert_ne!(before.face, after.face),
-                PanelToggle::Music => assert_ne!(before.music, after.music),
+            match event {
+                WindowEvent::ToggleHoverExpand => assert_ne!(before.hover, after.hover),
+                WindowEvent::ToggleFace => assert_ne!(before.face, after.face),
+                WindowEvent::ToggleMusic => assert_ne!(before.music, after.music),
+                _ => unreachable!(),
             }
-            // A second application lands back where it started, so the
-            // panel row and the menu item are both true toggles.
             assert!(apply_setting(&event, &mut island));
             let round_trip = termielle_app::tray::MenuState::from_island(&island);
-            match setting {
-                PanelToggle::HoverExpand => assert_eq!(round_trip.hover, before.hover),
-                PanelToggle::Face => assert_eq!(round_trip.face, before.face),
-                PanelToggle::Music => assert_eq!(round_trip.music, before.music),
+            match event {
+                WindowEvent::ToggleHoverExpand => assert_eq!(round_trip.hover, before.hover),
+                WindowEvent::ToggleFace => assert_eq!(round_trip.face, before.face),
+                WindowEvent::ToggleMusic => assert_eq!(round_trip.music, before.music),
+                _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn menu_bar_items_can_be_pinned_and_unpinned() {
+        let mut island = termielle_core::IslandConfig::default();
+        assert!(!termielle_app::tray::MenuState::from_island(&island).bar_cpu);
+        assert!(apply_setting(
+            &WindowEvent::ToggleBarModule("cpu"),
+            &mut island
+        ));
+        assert!(termielle_app::tray::MenuState::from_island(&island).bar_cpu);
+        assert!(apply_setting(
+            &WindowEvent::ToggleBarModule("cpu"),
+            &mut island
+        ));
+        assert!(!termielle_app::tray::MenuState::from_island(&island).bar_cpu);
+        assert!(!apply_setting(
+            &WindowEvent::ToggleBarModule("not_a_module"),
+            &mut island
+        ));
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub const TRAY_THEME_MIDNIGHT: u32 = 111;
 pub const TRAY_THEME_LIGHT: u32 = 112;
 pub const TRAY_THEME_TRANSPARENT: u32 = 113;
 pub const TRAY_THEME_AUTO: u32 = 114;
+pub const TRAY_THEME_CATPPUCCIN_MACCHIATO: u32 = 115;
 
 /// Y-offset presets for standalone Island/Notch layouts.
 pub const TRAY_YOFFSET_0: u32 = 120;
@@ -69,6 +70,11 @@ pub const TRAY_BAR_BOTTOM: u32 = 126;
 pub const TRAY_TOGGLE_MUSIC: u32 = 130;
 pub const TRAY_TOGGLE_HOVER: u32 = 131;
 pub const TRAY_TOGGLE_FACE: u32 = 132;
+pub const TRAY_TOGGLE_BAR_CPU: u32 = 133;
+pub const TRAY_TOGGLE_BAR_MEMORY: u32 = 134;
+pub const TRAY_TOGGLE_BAR_VOLUME: u32 = 135;
+pub const TRAY_TOGGLE_BAR_BATTERY: u32 = 136;
+pub const TRAY_TOGGLE_BAR_NETWORK: u32 = 137;
 
 /// Current user-visible settings used to mark tray menu choices.
 #[derive(Clone, Debug, Default)]
@@ -80,6 +86,11 @@ pub struct MenuState {
     pub music: bool,
     pub face: bool,
     pub hover: bool,
+    pub bar_cpu: bool,
+    pub bar_memory: bool,
+    pub bar_volume: bool,
+    pub bar_battery: bool,
+    pub bar_network: bool,
 }
 
 impl MenuState {
@@ -102,6 +113,19 @@ impl MenuState {
             music: island.has_widget("music"),
             face: island.has_widget("face"),
             hover: island.expand_on_hover,
+            bar_cpu: island.bar.modules_right.iter().any(|item| item == "cpu"),
+            bar_memory: island.bar.modules_right.iter().any(|item| item == "memory"),
+            bar_volume: island.bar.modules_right.iter().any(|item| item == "volume"),
+            bar_battery: island
+                .bar
+                .modules_right
+                .iter()
+                .any(|item| item == "battery"),
+            bar_network: island
+                .bar
+                .modules_right
+                .iter()
+                .any(|item| item == "network"),
         }
     }
 }
@@ -270,6 +294,11 @@ pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
             "Theme: Midnight",
             state.theme == "midnight",
         ),
+        (
+            TRAY_THEME_CATPPUCCIN_MACCHIATO,
+            "Theme: Catppuccin Macchiato",
+            state.theme == "catppuccin-macchiato",
+        ),
         (TRAY_THEME_LIGHT, "Theme: Light", state.theme == "light"),
         (
             TRAY_THEME_TRANSPARENT,
@@ -383,6 +412,34 @@ pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
             PCWSTR(widgets_label.as_ptr()),
         )
     };
+
+    if state.layout == "bar" {
+        let Ok(status_menu) = (unsafe { CreatePopupMenu() }) else {
+            let _ = unsafe { DestroyMenu(menu) };
+            return 0;
+        };
+        for (id, label, active) in [
+            (TRAY_TOGGLE_BAR_NETWORK, "Network", state.bar_network),
+            (TRAY_TOGGLE_BAR_CPU, "CPU", state.bar_cpu),
+            (TRAY_TOGGLE_BAR_MEMORY, "Memory", state.bar_memory),
+            (TRAY_TOGGLE_BAR_VOLUME, "Volume", state.bar_volume),
+            (TRAY_TOGGLE_BAR_BATTERY, "Battery", state.bar_battery),
+        ] {
+            let label = format!("{} {label}", if active { "[x]" } else { "[ ]" });
+            let wide = crate::window::encode_wide(&label);
+            let _ =
+                unsafe { AppendMenuW(status_menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr())) };
+        }
+        let label = crate::window::encode_wide("Menu Bar Items");
+        let _ = unsafe {
+            AppendMenuW(
+                menu,
+                windows::Win32::UI::WindowsAndMessaging::MF_POPUP,
+                status_menu.0 as usize,
+                PCWSTR(label.as_ptr()),
+            )
+        };
+    }
 
     // Separator + Restart/Exit
     let _ = unsafe {
@@ -597,6 +654,11 @@ mod tests {
         assert_eq!(state.theme, "midnight");
         assert_eq!(state.bar_position, "bottom");
         assert_eq!(state.y_offset, 80);
+        assert!(!state.bar_cpu);
+        assert!(!state.bar_memory);
+        assert!(state.bar_volume);
+        assert!(state.bar_battery);
+        assert!(state.bar_network);
     }
 
     #[test]

@@ -36,7 +36,7 @@ impl Controller {
         };
 
         if height >= 85 {
-            if self.panel_open {
+            if self.panel_open && !island.is_bar() {
                 // Control Center is a separate surface, not a body of the
                 // island's card: it does not wear the island's header, and it
                 // is not swapped out for media or an agent turn. It has its

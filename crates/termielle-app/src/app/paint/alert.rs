@@ -1,13 +1,48 @@
-//! Alert banner: transient notification card with timeout hairline.
+//! Transient notification content for the island and bar.
 
 use super::super::controller::Controller;
+use super::super::types::{AlertBanner, AlertKind, HIT_ALERT_DISMISS};
 use crate::animation::FrameBuffer;
+use crate::animation::notch::{
+    blit_rounded, draw_rounded_rect, draw_text, draw_text_in_rect, fill_rect_pub,
+};
 use termielle_core::IslandConfig;
 
+fn alert_copy(alert: &AlertBanner) -> (&str, &str, &str) {
+    match alert.kind {
+        AlertKind::Agent => {
+            let source = if alert.subtitle.trim().is_empty() {
+                "Termielle"
+            } else {
+                alert.subtitle.as_str()
+            };
+            let headline = match alert.title.as_str() {
+                "Input" => "Needs your input",
+                "Failed" => "Turn failed",
+                _ => alert.title.as_str(),
+            };
+            (source, headline, "")
+        }
+        AlertKind::System => {
+            let (source, body) = alert
+                .subtitle
+                .split_once(": ")
+                .unwrap_or((alert.subtitle.as_str(), ""));
+            let source = if source.trim().is_empty() {
+                "Notification"
+            } else {
+                source
+            };
+            if alert.title.eq_ignore_ascii_case(source) && !body.is_empty() {
+                (source, body, "")
+            } else {
+                (source, alert.title.as_str(), body)
+            }
+        }
+    }
+}
+
 impl Controller {
-    /// Content painter 0: the active notification alert banner. Returns
-    /// true when a banner showed (the caller returns early); the cloned
-    /// alert unties the `alerts` borrow from the paint calls.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn paint_alert_banner(
         &mut self,
@@ -17,187 +52,148 @@ impl Controller {
         height: u32,
         now_ms: u64,
     ) -> bool {
-        let cy = (height / 2) as i32;
-        let now = now_ms;
-        // 0. Active Notification Alert Banner
-        if let Some(alert) = self.alerts.front() {
-            // The entire visible notification is a dismiss target. The close
-            // glyph remains a visual affordance, but a click anywhere on the
-            // banner quickly returns the surface to the compact bar/island.
-            self.icon_hits
-                .push((super::super::types::HIT_ALERT_DISMISS, 0, 0, width, height));
-            let pad = 18i32;
+        let Some(alert) = self.alerts.front() else {
+            return false;
+        };
+        self.icon_hits
+            .push((HIT_ALERT_DISMISS, 0, 0, width, height));
 
-            if height >= 85 {
-                // Tall card layout: drops vertically downward
-                if island.has_widget("face") {
-                    let face_size = 22i32;
-                    let fx = pad;
-                    let fy = 14;
-                    crate::animation::notch::draw_disc(
-                        frame,
-                        fx + face_size / 2,
-                        fy + face_size / 2,
-                        (face_size / 2 + 2) as u32,
-                        [alert.accent[0], alert.accent[1], alert.accent[2], 65],
-                    );
-                    crate::animation::notch::blit_rounded(
-                        frame,
-                        &self.face_frame,
-                        fx,
-                        fy,
-                        face_size as u32,
-                        face_size as u32,
-                        6,
-                    );
-                }
-
-                let tag_x = if island.has_widget("face") {
-                    pad + 30
-                } else {
-                    pad
-                };
-                crate::animation::notch::draw_text(
-                    frame,
-                    alert.kind.label(),
-                    tag_x,
-                    15,
-                    width.saturating_sub((tag_x as u32) + 40),
-                    10,
-                    true,
-                    [alert.accent[0], alert.accent[1], alert.accent[2], 255],
-                );
-
-                // Trailing beacon badge with soft glowing halo
-                crate::animation::notch::draw_disc(
-                    frame,
-                    width as i32 - 24,
-                    22,
-                    7,
-                    [alert.accent[0], alert.accent[1], alert.accent[2], 50],
-                );
-                crate::animation::notch::draw_disc(frame, width as i32 - 24, 22, 4, alert.accent);
-                let close_x = width as i32 - 48;
-                crate::animation::notch::draw_text(
-                    frame,
-                    "×",
-                    close_x,
-                    10,
-                    24,
-                    18,
-                    false,
-                    self.ink_dim(),
-                );
-                self.icon_hits
-                    .push((super::super::types::HIT_ALERT_DISMISS, close_x, 6, 28, 28));
-
-                // Hairline glass separator
-                crate::animation::notch::fill_rect_pub(
-                    frame,
-                    pad,
-                    38,
-                    width.saturating_sub((pad as u32) * 2),
-                    1,
-                    [22, 22, 22, 22],
-                );
-
-                // Main headline and detail text
-                let text_w = width.saturating_sub((pad as u32) * 2);
-                crate::animation::notch::draw_text(
-                    frame,
-                    &alert.title,
-                    pad,
-                    48,
-                    text_w,
-                    15,
-                    true,
-                    self.ink(),
-                );
-                crate::animation::notch::draw_text(
-                    frame,
-                    &alert.subtitle,
-                    pad,
-                    76,
-                    text_w,
-                    12,
-                    false,
-                    self.ink_dim(),
-                );
-
-                // Timeout hairline: the banner's remaining life, so the
-                // auto-dismiss reads as intentional rather than a flicker.
-                let frac = match (alert.duration_ms, alert.expires_at_ms) {
-                    (0, _) | (_, None) => 0.0,
-                    (duration, Some(expires_at)) => {
-                        expires_at.saturating_sub(now) as f32 / duration as f32
-                    }
-                }
-                .clamp(0.0, 1.0);
-                let hair_w =
-                    ((width.saturating_sub((pad as u32) * 2)) as f32 * frac).round() as u32;
-                if hair_w > 0 {
-                    crate::animation::notch::fill_rect_pub(
-                        frame,
-                        pad,
-                        height as i32 - 4,
-                        hair_w,
-                        2,
-                        [
-                            (u32::from(alert.accent[0]) * 200 / 255) as u8,
-                            (u32::from(alert.accent[1]) * 200 / 255) as u8,
-                            (u32::from(alert.accent[2]) * 200 / 255) as u8,
-                            200,
-                        ],
-                    );
-                }
-            } else {
-                let face_size = (height.saturating_sub(18)).min(36) as i32;
-                let fx = pad;
-                let fy = cy - face_size / 2;
-
-                if island.has_widget("face") {
-                    crate::animation::notch::draw_disc(
-                        frame,
-                        fx + face_size / 2,
-                        cy,
-                        (face_size / 2 + 3) as u32,
-                        [alert.accent[0], alert.accent[1], alert.accent[2], 65],
-                    );
-                    crate::animation::notch::blit_rounded(
-                        frame,
-                        &self.face_frame,
-                        fx,
-                        fy,
-                        face_size as u32,
-                        face_size as u32,
-                        8,
-                    );
-                }
-
-                let text_x = if island.has_widget("face") {
-                    fx + face_size + 14
-                } else {
-                    pad
-                };
-                let text_w = width.saturating_sub((text_x as u32) + 36);
-
-                crate::animation::notch::draw_text(
-                    frame,
-                    &alert.title,
-                    text_x,
-                    cy - 7,
-                    text_w,
-                    12,
-                    true,
-                    self.ink(),
-                );
-
-                // Trailing beacon badge
-                crate::animation::notch::draw_disc(frame, width as i32 - 20, cy, 5, alert.accent);
-            }
-
-            return true;
+        let (source, headline, detail) = alert_copy(alert);
+        let accent = alert.accent;
+        let avatar_x = 16;
+        let avatar_y = 27;
+        draw_rounded_rect(
+            frame,
+            avatar_x,
+            avatar_y,
+            40,
+            40,
+            12,
+            [accent[0], accent[1], accent[2], 78],
+            [accent[0], accent[1], accent[2], 115],
+        );
+        if alert.kind == AlertKind::Agent && island.has_widget("face") {
+            blit_rounded(
+                frame,
+                &self.face_frame,
+                avatar_x + 5,
+                avatar_y + 5,
+                30,
+                30,
+                8,
+            );
+        } else {
+            let initial = source
+                .chars()
+                .next()
+                .unwrap_or('N')
+                .to_uppercase()
+                .to_string();
+            draw_text_in_rect(
+                frame,
+                &initial,
+                (avatar_x, avatar_y, 40, 40),
+                18,
+                true,
+                self.ink(),
+                true,
+            );
         }
-        false
+
+        let text_x = 68;
+        let text_w = width.saturating_sub(text_x as u32 + 18);
+        let (source_y, headline_y) = if detail.is_empty() {
+            (28, 47)
+        } else {
+            (17, 36)
+        };
+        let source_label = if alert.kind == AlertKind::Agent {
+            let mut characters = source.chars();
+            let first = characters.next().unwrap_or('T');
+            first.to_uppercase().collect::<String>() + characters.as_str()
+        } else {
+            source.to_owned()
+        };
+        draw_text(
+            frame,
+            &source_label,
+            text_x,
+            source_y,
+            text_w,
+            11,
+            true,
+            accent,
+        );
+        draw_text(
+            frame,
+            headline,
+            text_x,
+            headline_y,
+            text_w,
+            16,
+            true,
+            self.ink(),
+        );
+        if !detail.is_empty() {
+            draw_text(frame, detail, text_x, 58, text_w, 12, false, self.ink_dim());
+        }
+
+        let remaining = match (alert.duration_ms, alert.expires_at_ms) {
+            (0, _) | (_, None) => 0.0,
+            (duration, Some(expires_at)) => {
+                expires_at.saturating_sub(now_ms) as f32 / duration as f32
+            }
+        }
+        .clamp(0.0, 1.0);
+        let track_w = width.saturating_sub(text_x as u32 + 18);
+        let track_y = height as i32 - 8;
+        fill_rect_pub(frame, text_x, track_y, track_w, 1, [255, 255, 255, 18]);
+        let fill_w = (track_w as f32 * remaining).round() as u32;
+        if fill_w > 0 {
+            fill_rect_pub(
+                frame,
+                text_x,
+                track_y,
+                fill_w,
+                1,
+                [accent[0], accent[1], accent[2], 120],
+            );
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn banner(kind: AlertKind, title: &str, subtitle: &str) -> AlertBanner {
+        AlertBanner {
+            title: title.into(),
+            subtitle: subtitle.into(),
+            accent: [0; 4],
+            kind,
+            dedupe_key: String::new(),
+            duration_ms: 0,
+            expires_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn agent_alert_uses_the_agent_as_source_and_a_clear_action() {
+        let alert = banner(AlertKind::Agent, "Input", "claude");
+        assert_eq!(alert_copy(&alert), ("claude", "Needs your input", ""));
+    }
+
+    #[test]
+    fn system_toast_separates_app_title_and_body() {
+        let alert = banner(AlertKind::System, "Release ready", "Updates: Download now");
+        assert_eq!(
+            alert_copy(&alert),
+            ("Updates", "Release ready", "Download now")
+        );
+
+        let alert = banner(AlertKind::System, "Updates", "Updates: Download now");
+        assert_eq!(alert_copy(&alert), ("Updates", "Download now", ""));
     }
 }

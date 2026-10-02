@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
+use termielle_core::IslandConfig;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
@@ -56,7 +57,7 @@ pub struct ThumbBitmap {
 }
 
 /// Open application window icon and title.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskIcon {
     pub hwnd: isize,
     pub title: String,
@@ -166,6 +167,17 @@ impl WorkerConfig {
             poll_tasks: AtomicBool::new(poll_tasks),
         }
     }
+}
+
+pub fn should_poll_tasks(config: &IslandConfig) -> bool {
+    (config.has_widget("tasks") && config.show_tasks)
+        || (config.is_bar()
+            && (config.bar.replace_taskbar
+                || config
+                    .bar
+                    .modules_left
+                    .iter()
+                    .any(|module| module == "apps")))
 }
 
 /// Starts the background worker: SMTC media sampling and frosted-glass
@@ -628,7 +640,7 @@ pub fn window_icon(hwnd: isize, title: &str) -> Option<TaskIcon> {
 }
 
 /// Native icon dimensions from a GDI bitmap handle.
-fn bitmap_dims(hbm: HBITMAP) -> Option<(i32, i32)> {
+pub(crate) fn bitmap_dims(hbm: HBITMAP) -> Option<(i32, i32)> {
     let mut bm = BITMAP::default();
     if unsafe {
         GetObjectW(
@@ -645,7 +657,7 @@ fn bitmap_dims(hbm: HBITMAP) -> Option<(i32, i32)> {
 
 /// Reads `h` top-down rows of a GDI bitmap as bytes: 32bpp BGRA, or 1bpp
 /// stride-padded rows with MSB first for masks.
-fn dib_bits(hdc: HDC, hbm: HBITMAP, w: i32, h: i32, bpp: u16) -> Option<Vec<u8>> {
+pub(crate) fn dib_bits(hdc: HDC, hbm: HBITMAP, w: i32, h: i32, bpp: u16) -> Option<Vec<u8>> {
     let stride = if bpp == 1 {
         (w as usize).div_ceil(32) * 4
     } else {
@@ -887,5 +899,26 @@ mod icon_mask_tests {
         apply_icon_mask(&mut pixels, &mask, false);
         assert_eq!(pixels[3], 255);
         assert_eq!(pixels[7], 0);
+    }
+}
+
+#[cfg(test)]
+mod worker_config_tests {
+    use super::should_poll_tasks;
+    use termielle_core::{IslandConfig, IslandLayout};
+
+    #[test]
+    fn apps_module_polls_tasks_without_replacing_the_taskbar() {
+        let mut config = IslandConfig {
+            layout: IslandLayout::Bar,
+            ..IslandConfig::default()
+        };
+        assert!(should_poll_tasks(&config));
+
+        config.bar.modules_left = vec!["workspaces".into(), "window".into()];
+        assert!(!should_poll_tasks(&config));
+
+        config.bar.replace_taskbar = true;
+        assert!(should_poll_tasks(&config));
     }
 }

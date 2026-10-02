@@ -20,6 +20,7 @@ pub(crate) struct BarZoneCache {
     /// panel hangs from the icon the frame actually painted rather than from
     /// a second, independently-derived idea of where that icon is.
     pub(crate) control_center_x: Option<i32>,
+    pub(crate) clock_x: Option<i32>,
 }
 
 /// Transparent breathing room between the persistent strip and its popup.
@@ -62,10 +63,9 @@ pub(crate) struct BarCard {
     pub(crate) bar_y: i32,
     pub(crate) progress: f32,
     pub(crate) island_x: i32,
-    /// Whether the island's *own* card is open, as opposed to the Control
-    /// Center panel. Both make the window tall, so the pill's own visibility
-    /// cannot be read off the height.
-    pub(crate) island_card_open: bool,
+    /// Whether an island card or alert is morphing the resting pill. Control
+    /// Center also makes the window tall, but never changes the pill itself.
+    pub(crate) pill_morphing: bool,
     /// Left edge of the full-size card content, in frame coordinates. Same
     /// anchor as `island_x`; carried separately because the card animates its
     /// width while the content inside it is already full size.

@@ -79,6 +79,39 @@ pub(crate) const ADJUSTMENTS: Icon = Icon(&[
     "M18 9v11",
 ]);
 
+pub(crate) const WIFI: Icon = Icon(&[
+    "M12 18l.01 0",
+    "M9.172 15.172a4 4 0 0 1 5.656 0",
+    "M6.343 12.343a8 8 0 0 1 11.314 0",
+    "M3.515 9.515c4.686 -4.687 12.284 -4.687 17 0",
+]);
+
+pub(crate) const BLUETOOTH: Icon = Icon(&["M7 8l10 8l-5 4l0 -16l5 4l-10 8"]);
+
+pub(crate) const MOON: Icon =
+    Icon(&["M12 3c.132 0 .263 0 .393 0a7.5 7.5 0 0 0 7.92 12.446a9 9 0 1 1 -8.313 -12.454z"]);
+
+pub(crate) const DEVICE_DESKTOP: Icon = Icon(&[
+    "M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10z",
+    "M7 20h10",
+    "M9 16v4",
+    "M15 16v4",
+]);
+
+pub(crate) const SEARCH: Icon = Icon(&["M3 10a7 7 0 1 0 14 0a7 7 0 0 0 -14 0", "M21 21l-6 -6"]);
+
+pub(crate) const PLAYER_PLAY: Icon = Icon(&["M7 4v16l13 -8z"]);
+pub(crate) const PLAYER_PAUSE: Icon = Icon(&[
+    "M6 5m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v12a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z",
+    "M14 5m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v12a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z",
+]);
+pub(crate) const MUSIC: Icon = Icon(&[
+    "M3 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0",
+    "M13 17a3 3 0 1 0 6 0a3 3 0 0 0 -6 0",
+    "M9 17v-13h10v13",
+    "M9 8h10",
+]);
+
 /// A flattened polyline in viewBox units, ready to be scaled to the canvas.
 struct Polyline(Vec<(f32, f32)>);
 
@@ -428,7 +461,7 @@ pub(crate) fn draw_icon(
                     best = d;
                 }
             }
-            let cov = (half + 0.5 - best.sqrt()).clamp(0.0, 1.0);
+            let cov = (half + 0.5 - best.sqrt() * k).clamp(0.0, 1.0);
             if cov <= 0.0 {
                 continue;
             }
@@ -478,6 +511,13 @@ mod tests {
             ("battery_charging", BATTERY_CHARGING),
             ("clock", CLOCK),
             ("adjustments", ADJUSTMENTS),
+            ("wifi", WIFI),
+            ("bluetooth", BLUETOOTH),
+            ("moon", MOON),
+            ("device_desktop", DEVICE_DESKTOP),
+            ("player_play", PLAYER_PLAY),
+            ("player_pause", PLAYER_PAUSE),
+            ("music", MUSIC),
         ];
         for (name, icon) in icons {
             let mut f = frame();
@@ -532,5 +572,26 @@ mod tests {
         // glyph picks up extra cap and join fill on top of that.
         let ratio = ink(&big) as f32 / ink(&small) as f32;
         assert!((3.0..9.0).contains(&ratio), "area ratio was {ratio}");
+    }
+
+    #[test]
+    fn small_icon_stroke_keeps_pixel_coverage() {
+        let mut small = frame();
+        draw_icon(
+            &mut small,
+            Icon(&["M0 12h24"]),
+            0,
+            0,
+            12,
+            [255, 255, 255, 255],
+        );
+        let alphas: Vec<_> = small
+            .pixels_pbgra
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .filter(|alpha| *alpha > 0)
+            .collect();
+        assert!(!alphas.is_empty());
+        assert!(alphas.iter().any(|alpha| *alpha < 255));
     }
 }

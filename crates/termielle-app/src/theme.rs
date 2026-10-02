@@ -74,6 +74,7 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
             ),
             "transparent" => ([30, 30, 30, 70], 0, 20, 24, 18),
             "midnight" => ([12, 18, 32, 205], 28, 28, 50, 80),
+            "catppuccin-macchiato" => ([58, 39, 36, 224], 12, 34, 52, 48),
             _ => (
                 [30, 22, 18, if transparency { 190 } else { 255 }],
                 12,
@@ -255,6 +256,12 @@ mod tests {
         apply_theme(&mut c, "light");
         // Windows 11 taskbar light material: #F3F3F3.
         assert_eq!(c.glass.tint, [243, 243, 243, 230]);
+    }
+    #[test]
+    fn macchiato_theme_uses_the_palette_base() {
+        let mut config = IslandConfig::default();
+        apply_theme(&mut config, "catppuccin-macchiato");
+        assert_eq!(config.glass.tint, [58, 39, 36, 224]);
     }
     #[test]
     fn tray_selection_clears_stale_explicit_glass() {

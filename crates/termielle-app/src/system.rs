@@ -30,6 +30,23 @@ pub fn current_time_text() -> String {
     format!("{:02}:{:02}", st.wHour, st.wMinute)
 }
 
+pub fn current_date_text() -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let date = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    let weekday = WEEKDAYS
+        .get(date.wDayOfWeek as usize)
+        .copied()
+        .unwrap_or("");
+    let month = MONTHS
+        .get(date.wMonth.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{weekday} {} {month}", date.wDay)
+}
+
 pub fn battery_status() -> (Option<u8>, bool, bool) {
     unsafe {
         let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();

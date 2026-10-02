@@ -4,4 +4,5 @@ pub(crate) mod modules;
 pub(crate) mod render;
 pub(crate) mod text;
 pub(crate) mod types;
+pub(crate) mod volume;
 pub(crate) mod zones;

@@ -11,6 +11,7 @@ use super::types::FACE_SIZE;
 use super::types::FALLBACK_FRAME_SIZE;
 use super::types::GlassCacheKey;
 use super::types::MAX_QUEUED_ALERTS;
+use super::types::{MAX_RECENT_NOTIFICATIONS, RecentNotification, RightPanel};
 use crate::animation::spring::{Spring1, Spring2D};
 use crate::animation::{
     AnimationError, AnimationSource, FrameBuffer, GifAnimation, fallback_frame,
@@ -71,11 +72,12 @@ pub struct Controller {
     pub(crate) manually_expanded: bool,
     /// Set while the cursor hovers the island (when `expand_on_hover`).
     pub(crate) hover_expanded: bool,
-    /// Which body the bar popup is showing: `None` is the default card (media,
-    /// activity, switcher, dashboard by priority), `Some` is the control
-    /// panel. The panel is a deliberate choice, so it never steals the card
-    /// from an activity: the pill's own click closes it first.
+    /// Whether the menu-bar Control Center popover is open independently of
+    /// the centered island card.
     pub(crate) panel_open: bool,
+    pub(crate) panel_kind: RightPanel,
+    pub(crate) panel_morphing: bool,
+    pub(crate) alert_pill_morphing: bool,
     pub(crate) hover_deadline: Option<(bool, u64)>,
     pub(crate) hover_suppressed: bool,
     /// Pre-decoded termielle face frames (downscaled to [`FACE_SIZE`]) plus
@@ -120,6 +122,8 @@ pub struct Controller {
     pub(crate) tasks: Vec<crate::tasks::TaskIcon>,
     /// Queued notification alert banners; the front one shows.
     pub(crate) alerts: VecDeque<AlertBanner>,
+    pub(crate) recent_notifications: VecDeque<RecentNotification>,
+    pub(crate) unread_notifications: usize,
     /// Last controller-clock time, for renders without their own timestamp.
     pub(crate) clock_ms: u64,
     /// When the current visual state began, for one-shot state effects.
@@ -133,6 +137,7 @@ pub struct Controller {
     pub(crate) bar_width: u32,
     /// Next bar periodic refresh deadline; None when not in bar mode.
     pub(crate) bar_deadline: Option<u64>,
+    pub(crate) volume_feedback_deadline: Option<u64>,
     /// Cached bar metrics to prevent heavy COM/Registry/CPU queries on every render.
     /// Most recently rendered transparent content layer for same-geometry
     /// crossfades.
@@ -211,6 +216,9 @@ impl Controller {
             pressed: false,
             manually_expanded: false,
             panel_open: false,
+            panel_kind: RightPanel::Controls,
+            panel_morphing: false,
+            alert_pill_morphing: false,
             hover_expanded: false,
             hover_deadline: None,
             hover_suppressed: false,
@@ -230,10 +238,13 @@ impl Controller {
             clock_ms: 0,
             state_since_ms: 0,
             alerts: VecDeque::new(),
+            recent_notifications: VecDeque::new(),
+            unread_notifications: 0,
             dpi_scale: 1.0,
             user_scale: 1.0,
             bar_width: 1920,
             bar_deadline,
+            volume_feedback_deadline: None,
             content_layer: None,
             content_transition: None,
             interaction_deadline: None,
@@ -285,7 +296,12 @@ impl Controller {
             });
         self.media = update.media;
         self.tasks = update.tasks;
-        if !self.island.is_enabled() || (!media_changed && !tasks_changed) {
+        let hover_closed = self.hover_expanded && !self.hover_content_available();
+        if !self.hover_content_available() {
+            self.hover_deadline = None;
+            self.hover_expanded = false;
+        }
+        if !self.island.is_enabled() || (!media_changed && !tasks_changed && !hover_closed) {
             return false;
         }
 
@@ -294,10 +310,17 @@ impl Controller {
             self.morph_to_target(now_ms);
             return true;
         }
-        if tasks_changed && self.island.is_bar() && self.island.bar.replace_taskbar {
+        if tasks_changed
+            && self.island.is_bar()
+            && (self.island.bar.replace_taskbar || self.bar_module("left", "apps"))
+        {
             self.bar_left_cache = None;
-            self.current =
-                self.render_bar_with_damage(self.state, from.0, from.1, now_ms, BarDamage::LEFT);
+            let damage = if media_changed {
+                BarDamage::LEFT.union(BarDamage::CENTER)
+            } else {
+                BarDamage::LEFT
+            };
+            self.current = self.render_bar_with_damage(self.state, from.0, from.1, now_ms, damage);
             return true;
         }
         if !self.dashboard_expanded() && !self.media_available() {
@@ -326,11 +349,38 @@ impl Controller {
         now_ms: u64,
         dedupe_key: impl Into<String>,
     ) -> bool {
+        self.trigger_alert_from(
+            kind,
+            kind.label(),
+            title,
+            subtitle,
+            accent,
+            duration_ms,
+            now_ms,
+            dedupe_key,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn trigger_alert_from(
+        &mut self,
+        kind: super::types::AlertKind,
+        source: &str,
+        title: impl Into<String>,
+        subtitle: impl Into<String>,
+        accent: [u8; 4],
+        duration_ms: u64,
+        now_ms: u64,
+        dedupe_key: impl Into<String>,
+    ) -> bool {
         if !self.island.is_enabled() {
             return false;
         }
         let previous_geometry = self.current_logical_size();
         let dedupe_key = dedupe_key.into();
+        let title = title.into();
+        let subtitle = subtitle.into();
+        self.remember_notification(&dedupe_key, source, &title, &subtitle, accent, kind);
         if let Some(index) = self
             .alerts
             .iter()
@@ -338,21 +388,23 @@ impl Controller {
         {
             let is_front = index == 0;
             let alert = &mut self.alerts[index];
-            alert.title = title.into();
-            alert.subtitle = subtitle.into();
+            alert.title = title;
+            alert.subtitle = subtitle;
             alert.accent = accent;
             alert.duration_ms = duration_ms;
             alert.expires_at_ms = is_front.then(|| now_ms.saturating_add(duration_ms));
             if is_front {
                 let (width, height) = self.current_logical_size();
                 self.current = self.render_island(self.state, width, height, now_ms);
+            } else if self.is_notification_center_open() {
+                return self.morph_to_target(now_ms);
             }
             return is_front;
         }
 
         let alert = AlertBanner {
-            title: title.into(),
-            subtitle: subtitle.into(),
+            title,
+            subtitle,
             accent,
             kind,
             dedupe_key,
@@ -381,8 +433,12 @@ impl Controller {
         }
         if was_empty || preempts_system {
             self.arm_front_alert(now_ms);
+            self.alert_pill_morphing = true;
         } else {
             // Unseen activities have no visual ownership and no timer yet.
+            if self.is_notification_center_open() {
+                return self.morph_to_target(now_ms);
+            }
             return false;
         }
         if preempts_system
@@ -392,6 +448,38 @@ impl Controller {
             self.begin_content_transition(now_ms);
         }
         self.morph_to_target(now_ms)
+    }
+
+    fn remember_notification(
+        &mut self,
+        dedupe_key: &str,
+        source: &str,
+        title: &str,
+        subtitle: &str,
+        accent: [u8; 4],
+        kind: super::types::AlertKind,
+    ) {
+        let existing = self
+            .recent_notifications
+            .iter()
+            .position(|entry| entry.dedupe_key == dedupe_key);
+        if let Some(index) = existing {
+            self.recent_notifications.remove(index);
+        } else if !self.panel_open || self.panel_kind != RightPanel::Notifications {
+            self.unread_notifications =
+                (self.unread_notifications + 1).min(MAX_RECENT_NOTIFICATIONS);
+        }
+        self.recent_notifications.push_front(RecentNotification {
+            source: source.to_string(),
+            received_at: crate::system::current_time_text(),
+            title: title.to_string(),
+            subtitle: subtitle.to_string(),
+            accent,
+            kind,
+            dedupe_key: dedupe_key.to_string(),
+        });
+        self.recent_notifications.truncate(MAX_RECENT_NOTIFICATIONS);
+        self.bar_right_cache = None;
     }
 
     /// Starts the visible banner's timeout only when it reaches the front.
@@ -414,8 +502,12 @@ impl Controller {
         self.hover_deadline = None;
         self.hover_suppressed = false;
         if mode_changed {
+            self.volume_feedback_deadline = None;
             self.pressed = false;
             self.manually_expanded = false;
+            self.panel_open = false;
+            self.panel_morphing = false;
+            self.alert_pill_morphing = self.island.is_bar() && !self.alerts.is_empty();
             self.interaction_deadline = None;
             self.hover_point = None;
             self.separation = None;
@@ -461,11 +553,11 @@ impl Controller {
     }
 
     /// Feeds the measured cost of the last present back into frame pacing.
-    /// Opens the control panel body. The pill's glyph is the user-facing
-    /// door; this is the same door for the review harness and for a host that
-    /// wants to show the panel directly.
+    /// Opens the Control Center popover without changing the island card.
     pub fn open_control_panel(&mut self, now_ms: u64) -> bool {
         self.panel_open = true;
+        self.panel_kind = RightPanel::Controls;
+        self.panel_morphing = false;
         self.morph_to_target(now_ms)
     }
 
@@ -492,8 +584,9 @@ impl Controller {
         if accepted && self.island.is_enabled() {
             match kind {
                 termielle_core::EventKind::NeedsInput if fresh => {
-                    self.trigger_alert(
+                    self.trigger_alert_from(
                         super::types::AlertKind::Agent,
+                        &source,
                         "Input",
                         source.clone(),
                         crate::animation::notch::accent_colors(VisualState::NeedsInput).0,
@@ -504,8 +597,9 @@ impl Controller {
                     actions.present_frame = true;
                 }
                 termielle_core::EventKind::TurnFailed if fresh => {
-                    self.trigger_alert(
+                    self.trigger_alert_from(
                         super::types::AlertKind::Agent,
+                        &source,
                         "Failed",
                         source.clone(),
                         crate::animation::notch::accent_colors(VisualState::Failed).0,
@@ -528,11 +622,27 @@ impl Controller {
         self.clock_ms = now_ms;
         self.reducer.advance(now_ms);
         let mut actions = self.sync_state(now_ms);
+        if self.volume_feedback_deadline.is_some_and(|at| now_ms >= at) {
+            self.volume_feedback_deadline = None;
+            if self.island.is_bar() {
+                let (width, height) = self.current_logical_size();
+                self.current = self.render_bar_with_damage(
+                    self.state,
+                    width,
+                    height,
+                    now_ms,
+                    BarDamage::CENTER,
+                );
+                actions.present_frame = true;
+            }
+        }
         if let Some((expanded, at)) = self.hover_deadline {
             if now_ms >= at {
                 self.hover_deadline = None;
-                self.hover_expanded = expanded;
-                actions.present_frame |= self.morph_to_target(now_ms);
+                if !expanded || self.hover_content_available() {
+                    self.hover_expanded = expanded;
+                    actions.present_frame |= self.morph_to_target(now_ms);
+                }
             }
         }
 
@@ -609,6 +719,12 @@ impl Controller {
                 if target_reached {
                     self.spring = None;
                     self.separation = None;
+                    if self.alerts.is_empty() {
+                        self.alert_pill_morphing = false;
+                    }
+                    if !self.panel_open {
+                        self.panel_morphing = false;
+                    }
                     self.current = self.render_island(self.state, target_w, target_h, now_ms);
                     self.frame_deadline = None;
                     self.arm_face_deadline(now_ms);
@@ -783,6 +899,9 @@ impl Controller {
             deadline = Some(deadline.map_or(interaction_at, |at| at.min(interaction_at)));
         }
         if self.island.is_bar() {
+            if let Some(volume_at) = self.volume_feedback_deadline {
+                deadline = Some(deadline.map_or(volume_at, |at| at.min(volume_at)));
+            }
             if let Some(bar_at) = self.bar_deadline {
                 deadline = match deadline {
                     Some(d) => Some(d.min(bar_at)),
@@ -852,6 +971,10 @@ impl Controller {
             if state == VisualState::Idle {
                 self.manually_expanded = false;
                 self.interaction_deadline = None;
+            }
+            if !self.hover_content_available() {
+                self.hover_deadline = None;
+                self.hover_expanded = false;
             }
             if self.island.is_enabled() {
                 self.refresh_face(state);
@@ -991,6 +1114,148 @@ mod tests {
     use super::*;
     use termielle_core::{EventKind, EventMessage, IslandLayout, Source};
 
+    fn volume_bar() -> Controller {
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            true,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                widgets: Vec::new(),
+                ..IslandConfig::default()
+            },
+        );
+        controller.set_bar_width(800);
+        controller.set_bar_metrics(
+            crate::bar::metrics::Snapshot {
+                volume: crate::bar::volume::VolumeSnapshot {
+                    level: 40,
+                    muted: false,
+                },
+                ..Default::default()
+            },
+            1_000,
+        );
+        controller.on_timer(2_000);
+        controller
+    }
+
+    fn center_pixels(controller: &Controller) -> Vec<u8> {
+        controller
+            .current_frame()
+            .pixels_pbgra
+            .chunks_exact(800 * 4)
+            .flat_map(|row| row[300 * 4..500 * 4].iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn volume_feedback_starts_only_on_change_and_restores_resting_pill() {
+        let mut controller = volume_bar();
+        assert!(controller.volume_feedback_deadline.is_none());
+        let resting = center_pixels(&controller);
+        let hits = controller.click_regions().to_vec();
+        let mut snapshot = controller.bar_metrics_cache.clone().unwrap();
+        snapshot.volume.level = 60;
+        assert!(controller.set_bar_metrics(snapshot.clone(), 2_100));
+        assert_eq!(controller.volume_feedback_deadline, Some(3_600));
+        assert_eq!(controller.next_deadline_ms(), Some(3_600));
+        assert_ne!(center_pixels(&controller), resting);
+        assert_eq!(controller.click_regions(), hits);
+        assert_eq!(
+            controller.current_frame().height,
+            controller.island.bar.height
+        );
+        assert!(!controller.manually_expanded);
+        assert!(!controller.hover_expanded);
+        assert!(controller.spring.is_none());
+
+        snapshot.cpu_pct = 25;
+        controller.set_bar_metrics(snapshot.clone(), 2_600);
+        assert_eq!(controller.volume_feedback_deadline, Some(3_600));
+        snapshot.volume.level = 80;
+        controller.set_bar_metrics(snapshot, 3_000);
+        assert_eq!(controller.volume_feedback_deadline, Some(4_500));
+        controller.on_timer(3_600);
+        assert_eq!(controller.volume_feedback_deadline, Some(4_500));
+        assert!(controller.on_timer(4_500).present_frame);
+        assert!(controller.volume_feedback_deadline.is_none());
+        assert_eq!(center_pixels(&controller), resting);
+    }
+
+    #[test]
+    fn volume_feedback_distinguishes_muted_zero_and_audible_levels() {
+        let mut controller = volume_bar();
+        let mut snapshot = controller.bar_metrics_cache.clone().unwrap();
+        snapshot.volume.muted = true;
+        controller.set_bar_metrics(snapshot.clone(), 2_100);
+        let muted = center_pixels(&controller);
+        snapshot.volume.muted = false;
+        snapshot.volume.level = 0;
+        controller.set_bar_metrics(snapshot.clone(), 2_200);
+        let zero = center_pixels(&controller);
+        assert_ne!(muted, zero);
+        snapshot.volume.level = 100;
+        controller.set_bar_metrics(snapshot, 2_300);
+        assert_ne!(center_pixels(&controller), zero);
+        assert_eq!(controller.volume_feedback_deadline, Some(3_800));
+    }
+
+    #[test]
+    fn volume_feedback_preserves_control_center_and_expanded_card_priority() {
+        let mut controller = volume_bar();
+        controller.open_control_panel(2_100);
+        let height = controller.current_frame().height;
+        let hover_deadline = controller.hover_deadline;
+        let mut snapshot = controller.bar_metrics_cache.clone().unwrap();
+        snapshot.volume.level = 60;
+        controller.set_bar_metrics(snapshot.clone(), 2_200);
+        assert!(controller.is_panel_open());
+        assert!(!controller.manually_expanded);
+        assert!(!controller.hover_expanded);
+        assert_eq!(controller.hover_deadline, hover_deadline);
+        assert_eq!(controller.current_frame().height, height);
+        controller.on_timer(3_700);
+        assert!(controller.is_panel_open());
+
+        controller.toggle_expand(3_800);
+        let expanded = center_pixels(&controller);
+        let height = controller.current_frame().height;
+        snapshot.volume.level = 80;
+        controller.set_bar_metrics(snapshot, 3_900);
+        assert!(controller.manually_expanded);
+        assert!(controller.is_panel_open());
+        assert_eq!(controller.current_frame().height, height);
+        assert_eq!(center_pixels(&controller), expanded);
+    }
+
+    #[test]
+    fn volume_feedback_never_replaces_an_alert_or_carries_across_layouts() {
+        let mut controller = volume_bar();
+        controller.trigger_alert(
+            super::super::types::AlertKind::System,
+            "A message",
+            "Notification content",
+            [120, 140, 160, 255],
+            6_000,
+            2_100,
+            "volume-priority",
+        );
+        let alert = center_pixels(&controller);
+        let mut snapshot = controller.bar_metrics_cache.clone().unwrap();
+        snapshot.volume.level = 60;
+        controller.set_bar_metrics(snapshot, 2_200);
+        assert_eq!(center_pixels(&controller), alert);
+        assert_eq!(controller.alerts.len(), 1);
+        assert_eq!(controller.alerts.front().unwrap().title, "A message");
+        let mut island = controller.island.clone();
+        island.layout = IslandLayout::Island;
+        controller.set_island_config(island, 2_300);
+        assert!(controller.volume_feedback_deadline.is_none());
+    }
+
     fn quiet_island() -> Controller {
         Controller::new_with_island(
             5_000,
@@ -1036,6 +1301,42 @@ mod tests {
         c.on_timer(1_140);
         assert!(c.content_transition.is_none());
         assert!(c.next_deadline_ms().is_none());
+    }
+
+    #[test]
+    fn recent_notification_keeps_exact_source_and_arrival_time() {
+        use super::super::types::AlertKind;
+
+        let mut controller = quiet_island();
+        controller.trigger_alert_from(
+            AlertKind::System,
+            "Messages",
+            "Hello",
+            "Messages: See you soon",
+            [255; 4],
+            6_000,
+            1_000,
+            "toast:one",
+        );
+        let entry = &controller.recent_notifications[0];
+        assert_eq!(entry.source, "Messages");
+        assert_eq!(entry.title, "Hello");
+        assert_eq!(entry.received_at.len(), 5);
+        assert_eq!(entry.received_at.as_bytes()[2], b':');
+
+        controller.trigger_alert_from(
+            AlertKind::System,
+            "Mail",
+            "Updated",
+            "Mail: New body",
+            [255; 4],
+            6_000,
+            1_100,
+            "toast:one",
+        );
+        assert_eq!(controller.recent_notifications.len(), 1);
+        assert_eq!(controller.recent_notifications[0].source, "Mail");
+        assert_eq!(controller.recent_notifications[0].title, "Updated");
     }
 
     #[test]
@@ -1177,7 +1478,135 @@ mod tests {
             },
         );
         c.set_bar_width(1536);
+        c.set_task_update_at(
+            WorkerUpdate {
+                media: Some(crate::tasks::MediaInfo {
+                    title: "Test song".into(),
+                    playing: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            0,
+        );
         c
+    }
+
+    #[test]
+    fn empty_bar_hover_stays_collapsed_and_click_opens_dashboard() {
+        let mut controller = bar_with_hover(true);
+        controller.set_task_update_at(WorkerUpdate::default(), 1_000);
+        assert!(!controller.set_hover(true, 1_100));
+        assert!(controller.hover_deadline.is_none());
+        controller.on_timer(1_100 + Controller::HOVER_DWELL_MS);
+        assert!(!controller.hover_expanded);
+        assert!(!controller.island_card_open());
+
+        let (pill_x, pill_y, pill_width, pill_height) = controller.bar_pill_rect(1536);
+        assert!(matches!(
+            controller.handle_click(
+                pill_x + pill_width as i32 / 2,
+                pill_y + pill_height as i32 / 2,
+                2_000
+            ),
+            crate::app::types::ClickOutcome::Expanded
+        ));
+    }
+
+    #[test]
+    fn idle_bar_today_card_has_shortcuts_without_changing_live_card_size() {
+        let mut controller = bar_with_hover(true);
+        assert_eq!(controller.bar_island_height(), 175);
+        controller.set_task_update_at(WorkerUpdate::default(), 1_000);
+        assert_eq!(controller.bar_island_height(), 164);
+
+        let (pill_x, pill_y, pill_width, pill_height) = controller.bar_pill_rect(1536);
+        assert!(matches!(
+            controller.handle_click(
+                pill_x + pill_width as i32 / 2,
+                pill_y + pill_height as i32 / 2,
+                2_000
+            ),
+            crate::app::types::ClickOutcome::Expanded
+        ));
+        controller.on_timer(2_100);
+
+        let search_id = crate::bar::shell::ShellAction::Search.hit_id();
+        let (_, search_x, search_y, search_width, search_height) = controller
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == search_id)
+            .copied()
+            .expect("Today card has Search");
+        assert!(search_y >= controller.island.bar.height as i32);
+        assert!(matches!(
+            controller.handle_click(
+                search_x + search_width as i32 / 2,
+                search_y + search_height as i32 / 2,
+                2_200
+            ),
+            crate::app::types::ClickOutcome::Shell(crate::bar::shell::ShellAction::Search)
+        ));
+
+        let (_, notifications_x, notifications_y, notifications_width, notifications_height) =
+            controller
+                .click_regions()
+                .iter()
+                .find(|(id, _, y, ..)| {
+                    *id == crate::app::types::HIT_CARD_NOTIFICATIONS
+                        && *y >= controller.island.bar.height as i32
+                })
+                .copied()
+                .expect("Today card has Notifications");
+        assert!(matches!(
+            controller.handle_click(
+                notifications_x + notifications_width as i32 / 2,
+                notifications_y + notifications_height as i32 / 2,
+                2_300
+            ),
+            crate::app::types::ClickOutcome::PanelToggled
+        ));
+        assert!(controller.is_notification_center_open());
+        assert!(controller.is_manually_expanded());
+    }
+
+    #[test]
+    fn removing_media_closes_a_hover_opened_bar_card() {
+        let mut controller = bar_with_hover(true);
+        controller.set_hover(true, 1_000);
+        controller.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+        assert!(controller.hover_expanded);
+
+        controller.set_task_update_at(WorkerUpdate::default(), 2_000);
+        assert!(!controller.hover_expanded);
+        assert!(controller.hover_deadline.is_none());
+    }
+
+    #[test]
+    fn empty_standalone_pill_only_opens_on_click() {
+        for layout in [IslandLayout::Notch, IslandLayout::Island] {
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                true,
+                None,
+                IslandConfig {
+                    layout,
+                    expand_on_hover: true,
+                    ..IslandConfig::default()
+                },
+            );
+            assert!(!controller.set_hover(true, 1_000));
+            controller.on_timer(1_000 + Controller::HOVER_DWELL_MS);
+            assert!(!controller.hover_expanded);
+
+            let (width, height) = controller.current_logical_size();
+            assert!(matches!(
+                controller.handle_click(width as i32 / 2, height as i32 / 2, 2_000),
+                crate::app::types::ClickOutcome::Expanded
+            ));
+        }
     }
 
     /// A bar's pill is the Dynamic Island: with `expand_on_hover` on, dwelling

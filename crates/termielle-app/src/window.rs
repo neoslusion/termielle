@@ -162,6 +162,7 @@ pub enum WindowEvent {
     ToggleHoverExpand,
     /// Tray toggled the Termielle face widget.
     ToggleFace,
+    ToggleBarModule(&'static str),
     /// Windows light/dark theme setting changed; re-resolve `auto`.
     SystemThemeChanged,
 }
@@ -720,6 +721,13 @@ unsafe extern "system" fn window_proc(
                                     .send(WindowEvent::ThemeChanged("midnight".into()))
                             };
                         }
+                        tray::TRAY_THEME_CATPPUCCIN_MACCHIATO => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("catppuccin-macchiato".into()))
+                            };
+                        }
                         tray::TRAY_THEME_LIGHT => {
                             let _ = unsafe {
                                 (*state)
@@ -782,6 +790,35 @@ unsafe extern "system" fn window_proc(
                         }
                         tray::TRAY_TOGGLE_FACE => {
                             let _ = unsafe { (*state).events.send(WindowEvent::ToggleFace) };
+                        }
+                        tray::TRAY_TOGGLE_BAR_CPU => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::ToggleBarModule("cpu"))
+                            };
+                        }
+                        tray::TRAY_TOGGLE_BAR_MEMORY => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::ToggleBarModule("memory"))
+                            };
+                        }
+                        tray::TRAY_TOGGLE_BAR_VOLUME => {
+                            let _ = unsafe {
+                                (*state).events.send(WindowEvent::ToggleBarModule("volume"))
+                            };
+                        }
+                        tray::TRAY_TOGGLE_BAR_BATTERY => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ToggleBarModule("battery"))
+                            };
+                        }
+                        tray::TRAY_TOGGLE_BAR_NETWORK => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ToggleBarModule("network"))
+                            };
                         }
                         _ => {}
                     }
@@ -1075,7 +1112,7 @@ impl OverlayWindow {
             return Ok(Some(event));
         }
         let mut message = MSG::default();
-        let result = unsafe { GetMessageW(&mut message, Some(self.hwnd), 0, 0) };
+        let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
         if result.0 == 0 {
             return Ok(Some(WindowEvent::Quit));
         }

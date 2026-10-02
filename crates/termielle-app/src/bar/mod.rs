@@ -1,6 +1,7 @@
 //! Waybar-style modular status bar components and hit testing.
 
 pub mod appbar;
+pub mod connectivity;
 pub mod metrics;
 pub mod shell;
 pub mod volume;

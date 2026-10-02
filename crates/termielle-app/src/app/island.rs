@@ -70,8 +70,16 @@ impl Controller {
             now_ms,
         );
         let age_ms = now_ms.saturating_sub(self.state_since_ms);
-        let (motion_alpha, dx, dy) =
+        let (mut motion_alpha, dx, mut dy) =
             Self::content_motion(self.spring.as_ref(), presentation, state, age_ms);
+        if !self.alerts.is_empty() && self.spring.is_some() {
+            let (target_w, target_h) = self.target_size(state);
+            let fit =
+                (width as f32 / target_w.max(1) as f32).min(height as f32 / target_h.max(1) as f32);
+            motion_alpha =
+                (255.0 * crate::animation::notch::smoothstep(0.35, 0.9, fit)).round() as u8;
+            dy = ((1.0 - fit).max(0.0) * 4.0).round() as i32;
+        }
         let swap = self.content_transition.as_ref().map(|transition| {
             let elapsed = now_ms.saturating_sub(transition.started_ms);
             let linear = (elapsed as f32 / transition.duration_ms.max(1) as f32).clamp(0.0, 1.0);
@@ -195,13 +203,17 @@ impl Controller {
         self.island.has_widget("music") && self.media.is_some()
     }
 
+    pub(crate) fn hover_content_available(&self) -> bool {
+        self.state != VisualState::Idle || self.media_available() || !self.alerts.is_empty()
+    }
+
     /// The largest size this surface can reach from here, in logical pixels.
     /// The frosted backdrop captures a rect up front rather than a rect per
     /// frame, so it needs to know how far the surface can travel.
     pub fn max_surface_size(&self) -> (u32, u32) {
         let (mut w, mut h) = self.target_size(self.state);
-        // An alert banner is the tallest thing the island can show, and it can
-        // arrive while the surface is mid-morph.
+        // Reserve the tallest combined media/tasks dashboard even while the
+        // surface is mid-morph.
         w = w.max(self.island.expanded_width.max(320));
         h = h.max(210u32).max(self.island.height);
         (w, h)
@@ -229,9 +241,6 @@ impl Controller {
         if self.island.is_bar() {
             let w = self.bar_width;
             let base_h = self.island.bar.height;
-            if !self.alerts.is_empty() {
-                return (w, base_h + 124 + BAR_POPUP_GAP);
-            }
             return match self.presentation() {
                 crate::animation::notch::Presentation::Expanded => {
                     (w, base_h + self.bar_expanded_height() + BAR_POPUP_GAP)
@@ -241,7 +250,7 @@ impl Controller {
         }
         if !self.alerts.is_empty() {
             let w = self.island.expanded_width.max(320);
-            return (w, 124u32.max(self.island.height));
+            return (w, super::types::ALERT_HEIGHT.max(self.island.height));
         }
         match self.presentation() {
             crate::animation::notch::Presentation::Expanded => {
@@ -625,13 +634,21 @@ impl Controller {
         snapshot: crate::bar::metrics::Snapshot,
         now_ms: u64,
     ) -> bool {
-        let damage = metrics_damage(self.bar_metrics_cache.as_ref(), &snapshot);
+        let volume_changed = self
+            .bar_metrics_cache
+            .as_ref()
+            .is_some_and(|previous| previous.volume != snapshot.volume);
+        let mut damage = metrics_damage(self.bar_metrics_cache.as_ref(), &snapshot);
         if damage == BarDamage::NONE {
             return false;
         }
         self.bar_metrics_cache = Some(snapshot);
         if !self.island.is_bar() {
             return false;
+        }
+        if volume_changed && self.bar_module("center", "termielle") {
+            self.volume_feedback_deadline = Some(now_ms.saturating_add(1_500));
+            damage = damage.union(BarDamage::CENTER);
         }
         if damage.contains(BarDamage::CENTER) {
             self.bar_left_cache = None;
@@ -674,62 +691,57 @@ impl Controller {
                     );
                 }
                 crate::bar::HIT_BAR_VOLUME_TOGGLE => return ClickOutcome::VolumeToggle,
-                crate::app::types::HIT_CARD_PANEL => {
-                    // Control Center is its own surface, not a body of the
-                    // island's card. It used to set `manually_expanded` and
-                    // paint itself inside that card, which is exactly why the
-                    // panel and the pill read as one object: the island's
-                    // header sat on top of it, the pill's hover could take it
-                    // away, and dismissing "the card" dismissed the panel.
-                    if self.panel_open {
-                        self.panel_open = false;
+                crate::app::types::HIT_CARD_NOTIFICATIONS => {
+                    if self.panel_open
+                        && self.panel_kind == crate::app::types::RightPanel::Notifications
+                    {
+                        self.close_panel(now_ms);
+                    } else {
+                        self.panel_open = true;
+                        self.panel_kind = crate::app::types::RightPanel::Notifications;
+                        self.panel_morphing = false;
+                        self.unread_notifications = 0;
+                        self.bar_right_cache = None;
+                        self.interaction_deadline = Some(now_ms.saturating_add(100));
                         self.morph_to_target(now_ms);
+                    }
+                    return ClickOutcome::PanelToggled;
+                }
+                crate::app::types::HIT_NOTIFICATIONS_CLEAR => {
+                    self.recent_notifications.clear();
+                    self.unread_notifications = 0;
+                    self.morph_to_target(now_ms);
+                    return ClickOutcome::NotificationsCleared;
+                }
+                crate::app::types::HIT_PANEL_VOLUME_TRACK => {
+                    if let Some((_, track_x, _, track_width, _)) = self
+                        .icon_hits
+                        .iter()
+                        .find(|&&(hit, ..)| hit == crate::app::types::HIT_PANEL_VOLUME_TRACK)
+                        .copied()
+                    {
+                        let level = ((x - track_x) * 100
+                            / track_width.saturating_sub(1).max(1) as i32)
+                            .clamp(0, 100);
+                        return ClickOutcome::VolumeSet(level as u8);
+                    }
+                }
+                crate::app::types::HIT_CARD_PANEL => {
+                    if self.panel_open && self.panel_kind == crate::app::types::RightPanel::Controls
+                    {
+                        self.close_panel(now_ms);
                         return ClickOutcome::PanelToggled;
                     }
-                    // One surface at a time. They are separate, so opening one
-                    // clears the other rather than nesting inside it.
-                    self.claim_window(now_ms);
                     self.panel_open = true;
+                    self.panel_kind = crate::app::types::RightPanel::Controls;
+                    self.panel_morphing = false;
                     self.interaction_deadline = Some(now_ms.saturating_add(100));
                     self.morph_to_target(now_ms);
                     return ClickOutcome::PanelToggled;
                 }
-                crate::app::types::HIT_PANEL_VOLUME_DOWN
-                | crate::app::types::HIT_PANEL_VOLUME_UP => {
-                    let (level, _) = self.panel_volume();
-                    let step = if id == crate::app::types::HIT_PANEL_VOLUME_DOWN {
-                        -(crate::app::types::PANEL_VOLUME_STEP as i32)
-                    } else {
-                        crate::app::types::PANEL_VOLUME_STEP as i32
-                    };
-                    return ClickOutcome::VolumeSet((i32::from(level) + step).clamp(0, 100) as u8);
-                }
-                id if id <= crate::app::types::HIT_PANEL_TOGGLE_BASE
-                    && id > crate::app::types::HIT_PANEL_TOGGLE_BASE - 8 =>
-                {
-                    let offset = crate::app::types::HIT_PANEL_TOGGLE_BASE - id;
-                    let setting = match offset {
-                        0 => crate::app::types::PanelToggle::HoverExpand,
-                        1 => crate::app::types::PanelToggle::Face,
-                        _ => crate::app::types::PanelToggle::Music,
-                    };
-                    return ClickOutcome::PanelToggle(setting);
-                }
                 crate::bar::HIT_BAR_TERMIELLE_MODULE => {
-                    // The pill is the island, not the panel. While the panel
-                    // is open, pressing the pill dismisses the panel and
-                    // nothing else: swapping straight to the island's card
-                    // morphed the pill away as it dismissed, which read as
-                    // "dismissing the panel collapsed the pill too".
-                    if self.panel_open {
-                        // The pill is the island's own control. It is not a
-                        // dismiss button for the Control Center: a press here
-                        // while the panel is up is the island's business, and
-                        // the panel is only ever closed by the panel.
-                        return ClickOutcome::None;
-                    }
                     if self.manually_expanded || self.hover_expanded {
-                        self.collapse_if_expanded(now_ms);
+                        self.close_notch(now_ms);
                         return ClickOutcome::Collapsed;
                     }
                     self.toggle_expand(now_ms);
@@ -790,13 +802,7 @@ impl Controller {
         if !self.island.is_enabled() {
             return false;
         }
-        if self.panel_open {
-            // Clicking the pill opens the island's card, so the panel steps
-            // aside rather than nesting inside it - through the panel's own
-            // close, so it is torn down the same way its own icon closes it.
-            self.close_panel(now_ms);
-        }
-        if self.collapse_if_expanded(now_ms) {
+        if self.manually_expanded && self.close_notch(now_ms) {
             return true;
         }
         self.manually_expanded = true;
@@ -818,7 +824,19 @@ impl Controller {
     /// Whether the Control Center panel is open. It is a surface of its own,
     /// not a body of the island's card, so callers can ask about it directly.
     pub fn is_panel_open(&self) -> bool {
-        self.panel_open
+        self.panel_open && self.panel_kind == crate::app::types::RightPanel::Controls
+    }
+
+    pub fn is_notification_center_open(&self) -> bool {
+        self.panel_open && self.panel_kind == crate::app::types::RightPanel::Notifications
+    }
+
+    pub fn recent_notification_count(&self) -> usize {
+        self.recent_notifications.len()
+    }
+
+    pub fn unread_notification_count(&self) -> usize {
+        self.unread_notifications
     }
 
     /// Whether the island is currently manually expanded into the full card.
@@ -839,6 +857,7 @@ impl Controller {
             return false;
         }
         self.panel_open = false;
+        self.panel_morphing = true;
         self.morph_to_target(now_ms)
     }
 
@@ -859,27 +878,8 @@ impl Controller {
         was_open || moved
     }
 
-    /// The window has one geometry, so only one of the two cards can be drawn.
-    /// This is the single place that says so.
-    ///
-    /// It used to be spread over five arms, each reaching into the other
-    /// surface's flags: opening the panel cleared `manually_expanded`,
-    /// `hover_expanded` and `hover_deadline`, and opening the pill cleared
-    /// `panel_open`. Any of those could be missed by a new arm, and a miss
-    /// left both cards believing they owned the window. Rule: opening one
-    /// surface dismisses the other through the other's own close, so each
-    /// surface is still torn down by the code that belongs to it.
-    fn claim_window(&mut self, now_ms: u64) {
-        self.close_notch(now_ms);
-    }
-
-    /// Dismisses whichever surface is showing, for Escape and click-outside.
-    ///
-    /// This is the one shared entry point, and it is shared on purpose: both
-    /// keys mean "dismiss what I am looking at". It dispatches to each
-    /// surface's own close rather than collapsing them together, so closing
-    /// the panel cannot leave the island half-torn-down and closing the
-    /// island cannot leave the panel open.
+    /// Dismisses the Control Center first, then the island card, when both
+    /// are open. Escape and click-outside use this shared entry point.
     pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
         if !self.island.is_enabled() {
             return false;
@@ -913,6 +913,14 @@ impl Controller {
         }
         if !self.island.expand_on_hover {
             // Turning the setting off has to close whatever hover opened.
+            self.hover_deadline = None;
+            if !self.hover_expanded {
+                return false;
+            }
+            self.hover_expanded = false;
+            return self.morph_to_target(now_ms);
+        }
+        if !self.hover_content_available() {
             self.hover_deadline = None;
             if !self.hover_expanded {
                 return false;
@@ -1037,6 +1045,9 @@ impl Controller {
     /// velocity, exactly like the Dynamic Island. The corner radius and
     /// the blob separation ride the same motion.
     pub(crate) fn morph_to_target(&mut self, now_ms: u64) -> bool {
+        if self.island.is_bar() && self.panel_open && self.alerts.is_empty() {
+            self.alert_pill_morphing = false;
+        }
         let (mut target_w, mut target_h) = self.target_size(self.state);
         let mut target_r = self.target_radius();
         // Press swell: inflate the target a few percent while held (not in bar mode).
@@ -1066,6 +1077,12 @@ impl Controller {
         if self.reduced_motion {
             self.spring = None;
             self.separation = None;
+            if self.alerts.is_empty() {
+                self.alert_pill_morphing = false;
+            }
+            if !self.panel_open {
+                self.panel_morphing = false;
+            }
             self.radius = target_r;
             self.current = self.render_island(self.state, target_w, target_h, now_ms);
             self.frame_deadline = None;
@@ -1093,6 +1110,9 @@ impl Controller {
             && vel_z.abs() < 1.0
         {
             self.spring = None;
+            if self.alerts.is_empty() {
+                self.alert_pill_morphing = false;
+            }
             self.radius = target_r;
             self.current = self.render_island(self.state, target_w, target_h, now_ms);
             self.frame_deadline = None;

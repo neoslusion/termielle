@@ -19,24 +19,121 @@ impl Controller {
             let text_x = ctx.pad + if island.has_widget("face") { 30 } else { 0 };
             crate::animation::notch::draw_text(
                 frame,
-                "Termielle",
+                "Today",
                 text_x,
                 16,
-                text_w.saturating_sub(30),
-                10,
-                true,
-                self.ink_dim(),
-            );
-            crate::animation::notch::draw_text(
-                frame,
-                "Idle",
-                ctx.pad,
-                72,
-                text_w,
-                18,
+                text_w.saturating_sub(122),
+                13,
                 true,
                 self.ink(),
             );
+            let date = crate::system::current_date_text();
+            crate::animation::notch::draw_text(
+                frame,
+                &date,
+                ctx.width as i32 - ctx.pad - 94,
+                17,
+                94,
+                10,
+                false,
+                self.ink_dim(),
+            );
+
+            let preview_y = 54;
+            crate::animation::notch::draw_rounded_rect(
+                frame,
+                ctx.pad,
+                preview_y,
+                text_w,
+                52,
+                10,
+                [255, 255, 255, 20],
+                [0; 4],
+            );
+            if let Some(notification) = self.recent_notifications.front() {
+                crate::animation::notch::draw_rounded_rect(
+                    frame,
+                    ctx.pad + 10,
+                    preview_y + 9,
+                    4,
+                    34,
+                    2,
+                    notification.accent,
+                    [0; 4],
+                );
+                crate::animation::notch::draw_text(
+                    frame,
+                    &notification.title,
+                    ctx.pad + 23,
+                    preview_y + 7,
+                    text_w.saturating_sub(34),
+                    12,
+                    true,
+                    self.ink(),
+                );
+                crate::animation::notch::draw_text(
+                    frame,
+                    &notification.subtitle,
+                    ctx.pad + 23,
+                    preview_y + 29,
+                    text_w.saturating_sub(34),
+                    10,
+                    false,
+                    self.ink_dim(),
+                );
+            } else {
+                crate::animation::notch::draw_text(
+                    frame,
+                    "All caught up",
+                    ctx.pad + 12,
+                    preview_y + 17,
+                    text_w.saturating_sub(24),
+                    12,
+                    false,
+                    self.ink_dim(),
+                );
+            }
+
+            let button_y = 119;
+            let button_gap = 8;
+            let button_width = text_w.saturating_sub(button_gap) / 2;
+            for (index, (label, hit_id)) in [
+                ("Search", crate::bar::shell::ShellAction::Search.hit_id()),
+                ("Notifications", crate::app::types::HIT_CARD_NOTIFICATIONS),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let button_x = ctx.pad + index as i32 * (button_width as i32 + button_gap as i32);
+                let hovered = self.hover_point.is_some_and(|(x, y)| {
+                    x >= button_x
+                        && x < button_x + button_width as i32
+                        && y >= button_y
+                        && y < button_y + 30
+                });
+                crate::animation::notch::draw_rounded_rect(
+                    frame,
+                    button_x,
+                    button_y,
+                    button_width,
+                    30,
+                    9,
+                    [255, 255, 255, if hovered { 40 } else { 24 }],
+                    [0; 4],
+                );
+                crate::animation::notch::draw_text(
+                    frame,
+                    label,
+                    button_x + 9,
+                    button_y + 8,
+                    button_width.saturating_sub(18),
+                    10,
+                    true,
+                    self.ink(),
+                );
+                self.icon_hits
+                    .push((hit_id, button_x, button_y, button_width, 30));
+            }
             return;
         }
         // Default Clean Standby & Glanceables Dashboard

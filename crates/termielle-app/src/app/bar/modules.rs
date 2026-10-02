@@ -45,6 +45,10 @@ pub(crate) struct BarModule {
 
 pub(crate) const MODULES: &[BarModule] = &[
     BarModule {
+        id: "apps",
+        zone: BarZone::Left,
+    },
+    BarModule {
         id: "workspaces",
         zone: BarZone::Left,
     },
@@ -62,6 +66,10 @@ pub(crate) const MODULES: &[BarModule] = &[
     },
     BarModule {
         id: "memory",
+        zone: BarZone::Right,
+    },
+    BarModule {
+        id: "network",
         zone: BarZone::Right,
     },
     BarModule {
@@ -110,12 +118,17 @@ pub(crate) fn metrics_damage(
         return BarDamage::FULL;
     };
     let mut damage = BarDamage::NONE;
-    if previous.workspaces != next.workspaces || previous.window_title != next.window_title {
+    if previous.workspaces != next.workspaces
+        || previous.foreground_hwnd != next.foreground_hwnd
+        || previous.window_title != next.window_title
+        || previous.foreground_icon != next.foreground_icon
+    {
         damage = damage.union(BarDamage::LEFT);
     }
     if previous.time_str != next.time_str
         || previous.battery != next.battery
         || previous.volume != next.volume
+        || previous.connectivity != next.connectivity
         || previous.memory_pct != next.memory_pct
         || previous.cpu_pct != next.cpu_pct
     {
@@ -133,7 +146,7 @@ mod tests {
     #[test]
     fn descriptors_own_the_expected_zones() {
         let config = BarConfig::default();
-        assert!(module_enabled(&config, BarZone::Left, "workspaces"));
+        assert!(module_enabled(&config, BarZone::Left, "apps"));
         assert!(module_enabled(&config, BarZone::Center, "termielle"));
         assert!(module_enabled(&config, BarZone::Right, "clock"));
         assert!(!module_enabled(&config, BarZone::Right, "termielle"));
@@ -150,6 +163,16 @@ mod tests {
         title.window_title = "editor".into();
         assert_eq!(metrics_damage(Some(&empty), &title), BarDamage::LEFT);
         assert_eq!(metrics_damage(Some(&empty), &empty), BarDamage::NONE);
+
+        let mut icon = empty.clone();
+        icon.foreground_icon = Some(crate::tasks::TaskIcon {
+            hwnd: 1,
+            title: "editor".into(),
+            width: 1,
+            height: 1,
+            pixels_pbgra: vec![20, 80, 180, 255],
+        });
+        assert_eq!(metrics_damage(Some(&empty), &icon), BarDamage::LEFT);
     }
 
     #[test]

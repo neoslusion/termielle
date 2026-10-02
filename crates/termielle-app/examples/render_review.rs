@@ -29,6 +29,10 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--light") {
         termielle_app::theme::apply_theme(&mut config, "light");
     }
+    if std::env::args().any(|arg| arg == "--macchiato") {
+        config.theme = "catppuccin-macchiato".into();
+        termielle_app::theme::apply_theme(&mut config, "catppuccin-macchiato");
+    }
     if std::env::args().any(|arg| arg == "--replace") {
         config.bar.replace_taskbar = true;
     }
@@ -41,7 +45,17 @@ fn main() -> std::io::Result<()> {
         None,
         config,
     );
-    if state == "media" {
+    if state == "notification" {
+        controller.trigger_alert(
+            termielle_app::app::AlertKind::System,
+            "Dinner tonight?",
+            "Messages: Are we still on for 7?",
+            [240, 154, 92, 255],
+            6_000,
+            10_000,
+            "review:notification",
+        );
+    } else if state == "media" {
         controller.set_task_update(WorkerUpdate {
             media: Some(MediaInfo {
                 title: "A quieter afternoon".into(),
@@ -77,7 +91,9 @@ fn main() -> std::io::Result<()> {
                     "failed" => EventKind::TurnFailed,
                     "waiting" => EventKind::NeedsInput,
                     "thinking" => EventKind::PromptSubmitted,
-                    _ => panic!("expected idle, thinking, working, ready, failed, or waiting"),
+                    _ => panic!(
+                        "expected idle, thinking, working, ready, failed, waiting, or notification"
+                    ),
                 },
                 timestamp_ms: 10000,
             },
@@ -117,23 +133,47 @@ fn main() -> std::io::Result<()> {
                 level,
                 muted: level == 0,
             });
-        controller.set_bar_metrics(
-            termielle_app::bar::metrics::Snapshot {
-                workspaces: termielle_app::bar::workspaces::WorkspaceSnapshot {
-                    total: 4,
-                    active: 2,
-                },
-                window_title: "Editor — main.rs — termielle".into(),
-                time_str: "14:32".into(),
-                battery: battery.unwrap_or((None, false, false)),
-                volume: volume.unwrap_or(termielle_app::bar::volume::VolumeSnapshot {
-                    level: 64,
-                    muted: false,
-                }),
-                ..Default::default()
+        let metrics = termielle_app::bar::metrics::Snapshot {
+            workspaces: termielle_app::bar::workspaces::WorkspaceSnapshot {
+                total: 4,
+                active: 2,
             },
-            10000,
-        );
+            foreground_hwnd: if std::env::args().any(|arg| arg == "--tasks") {
+                2
+            } else {
+                0
+            },
+            window_title: "Editor — main.rs — termielle".into(),
+            foreground_icon: std::env::args()
+                .any(|arg| arg == "--macchiato")
+                .then(|| TaskIcon {
+                    hwnd: 1,
+                    title: "Editor — main.rs — termielle".into(),
+                    width: 16,
+                    height: 16,
+                    pixels_pbgra: [196, 173, 138, 255].repeat(16 * 16),
+                }),
+            time_str: "14:32".into(),
+            battery: battery.unwrap_or((None, false, false)),
+            volume: volume.unwrap_or(termielle_app::bar::volume::VolumeSnapshot {
+                level: 64,
+                muted: false,
+            }),
+            connectivity: termielle_app::bar::connectivity::ConnectivitySnapshot {
+                network: termielle_app::bar::connectivity::NetworkState::Online,
+                bluetooth: termielle_app::bar::connectivity::BluetoothState::On,
+            },
+            cpu_pct: 24,
+            memory_pct: 58,
+            ..Default::default()
+        };
+        controller.set_bar_metrics(metrics.clone(), 10000);
+        if std::env::args().any(|arg| arg == "--volume-feedback") {
+            let mut baseline = metrics.clone();
+            baseline.volume.muted = !metrics.volume.muted;
+            controller.set_bar_metrics(baseline, 10000);
+            controller.set_bar_metrics(metrics, 10000);
+        }
         if std::env::args().any(|arg| arg == "--tasks") {
             controller.set_task_update(WorkerUpdate {
                 tasks: (1..=3)
@@ -156,8 +196,37 @@ fn main() -> std::io::Result<()> {
         }
     }
     if std::env::args().any(|arg| arg == "--panel") {
-        // The control panel only exists in bar mode, opened from the pill.
         controller.open_control_panel(10000);
+    }
+    if std::env::args().any(|arg| arg == "--notifications") {
+        for (index, source, title, body) in [
+            (1, "Messages", "A new message", "Dinner tonight at seven?"),
+            (
+                2,
+                "Codex",
+                "Agent finished",
+                "The build completed successfully.",
+            ),
+        ] {
+            controller.trigger_alert_from(
+                termielle_app::app::AlertKind::System,
+                source,
+                title,
+                body,
+                [180, 120, 225, 255],
+                100,
+                10000,
+                format!("review:{index}"),
+            );
+        }
+        if let Some((_, x, y, width, height)) = controller
+            .click_regions()
+            .iter()
+            .find(|(id, ..)| *id == termielle_app::app::HIT_CARD_NOTIFICATIONS)
+            .copied()
+        {
+            controller.handle_click(x + width as i32 / 2, y + height as i32 / 2, 10000);
+        }
     }
     if !compact {
         controller.toggle_expand(10000);

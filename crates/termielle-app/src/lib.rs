@@ -3,6 +3,7 @@ mod apartment;
 pub mod app;
 pub mod backdrop;
 pub mod bar;
+pub mod launcher;
 pub mod log;
 pub mod media;
 pub mod system;

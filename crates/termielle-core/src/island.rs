@@ -65,11 +65,10 @@ impl Default for BarConfig {
             reserve_space: true,
             replace_taskbar: false,
             follow_active_monitor: true,
-            modules_left: vec!["workspaces".to_string(), "window".to_string()],
+            modules_left: vec!["apps".to_string(), "window".to_string()],
             modules_center: vec!["termielle".to_string()],
             modules_right: vec![
-                "cpu".to_string(),
-                "memory".to_string(),
+                "network".to_string(),
                 "volume".to_string(),
                 "battery".to_string(),
                 // Between the status icons and the clock, which is where macOS
@@ -225,11 +224,11 @@ pub struct IslandConfig {
     /// Which 0-100% metric the `ring` widget draws (`battery`, `cpu`,
     /// `mem`). Anything else falls back to `battery` on load.
     pub ring_metric: String,
-    /// When true, hovering the collapsed island expands it (idle only);
-    /// leaving collapses it again unless it was manually toggled.
+    /// When true, hovering reveals available agent, media, or alert content;
+    /// empty-state hover stays collapsed and click can still expand it.
     pub expand_on_hover: bool,
     /// When true, the island completely hides when idle and unhovered,
-    /// popping down into the pill format on top-edge hover (macOS / iOS behavior).
+    /// popping down for live content on top-edge hover.
     /// When false, it rests as the minimal dot or compact pill.
     pub auto_hide: bool,
     /// Forward Windows app toast notifications to the island as transient
