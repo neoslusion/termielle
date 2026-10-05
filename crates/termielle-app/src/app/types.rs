@@ -56,7 +56,7 @@ pub const HIT_NOTIFICATIONS_CLEAR: isize = -521;
 pub const HIT_PANEL_VOLUME_TRACK: isize = -503;
 
 /// What a click on the island should do.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClickOutcome {
     /// Toggle play/pause on the system media session.
     MediaToggle,
@@ -68,6 +68,15 @@ pub enum ClickOutcome {
     AlertDismiss,
     /// Activate a specific window (HWND).
     ActivateWindow(isize),
+    /// User-linked session target, checked again against the native process.
+    ActivateAssociatedWindow(isize, u32),
+    LaunchApp(termielle_core::PinnedApp),
+    CloseAppWindow(isize, u32),
+    NavigationChanged,
+    NavigationPinsChanged,
+    OpenSettings,
+    /// Activity list/picker changed; the host only needs to present it.
+    ActivityChanged,
     /// Switch to a virtual desktop workspace by index.
     WorkspaceSwitch(u32),
     /// Toggle system audio mute.

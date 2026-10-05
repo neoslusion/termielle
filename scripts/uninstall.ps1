@@ -200,6 +200,18 @@ try {
     }
     Write-Good 'Overlay stopped'
 
+    # Remove only our two launchers. Never remove an arbitrary Start-menu folder.
+    $powerShortcuts = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Termielle'
+    foreach ($name in @('Turn Termielle On.lnk', 'Turn Termielle Off.lnk')) {
+        $link = Join-Path $powerShortcuts $name
+        if (Test-Path -LiteralPath $link) {
+            $shell = New-Object -ComObject WScript.Shell
+            if ($shell.CreateShortcut($link).TargetPath -ieq (Join-Path $bin 'termielle-app.exe')) {
+                Remove-Item -LiteralPath $link
+            }
+        }
+    }
+
     if ($record -and $record.task) {
         Write-Step 'Removing the crash-watchdog task'
         Unregister-ScheduledTask -TaskName 'Termielle' -Confirm:$false -ErrorAction SilentlyContinue

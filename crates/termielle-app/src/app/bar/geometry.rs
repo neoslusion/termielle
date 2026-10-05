@@ -20,7 +20,12 @@ impl Controller {
         } else {
             0
         };
-        island_height.max(panel_height)
+        let navigation_height = if self.is_navigation_open() {
+            self.navigation.height()
+        } else {
+            0
+        };
+        island_height.max(panel_height).max(navigation_height)
     }
 
     pub(crate) fn bar_island_height(&self) -> u32 {
@@ -28,6 +33,9 @@ impl Controller {
             || (self.alert_pill_morphing && self.spring.is_some() && !self.island_card_open())
         {
             return crate::app::types::ALERT_HEIGHT;
+        }
+        if self.activity_available() {
+            return self.activity_height();
         }
         let tasks =
             self.island.has_widget("tasks") && self.island.show_tasks && !self.tasks.is_empty();
@@ -124,6 +132,27 @@ impl Controller {
     /// Whether a click is inside the open popup or one of its own bar entries.
     pub fn point_over_open_popup(&self, point: (i32, i32)) -> bool {
         let (cursor_x, cursor_y) = (self.to_logical(point.0), self.to_logical(point.1));
+        if self.is_navigation_open() {
+            let (width, height) = self.current_logical_size();
+            let exp_h = height.saturating_sub(self.island.bar.height + super::types::BAR_POPUP_GAP);
+            let bar_y = if self.island.bar.position == termielle_core::BarPosition::Top {
+                0
+            } else {
+                height.saturating_sub(self.island.bar.height) as i32
+            };
+            let (x, y, w, h) = self.navigation_rect(width, exp_h, bar_y);
+            return (cursor_x >= x
+                && cursor_x < x + w as i32
+                && cursor_y >= y
+                && cursor_y < y + h as i32)
+                || self.icon_hits.iter().any(|hit| {
+                    super::super::navigation::Navigation::is_rail_hit(hit.0)
+                        && cursor_x >= hit.1
+                        && cursor_x < hit.1 + hit.3 as i32
+                        && cursor_y >= hit.2
+                        && cursor_y < hit.2 + hit.4 as i32
+                });
+        }
         let notifications_open =
             self.panel_open && self.panel_kind == crate::app::types::RightPanel::Notifications;
         if !notifications_open && self.point_over_notch_surface(point) {

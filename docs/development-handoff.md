@@ -10,6 +10,14 @@ as a GitHub release.
 - [README](../README.md): installation, agent integrations, privacy, and workspace.
 - [Island and bar guide](island.md): detailed interaction, rendering, and configuration.
 - [Reported behaviours](reported-behaviours.md): root causes, fixes, and verification caveats.
+- [Performance follow-up](performance.md): later idle/caching improvements, measured results, and the Clear All morph fix.
+- [Session activity](session-activity.md): later multi-session list, explicit window links, validation, and limits.
+- [Display recovery](display-recovery.md): lid/Modern Standby crash fix and subsequent local deployment of the activity/recovery build.
+- [App navigation](app-navigation.md): newer pinned/running rail, chooser, overflow, app actions and settings access; installed at user request on 2026-10-04.
+- [Notch background](notch-background.md): confirmed self-capture repair, scoped capture policy, edge math and stale-background rejection; included in the 2026-10-04 installed build.
+- [Desktop UX roadmap](desktop-ux-roadmap.md): approved follow-up scope and acceptance gates.
+- [Whole-application power](application-power.md): persistent tray/preferences Off and external On, isolated tests, no resident app while disabled; not yet deployed.
+- [Preferences/navigation polish](preferences-navigation-polish.md): first follow-up increment in source, not installed; 489 tests passed, with system popovers/replacement readiness still pending.
 - [Event protocol](protocol.md): the content-free agent lifecycle contract.
 - This document: agreed direction, delivered work, source map, validation, and handoff.
 
@@ -48,9 +56,12 @@ must not clear, freeze, or re-arm the notch's hover state.
 
 ### Bar styling and left-side refinement
 
-- The left rail shows up to six open-window icons; clicking focuses the window.
-  A focused-window label provides context without making desktop switching
-  the main feature. `workspaces` remains an optional configuration choice.
+- The original six-window rail is superseded in the working tree by stable
+  pinned/running app groups, count/active indicators, a multi-window chooser,
+  paginated overflow and explicit app actions. Bar settings no longer requires
+  tray access. A focused-window label remains lower-priority context;
+  `workspaces` is optional. See [app navigation](app-navigation.md) for current
+  validation and acceptance boundaries.
 - Macchiato groups the rail and right-side status items into rounded capsules.
   Capsule padding was increased so boundaries do not crowd the glyphs.
 - Macchiato status glyphs use an 18-logical-pixel size. Tabler path-based icons

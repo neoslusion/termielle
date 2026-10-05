@@ -1,6 +1,6 @@
 use super::{catalog, model::Model, paint};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
@@ -46,7 +46,7 @@ static CLASS: OnceLock<Result<u16, u32>> = OnceLock::new();
 
 enum Update {
     Catalog(windows::core::Result<Vec<super::model::App>>),
-    Icons(Vec<(Vec<u8>, Option<crate::animation::FrameBuffer>)>),
+    Icons(Vec<(Vec<u8>, Option<Arc<crate::animation::FrameBuffer>>)>),
     Launched(u64, windows::core::Result<()>),
 }
 
@@ -99,7 +99,13 @@ impl State {
         }
         let targets = {
             let model = self.model.borrow();
-            let done = self.icons_done.borrow();
+            let mut done = self.icons_done.borrow_mut();
+            done.retain(|target| {
+                model
+                    .results
+                    .iter()
+                    .any(|index| model.apps[*index].target == *target)
+            });
             model
                 .results
                 .iter()
@@ -223,11 +229,19 @@ impl State {
                     self.model.borrow_mut().set_apps(apps);
                 }
                 Update::Icons(icons) => {
+                    if !self.visible.get() {
+                        continue;
+                    }
                     let mut model = self.model.borrow_mut();
                     let mut done = self.icons_done.borrow_mut();
                     for (target, icon) in icons {
-                        if let Some(app) = model.apps.iter_mut().find(|app| app.target == target) {
-                            app.icon = icon;
+                        if let Some(index) = model
+                            .results
+                            .iter()
+                            .copied()
+                            .find(|index| model.apps[*index].target == target)
+                        {
+                            model.apps[index].icon = icon;
                             done.insert(target);
                         }
                     }
@@ -506,7 +520,7 @@ impl LauncherWindow {
                 }
             };
             notifier.send(Update::Catalog(catalog::enumerate()));
-            let mut cache = HashMap::new();
+            let mut cache = super::icon_cache::IconCache::default();
             while let Ok(first) = refresh_receiver.recv() {
                 let mut refresh = false;
                 let mut icons = false;
@@ -525,10 +539,7 @@ impl LauncherWindow {
                     let icons = targets
                         .into_iter()
                         .map(|target| {
-                            let icon = cache
-                                .entry(target.clone())
-                                .or_insert_with(|| catalog::read_icon(&target))
-                                .clone();
+                            let icon = cache.get(&target, || catalog::read_icon(&target));
                             (target, icon)
                         })
                         .collect();

@@ -1,4 +1,5 @@
 use crate::animation::FrameBuffer;
+use std::sync::Arc;
 
 pub(super) const MAX_RESULTS: usize = 6;
 
@@ -6,7 +7,7 @@ pub(super) struct App {
     pub name: String,
     pub key: String,
     pub target: Vec<u8>,
-    pub icon: Option<FrameBuffer>,
+    pub icon: Option<Arc<FrameBuffer>>,
 }
 
 pub(super) struct Model {
@@ -67,6 +68,11 @@ impl Model {
             .map(|(_, _, index)| index)
             .collect();
         self.selected = 0;
+        for (index, app) in self.apps.iter_mut().enumerate() {
+            if !self.results.contains(&index) {
+                app.icon = None;
+            }
+        }
     }
 
     pub fn move_selection(&mut self, delta: i32) {
@@ -129,6 +135,28 @@ fn match_score(name: &str, query: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_changes_release_artwork_for_hidden_results() {
+        let mut model = Model::default();
+        model.set_apps(apps(&["Alpha", "Beta", "Gamma"]));
+        let icon = Arc::new(FrameBuffer {
+            width: 1,
+            height: 1,
+            pixels_pbgra: vec![255; 4],
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        });
+        for app in &mut model.apps {
+            app.icon = Some(icon.clone());
+        }
+        model.set_query("beta".into());
+        assert!(model.apps[0].icon.is_none());
+        assert!(Arc::ptr_eq(model.apps[1].icon.as_ref().unwrap(), &icon));
+        assert!(model.apps[2].icon.is_none());
+        assert_eq!(Arc::strong_count(&icon), 2);
+    }
 
     fn apps(names: &[&str]) -> Vec<App> {
         names

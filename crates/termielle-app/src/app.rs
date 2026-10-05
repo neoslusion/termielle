@@ -10,11 +10,13 @@
 //! (status bar), `face` (termielle face cache), `paint` (content painters),
 //! `cards` (expanded-card sections).
 
+pub(crate) mod activity;
 pub(crate) mod bar;
 pub(crate) mod cards;
 pub(crate) mod controller;
 pub(crate) mod face;
 pub(crate) mod island;
+pub(crate) mod navigation;
 pub(crate) mod paint;
 pub(crate) mod types;
 

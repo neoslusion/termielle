@@ -24,6 +24,8 @@ pub enum ShellAction {
     Focus,
     Display,
     Settings,
+    Sound,
+    Power,
 }
 
 impl ShellAction {
@@ -47,6 +49,8 @@ impl ShellAction {
             8 => Some(Self::Focus),
             9 => Some(Self::Display),
             10 => Some(Self::Settings),
+            11 => Some(Self::Sound),
+            12 => Some(Self::Power),
             _ => None,
         }
     }
@@ -64,11 +68,13 @@ impl ShellAction {
             Self::Focus => "Focus",
             Self::Display => "Display",
             Self::Settings => "Settings",
+            Self::Sound => "Sound",
+            Self::Power => "Power",
         }
     }
 
-    /// The controls painted in the bar, in render order. The clock is not
-    /// one of them: it rides the right module zone with the other metrics.
+    /// Legacy shell shortcut set. App navigation now owns the bar's left
+    /// entry; the shortcuts remain available to other shell surfaces.
     pub const ALL: [Self; 5] = [
         Self::Start,
         Self::Search,
@@ -82,10 +88,6 @@ impl ShellAction {
     /// weighted chips rather than a ragged word list.
     pub fn control_width(self) -> u32 {
         (self.label().chars().count() as u32 * 7 + 14).max(32)
-    }
-
-    pub(crate) const fn label_of(self) -> &'static str {
-        self.label()
     }
 }
 
@@ -133,6 +135,8 @@ pub fn activate(action: ShellAction) {
         ShellAction::Focus => open_shell_uri("ms-settings:quiethours"),
         ShellAction::Display => open_shell_uri("ms-settings:display"),
         ShellAction::Settings => open_shell_uri("ms-settings:"),
+        ShellAction::Sound => open_shell_uri("ms-settings:sound"),
+        ShellAction::Power => open_shell_uri("ms-settings:powersleep"),
     }
 }
 
@@ -151,6 +155,8 @@ mod tests {
             ShellAction::Focus,
             ShellAction::Display,
             ShellAction::Settings,
+            ShellAction::Sound,
+            ShellAction::Power,
         ] {
             assert_eq!(ShellAction::from_hit(action.hit_id()), Some(action));
         }

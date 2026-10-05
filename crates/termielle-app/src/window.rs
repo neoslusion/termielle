@@ -5,8 +5,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
 use termielle_core::{AppConfig, GlassConfig, IslandLayout, RenderMode, island_anchored_position};
 use windows::Win32::Foundation::{
-    COLORREF, FALSE, GetLastError, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, TRUE,
-    WPARAM,
+    COLORREF, FALSE, GetLastError, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE,
+    TRUE, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AC_SRC_ALPHA, AC_SRC_OVER, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS,
@@ -15,6 +15,9 @@ use windows::Win32::Graphics::Gdi::{
     SetDIBitsToDevice,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Power::{
+    HPOWERNOTIFY, RegisterPowerSettingNotification, UnregisterPowerSettingNotification,
+};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, GetDpiForWindow,
     MDT_EFFECTIVE_DPI, SetProcessDpiAwarenessContext,
@@ -23,17 +26,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION,
-    HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer, LWA_COLORKEY, LoadCursorW,
-    MONITORINFOF_PRIMARY, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
-    SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, HTCAPTION, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer,
+    LWA_COLORKEY, LoadCursorW, MONITORINFOF_PRIMARY, MSG, PBT_APMRESUMEAUTOMATIC,
+    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY,
     WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::BOOL;
 use windows::core::PCWSTR;
@@ -84,6 +89,9 @@ pub fn straight_or_key(alpha: u8, b: u8, g: u8, r: u8) -> [u8; 3] {
 /// Message id used by [`WakeHandle::post`] to wake the message loop.
 const WAKE_MSG: u32 = WM_APP + 1;
 const ANIMATION_MSG: u32 = WM_APP + 3;
+const APP_LAUNCH_RESULT_MSG: u32 = WM_APP + 16;
+const SETTINGS_MSG: u32 = WM_APP + 17;
+const POWER_OFF_MSG: u32 = WM_APP + 18;
 
 /// `WM_MOUSELEAVE` (0x02A3), posted after `TrackMouseEvent(TME_LEAVE)`.
 /// Not exported by windows 0.62's `WindowsAndMessaging`, so it lives here.
@@ -91,6 +99,8 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// Timer id used by [`OverlayWindow::set_timer`].
 const TIMER_ID: usize = 1;
+/// Bounded resume/topology retries must wake even if DXGI has no live output.
+const DISPLAY_RECOVERY_TIMER_ID: usize = 2;
 
 /// Name of the registered overlay window class.
 const CLASS_NAME: &str = "termielle_overlay";
@@ -136,8 +146,15 @@ pub enum WindowEvent {
     Timer,
     /// Display topology or DPI changed; the caller should re-clamp and present.
     DisplayChanged,
+    /// Shell work area changed (including our own AppBar reservation).
+    WorkAreaChanged,
+    /// Resume or session display-on notification.
+    Resumed,
+    /// One-shot recovery retry, independent of the animation clock.
+    DisplayRecovery,
     /// The tray menu asked for a graceful exit.
     Quit,
+    TurnOff,
     /// The tray menu asked for a graceful exit followed by a relaunch.
     Restart,
     /// Tray requested a layout switch.
@@ -149,6 +166,13 @@ pub enum WindowEvent {
     /// Tray requested a standalone Island/Notch Y-offset change.
     YOffsetChanged(i32),
     ClickAt(i32, i32),
+    ContextAt(i32, i32),
+    PointerDown(i32, i32),
+    PointerMotion(i32, i32),
+    PointerCancelled,
+    NavigationKey(u32),
+    NavigationDismiss,
+    AppLaunchResult(i32),
     /// Wheel delta and physical client coordinates.
     ScrollAt(i32, i32, i16),
     /// The pointer was pressed down on (`true`) or released from the island,
@@ -190,10 +214,17 @@ pub fn scaled_size(logical: (u32, u32), scale: f32) -> (u32, u32) {
 }
 
 /// Moves `position` into `work_area` so the `size`-sized rect stays fully
-/// visible.
+/// visible. Oversized surfaces are aligned to the work-area origin until
+/// their owner resizes them; a transient empty/inverted work area cannot panic.
 pub fn clamp_to_work_area(position: (i32, i32), size: (i32, i32), work_area: Rect) -> (i32, i32) {
-    let max_x = work_area.right.saturating_sub(size.0);
-    let max_y = work_area.bottom.saturating_sub(size.1);
+    let max_x = work_area
+        .right
+        .saturating_sub(size.0.max(0))
+        .max(work_area.left);
+    let max_y = work_area
+        .bottom
+        .saturating_sub(size.1.max(0))
+        .max(work_area.top);
     (
         position.0.clamp(work_area.left, max_x),
         position.1.clamp(work_area.top, max_y),
@@ -262,6 +293,28 @@ fn cursor_over_pill_raw(hwnd: HWND, alpha: &AlphaMap) -> bool {
     }
 }
 
+fn foreground_target() -> (HWND, u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    (hwnd, pid)
+}
+
+fn return_focus_if_owned(overlay: HWND, previous: (HWND, u32)) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    if previous.1 == 0 || unsafe { GetForegroundWindow() } != overlay {
+        return;
+    }
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(previous.0, Some(&mut pid)) };
+    if pid == previous.1 {
+        let _ = unsafe { SetForegroundWindow(previous.0) };
+    }
+}
+
 /// Per-window state reachable from the window procedure through `GWLP_USERDATA`.
 struct WindowState {
     events: Sender<WindowEvent>,
@@ -275,6 +328,8 @@ struct WindowState {
     /// Whether a press is outstanding. A release is only honoured for a press
     /// that was actually seen.
     press_active: Cell<bool>,
+    navigation_focus: Cell<bool>,
+    previous_focus: Cell<(HWND, u32)>,
 }
 
 /// Makes every declared hit region a real mouse target.
@@ -464,6 +519,9 @@ unsafe extern "system" fn window_proc(
                     alpha_hit_test(&alpha.bytes, alpha.width, x, y)
                 };
                 if hit == HitTestResult::Caption {
+                    if unsafe { (*state).is_bar } {
+                        let _ = unsafe { (*state).events.send(WindowEvent::PointerDown(x, y)) };
+                    }
                     let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(true)) };
                     let _ = unsafe { SetCapture(hwnd) };
                     return LRESULT(0);
@@ -494,6 +552,7 @@ unsafe extern "system" fn window_proc(
                     let _ = unsafe { (*state).events.send(WindowEvent::ClickAt(x, y)) };
                     return LRESULT(0);
                 }
+                let _ = unsafe { (*state).events.send(WindowEvent::PointerCancelled) };
             }
         }
         windows::Win32::UI::WindowsAndMessaging::WM_CAPTURECHANGED => {
@@ -501,11 +560,41 @@ unsafe extern "system" fn window_proc(
             // another window). Never leave the physical press swell latched,
             // and drop the armed press with it: a release that arrives later
             // belongs to a press this window never saw the start of.
-            unsafe { (*state).press_active.set(false) };
+            if unsafe { (*state).press_active.replace(false) } {
+                let _ = unsafe { (*state).events.send(WindowEvent::PointerCancelled) };
+            }
             let _ = unsafe { (*state).events.send(WindowEvent::PressChanged(false)) };
             return LRESULT(0);
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
+            if unsafe { (*state).is_bar } {
+                let (x, y) = lparam_point(lparam);
+                let _ = unsafe { (*state).events.send(WindowEvent::ContextAt(x, y)) };
+                return LRESULT(0);
+            }
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN => {
+            if unsafe { (*state).navigation_focus.get() } {
+                let mut key = wparam.0 as u32;
+                if key == 9
+                    && unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x10) } < 0
+                {
+                    key = 265;
+                }
+                let _ = unsafe { (*state).events.send(WindowEvent::NavigationKey(key)) };
+                return LRESULT(0);
+            }
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+            if (wparam.0 & 0xffff) == 0 && unsafe { (*state).navigation_focus.get() } {
+                let _ = unsafe { (*state).events.send(WindowEvent::NavigationDismiss) };
+            }
+        }
         WM_MOUSEMOVE => {
+            if unsafe { (*state).is_bar && (*state).press_active.get() } {
+                let (x, y) = lparam_point(lparam);
+                let _ = unsafe { (*state).events.send(WindowEvent::PointerMotion(x, y)) };
+            }
             // Hover-to-expand: report the enter transition once, then arm
             // leave tracking. Transparent pixels never reach us — NCHITTEST
             // already returns HTTRANSPARENT there — so any MOVE here is over
@@ -575,7 +664,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_SETTINGCHANGE => {
             if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SPI_SETWORKAREA.0 as usize {
-                let _ = unsafe { (*state).events.send(WindowEvent::DisplayChanged) };
+                let _ = unsafe { (*state).events.send(WindowEvent::WorkAreaChanged) };
             }
             // lParam points at a NUL-terminated string naming the changed
             // setting; the light/dark toggle broadcasts "ImmersiveColorSet".
@@ -596,7 +685,30 @@ unsafe extern "system" fn window_proc(
         WM_TIMER => {
             if wparam.0 == TIMER_ID {
                 let _ = unsafe { (*state).events.send(WindowEvent::Timer) };
+            } else if wparam.0 == DISPLAY_RECOVERY_TIMER_ID {
+                // SetTimer is periodic; consume just one tick per arm.
+                let _ = unsafe { KillTimer(Some(hwnd), DISPLAY_RECOVERY_TIMER_ID) };
+                let _ = unsafe { (*state).events.send(WindowEvent::DisplayRecovery) };
             }
+            return LRESULT(0);
+        }
+        WM_POWERBROADCAST => {
+            let resumed = matches!(
+                wparam.0 as u32,
+                PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL
+            ) || (wparam.0 as u32 == PBT_POWERSETTINGCHANGE
+                && unsafe { recovery::display_is_on(lparam) });
+            if resumed {
+                let _ = unsafe { (*state).events.send(WindowEvent::Resumed) };
+            }
+            return LRESULT(1);
+        }
+        APP_LAUNCH_RESULT_MSG => {
+            let _ = unsafe {
+                (*state)
+                    .events
+                    .send(WindowEvent::AppLaunchResult(lparam.0 as i32))
+            };
             return LRESULT(0);
         }
         ANIMATION_MSG => {
@@ -604,14 +716,18 @@ unsafe extern "system" fn window_proc(
             return LRESULT(0);
         }
         WM_DPICHANGED => {
-            let suggested = unsafe { &*(lparam.0 as *const RECT) };
-            unsafe { reposition_to_work_area(hwnd, suggested) };
+            // Anchored surfaces are positioned by the GUI owner, not clamped
+            // like a free-floating pet inside this non-unwinding callback.
+            if !unsafe { (*state).is_island } && lparam.0 != 0 {
+                let suggested = unsafe { &*(lparam.0 as *const RECT) };
+                unsafe { reposition_to_work_area(hwnd, suggested) };
+            }
             let _ = unsafe { (*state).events.send(WindowEvent::DisplayChanged) };
             return LRESULT(0);
         }
         WM_DISPLAYCHANGE => {
             let mut rect = RECT::default();
-            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
+            if !unsafe { (*state).is_island } && unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok() {
                 unsafe { reposition_to_work_area(hwnd, &rect) };
             }
             let _ = unsafe { (*state).events.send(WindowEvent::DisplayChanged) };
@@ -657,8 +773,18 @@ unsafe extern "system" fn window_proc(
             }
             return LRESULT(1);
         }
-        WM_CLOSE => {
+        POWER_OFF_MSG => {
+            // Whole-app off is not navigation dismissal, even if a chooser owns focus.
             let _ = unsafe { (*state).events.send(WindowEvent::Quit) };
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            let event = if unsafe { (*state).navigation_focus.get() } {
+                WindowEvent::NavigationDismiss
+            } else {
+                WindowEvent::Quit
+            };
+            let _ = unsafe { (*state).events.send(event) };
             return LRESULT(0);
         }
         windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
@@ -667,12 +793,16 @@ unsafe extern "system" fn window_proc(
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
         }
         WM_DESTROY => return LRESULT(0),
-        tray::TRAY_MSG => {
-            if wparam.0 as u32 == tray::TRAY_ID {
+        SETTINGS_MSG | tray::TRAY_MSG => {
+            if message == SETTINGS_MSG || wparam.0 as u32 == tray::TRAY_ID {
                 let mouse = tray::callback_mouse_message(lparam.0);
-                if tray::is_menu_message(mouse) {
+                if message == SETTINGS_MSG || tray::is_menu_message(mouse) {
                     let menu_state = unsafe { (&*state).menu_state.borrow().clone() };
+                    let previous = foreground_target();
                     match tray::show_menu(hwnd, &menu_state) {
+                        tray::TRAY_TURN_OFF => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::TurnOff) };
+                        }
                         tray::TRAY_EXIT => {
                             let _ = unsafe { (*state).events.send(WindowEvent::Quit) };
                         }
@@ -822,6 +952,7 @@ unsafe extern "system" fn window_proc(
                         }
                         _ => {}
                     }
+                    return_focus_if_owned(hwnd, previous);
                 }
             }
             return LRESULT(0);
@@ -847,9 +978,14 @@ pub struct OverlayWindow {
     /// Blurred wallpaper captured by the worker thread, sampled under the
     /// pill during draw. `None` until the first worker round lands.
     backdrop: RefCell<Option<crate::backdrop::Backdrop>>,
+    backdrop_generation: u64,
+    frosted_enabled: bool,
+    tooltips: Option<tooltips::Tooltips>,
     surface: RefCell<Option<surface::Surface>>,
     /// Last ULW destination (x, y, w, h) in physical pixels.
     last_dest: (i32, i32, u32, u32),
+    recovery: recovery::DisplayRecovery,
+    power_notification: Cell<Option<HPOWERNOTIFY>>,
     /// Monitor the island is anchored to. Picked from the cursor position on
     /// the first present and re-picked on display changes, so the notch
     /// follows the display the user is on — but never jumps mid-morph just
@@ -927,12 +1063,31 @@ impl OverlayWindow {
             menu_state: RefCell::new(tray::MenuState::from_island(&config.island)),
             hover_inside: RefCell::new(false),
             press_active: Cell::new(false),
+            navigation_focus: Cell::new(false),
+            previous_focus: Cell::new((HWND::default(), 0)),
         });
         let state_ptr = &*state as *const WindowState as isize;
         let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr) };
 
+        // Production only: diagnostics/hidden test windows do not subscribe
+        // to host power changes. Registration failure is non-fatal; ordinary
+        // resume and display-change broadcasts still work.
+        let power_notification = if !hidden {
+            unsafe {
+                RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0),
+                    &recovery::SESSION_DISPLAY_STATUS,
+                    DEVICE_NOTIFY_WINDOW_HANDLE,
+                )
+            }
+            .ok()
+        } else {
+            None
+        };
         let window = Self {
             hwnd,
+            recovery: recovery::DisplayRecovery::default(),
+            power_notification: Cell::new(power_notification),
             destroyed: std::cell::Cell::new(false),
             state,
             receiver,
@@ -942,6 +1097,14 @@ impl OverlayWindow {
             tray: false,
             glass: config.island.glass.clone(),
             backdrop: RefCell::new(None),
+            backdrop_generation: 1,
+            tooltips: if hidden {
+                None
+            } else {
+                tooltips::Tooltips::create(hwnd).ok()
+            },
+            frosted_enabled: config.island.glass.blur_radius > 0
+                && !(config.island.is_attached() && config.island.glass.notch_black),
             surface: RefCell::new(None),
             hit_targets: RefCell::new(Vec::new()),
             last_dest: (0, 0, 1, 1),
@@ -1119,8 +1282,10 @@ impl OverlayWindow {
         if result.0 == -1 {
             return Err(WindowError::Win32(unsafe { GetLastError().0 }));
         }
-        let _ = unsafe { TranslateMessage(&message) };
-        let _ = unsafe { DispatchMessageW(&message) };
+        if !crate::preferences::translate_message(&message) {
+            let _ = unsafe { TranslateMessage(&message) };
+            let _ = unsafe { DispatchMessageW(&message) };
+        }
         match self.receiver.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
@@ -1166,6 +1331,70 @@ impl OverlayWindow {
         Ok(())
     }
 
+    /// Schedules three bounded recovery passes after a resume/topology event.
+    /// This uses a native timer so recovery cannot be stalled by WaitForVBlank.
+    pub fn schedule_display_recovery(&mut self, restart: bool) -> Result<(), WindowError> {
+        if restart {
+            self.recovery.restart();
+        }
+        let _ = unsafe { KillTimer(Some(self.hwnd), DISPLAY_RECOVERY_TIMER_ID) };
+        if let Some(delay) = self.recovery.next_delay_ms() {
+            let timer =
+                unsafe { SetTimer(Some(self.hwnd), DISPLAY_RECOVERY_TIMER_ID, delay, None) };
+            if timer == 0 {
+                return Err(WindowError::Win32(unsafe { GetLastError().0 }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Discards display-dependent handles/samples before re-anchoring. Does
+    /// not alter layout or config, and never activates the user's terminal.
+    pub fn invalidate_display(&mut self) {
+        self.anchor_monitor = None;
+        self.repositioned = false;
+        self.surface.borrow_mut().take();
+        self.backdrop.borrow_mut().take();
+        self.backdrop_generation = self.backdrop_generation.wrapping_add(1);
+        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+    }
+
+    /// Open our existing preferences menu without depending on the system tray.
+    pub fn open_settings_menu(&self) {
+        let _ = unsafe { PostMessageW(Some(self.hwnd), SETTINGS_MSG, WPARAM(0), LPARAM(0)) };
+    }
+
+    /// Temporarily focus a user-opened app chooser for keyboard navigation.
+    /// Restore only if we still own focus; never steal it from an outside click.
+    pub fn set_navigation_focus(&self, enabled: bool) {
+        if self.state.navigation_focus.replace(enabled) == enabled {
+            return;
+        }
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, IsWindowVisible, SetForegroundWindow,
+        };
+        let style = unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) };
+        if enabled {
+            self.state.previous_focus.set(foreground_target());
+            unsafe {
+                SetWindowLongPtrW(
+                    self.hwnd,
+                    GWL_EXSTYLE,
+                    style & !(WS_EX_NOACTIVATE.0 as isize),
+                );
+            }
+            if unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+                let _ = unsafe { SetForegroundWindow(self.hwnd) };
+            }
+        } else {
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE.0 as isize);
+            }
+            let previous = self.state.previous_focus.replace((HWND::default(), 0));
+            return_focus_if_owned(self.hwnd, previous);
+        }
+    }
+
     /// Handle that wakes the message loop from another thread.
     pub fn wake_handle(&self) -> WakeHandle {
         WakeHandle { hwnd: self.hwnd }
@@ -1208,7 +1437,28 @@ impl OverlayWindow {
     /// Updates the glass material live (theme switches); the new tint and
     /// blur apply on the next present.
     pub fn set_glass(&mut self, glass: &GlassConfig) {
-        self.glass = glass.clone();
+        if self.glass != *glass {
+            self.backdrop.borrow_mut().take();
+            self.backdrop_generation = self.backdrop_generation.wrapping_add(1);
+            self.glass = glass.clone();
+        }
+    }
+
+    pub fn set_frosted_enabled(&mut self, enabled: bool) {
+        if self.frosted_enabled != enabled {
+            self.frosted_enabled = enabled;
+            self.backdrop.borrow_mut().take();
+            self.backdrop_generation = self.backdrop_generation.wrapping_add(1);
+        }
+    }
+    pub fn set_navigation_tooltips(&mut self, hints: Vec<NavigationHint>) {
+        if let Some(tooltips) = self.tooltips.as_mut() {
+            tooltips.update(hints);
+        }
+    }
+
+    pub fn backdrop_generation(&self) -> u64 {
+        self.backdrop_generation
     }
 
     /// Destroys the window and posts `WM_QUIT` to the owning thread's queue.
@@ -1220,6 +1470,10 @@ impl OverlayWindow {
         if self.tray {
             let _ = tray::remove(self.hwnd);
         }
+        if let Some(notification) = self.power_notification.take() {
+            let _ = unsafe { UnregisterPowerSettingNotification(notification) };
+        }
+        let _ = unsafe { KillTimer(Some(self.hwnd), DISPLAY_RECOVERY_TIMER_ID) };
         let _ = unsafe { DestroyWindow(self.hwnd) };
         self.surface.borrow_mut().take();
         unsafe { PostQuitMessage(0) };
@@ -1244,8 +1498,15 @@ impl OverlayWindow {
     }
 
     /// Supplies a freshly captured+blurred backdrop from the worker thread.
-    pub fn set_backdrop(&mut self, bg: crate::backdrop::Backdrop) {
+    pub fn set_backdrop(&mut self, bg: crate::backdrop::Backdrop) -> bool {
+        if bg
+            .capture_token
+            .is_some_and(|token| token != (self.hwnd.0 as isize, self.backdrop_generation))
+        {
+            return false;
+        }
         *self.backdrop.borrow_mut() = Some(bg);
+        true
     }
 
     /// The last destination rect the pill was drawn at (physical pixels), so
@@ -1502,13 +1763,13 @@ impl OverlayWindow {
         let stride = surface.width as usize * 4;
 
         // Frosted glass: capture the live backdrop once (cached) and blur
-        // it under the frame's own tint. The backdrop excludes layered windows,
-        // so the pill can never feed back into itself. `None` means blur is off
+        // it under the frame's own tint. The worker scopes our HWND's capture
+        // exclusion to the desktop copy so the pill cannot feed back into itself. `None` means blur is off
         // or capture failed — fall back to the flat procedural frame.
         let backdrop_guard = self.backdrop.borrow();
         let backdrop = backdrop_guard
             .as_ref()
-            .filter(|_| self.glass.blur_radius > 0);
+            .filter(|_| self.frosted_enabled && self.glass.blur_radius > 0);
 
         let is_hidden_sensor = h <= 4;
         let mut alpha_map = Vec::with_capacity(w as usize * h as usize);
@@ -1533,42 +1794,12 @@ impl OverlayWindow {
                             let source = &frame.pixels_pbgra
                                 [(yy as usize * w as usize + xx as usize) * 4..][..4];
                             let target = yy as usize * stride + xx as usize * 4;
-                            if source[3] == 0 {
-                                // Outside the pill: stay fully transparent so clicks
-                                // pass through and the desktop shows untouched.
-                                dst[target..target + 4].fill(0);
-                            } else {
-                                let pixel = bg
-                                    .sample(
-                                        x.saturating_add(xx as i32),
-                                        y.saturating_add(yy as i32),
-                                    )
-                                    .unwrap_or(&self.glass.tint);
-                                let ia = 255 - u32::from(source[3]);
-                                let bg_b = u32::from(pixel[0]);
-                                let bg_g = u32::from(pixel[1]);
-                                let bg_r = u32::from(pixel[2]);
-                                let comp_b = (u32::from(source[0]) + bg_b * ia / 255).min(255);
-                                let comp_g = (u32::from(source[1]) + bg_g * ia / 255).min(255);
-                                let comp_r = (u32::from(source[2]) + bg_r * ia / 255).min(255);
-                                let tint_alpha = u32::from(self.glass.tint[3]).max(1);
-                                let is_interior =
-                                    source[3] >= self.glass.tint[3].saturating_sub(15);
-                                if is_interior {
-                                    dst[target] = comp_b as u8;
-                                    dst[target + 1] = comp_g as u8;
-                                    dst[target + 2] = comp_r as u8;
-                                    dst[target + 3] = 255;
-                                } else {
-                                    // Anti-aliased outer edge: scale colors by coverage so PBGRA stays valid
-                                    let edge_cov =
-                                        ((u32::from(source[3]) * 255) / tint_alpha).min(255);
-                                    dst[target] = (comp_b * edge_cov / 255) as u8;
-                                    dst[target + 1] = (comp_g * edge_cov / 255) as u8;
-                                    dst[target + 2] = (comp_r * edge_cov / 255) as u8;
-                                    dst[target + 3] = edge_cov as u8;
-                                }
-                            }
+                            let pixel = material::composite(
+                                source,
+                                bg.sample(x.saturating_add(xx as i32), y.saturating_add(yy as i32)),
+                                self.glass.tint[3],
+                            );
+                            dst[target..target + 4].copy_from_slice(&pixel);
                             // Hit-testing still follows the frame's own alpha, so the
                             // rounded corners stay click-through.
                             alpha_map.push(source[3]);
@@ -1779,6 +2010,10 @@ pub struct WakeHandle {
 unsafe impl Send for WakeHandle {}
 
 mod clock;
+mod material;
+mod tooltips;
+pub use tooltips::Hint as NavigationHint;
+mod recovery;
 mod surface;
 pub use clock::AnimationClock;
 
@@ -1790,6 +2025,23 @@ fn now_ms() -> u64 {
 }
 
 impl WakeHandle {
+    /// Requests normal whole-app teardown without WM_CLOSE's chooser dismissal.
+    pub fn post_power_off(&self) -> Result<(), WindowError> {
+        unsafe { PostMessageW(Some(self.hwnd), POWER_OFF_MSG, WPARAM(0), LPARAM(0)) }?;
+        Ok(())
+    }
+
+    pub fn post_app_launch_result(&self, code: i32) {
+        let _ = unsafe {
+            PostMessageW(
+                Some(self.hwnd),
+                APP_LAUNCH_RESULT_MSG,
+                WPARAM(0),
+                LPARAM(code as isize),
+            )
+        };
+    }
+
     fn post_animation(&self) -> Result<(), WindowError> {
         unsafe { PostMessageW(Some(self.hwnd), ANIMATION_MSG, WPARAM(0), LPARAM(0)) }?;
         Ok(())

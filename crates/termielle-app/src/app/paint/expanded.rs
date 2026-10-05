@@ -45,10 +45,10 @@ impl Controller {
             } else {
                 // Authentic tall card layout dropping vertically downward.
                 self.paint_card_header(frame, state, island, &ctx);
-                if self.media_available() && island.has_widget("music") {
-                    self.paint_media_card(frame, island, &ctx);
-                } else if state != VisualState::Idle {
+                if self.activity_available() {
                     self.paint_agent_activity(frame, state, island, &ctx);
+                } else if self.media_available() && island.has_widget("music") {
+                    self.paint_media_card(frame, island, &ctx);
                 } else if island.has_widget("tasks") && island.show_tasks && !self.tasks.is_empty()
                 {
                     self.paint_task_switcher(frame, island, &ctx);

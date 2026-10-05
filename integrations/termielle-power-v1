@@ -1,0 +1,2 @@
+This release supports termielle-app.exe --enable and --disable.
+The installer uses this marker to avoid creating power shortcuts for older binaries.

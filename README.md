@@ -143,17 +143,25 @@ asset is missing or undecodable.
 
 The default surface is a Waybar-style persistent system bar with a compact
 Termielle module. Clicking it opens a focused popup for agent and media detail;
-hovering opens it only when content is available. The default apps rail switches
-open windows, and the speaker is a control. The default right side keeps
+hovering opens it only when content is available. The apps rail now supports
+stable pinned/running groups, active/count indicators, a multi-window chooser,
+overflow, app actions, and Bar settings without tray access. See
+[app navigation](docs/app-navigation.md). The speaker is a control. The default right side keeps
 Network, Volume, Battery, Control Center, and the clock; CPU and Memory live
 in Control Center unless pinned to the strip.
 
 The overlay composites its layered window with per-pixel alpha via
-`UpdateLayeredWindow` by default. `--render color-key` (or
+`UpdateLayeredWindow` by default. The [notch background repair](docs/notch-background.md)
+prevents glass self-capture and fixes premultiplied edges/stale captures without
+changing user tint preferences. `--render color-key` (or
 `{"render": "color_key"}` in the config file) falls back to GDI color-keying
 for display drivers whose layered DIB redirection renders black. The tray menu
 switches layout, theme, position, widget state, and pinned menu-bar items; it marks the active choices
-and offers `Restart` and `Exit`. `Exit` terminates with code 0 so the external
+and offers `Restart`, temporary `Exit`, and persistent `Turn Off Termielle…`.
+The whole-application switch fully exits, preserves settings, and stays off across
+logins; `--enable` or the new-release Start-menu shortcut turns it back on.
+See [whole-application power controls](docs/application-power.md) for behavior and
+current deployment status. `Exit` terminates with code 0 so the external
 watchdog does not relaunch it.
 
 Animation playback is paced by a dedicated clock thread (not `WM_TIMER`, whose
@@ -162,6 +170,23 @@ cost subtracted from each frame interval. Set `{"frame_rate": 60}` in the
 config file to play every animation at that frame rate instead of the GIF's
 own delays — the loop then takes frame count / rate seconds (the shipped
 60-frame assets loop in one second).
+
+## Multi-session activity
+
+Click the Termielle pill to see individual agent sessions with status and
+elapsed time, four per page. **Link** explicitly associates a session with an
+open terminal window; clicking the linked row restores/focuses that window.
+**Change**, **Unlink**, and **Back** keep this user-controlled—no foreground
+window guesses or terminal-content capture. Finished sessions stay available
+after the Ready hold, until session end or stale expiry.
+
+Links are local and temporary, and focus targets windows rather than terminal
+tabs. See [the activity guide](docs/session-activity.md) for behavior, limits,
+and isolated visual-review commands.
+
+On laptop wake/display changes, the app re-anchors and re-presents with bounded
+recovery retries. See [display recovery](docs/display-recovery.md) for the
+lid/Modern Standby crash investigation and validation limits.
 
 ## Diagnostics
 

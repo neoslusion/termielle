@@ -74,13 +74,17 @@ struct Cli {
     bar_pos: Option<BarPosition>,
     replace_taskbar: Option<bool>,
     restore_taskbar: bool,
+    power: Option<bool>,
+    power_conflict: bool,
     watchdog_parent_pid: Option<u32>,
 }
 
 impl Cli {
     fn parse() -> Self {
-        let mut args = std::env::args();
-        let _program = args.next();
+        Self::parse_args(std::env::args().skip(1))
+    }
+
+    fn parse_args(args: impl Iterator<Item = String>) -> Self {
         let mut smoke_test = false;
         let mut pipe = String::from(DEFAULT_PIPE_NAME);
         let mut ack_file = None;
@@ -90,10 +94,17 @@ impl Cli {
         let mut config_path = None;
         let mut replace_taskbar = None;
         let mut restore_taskbar = false;
+        let mut power = None;
+        let mut power_conflict = false;
         let mut watchdog_parent_pid = None;
         let mut iter = args;
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--enable" | "--disable" => {
+                    let enabled = arg == "--enable";
+                    power_conflict |= power.is_some_and(|previous| previous != enabled);
+                    power = Some(enabled);
+                }
                 "--smoke-test" => smoke_test = true,
                 "--pipe" => pipe = iter.next().unwrap_or_else(|| DEFAULT_PIPE_NAME.to_string()),
                 "--ack-file" => ack_file = iter.next().map(PathBuf::from),
@@ -146,6 +157,8 @@ impl Cli {
             bar_pos,
             replace_taskbar,
             restore_taskbar,
+            power,
+            power_conflict,
             watchdog_parent_pid,
         }
     }
@@ -180,9 +193,41 @@ fn main() {
     }));
 
     let cli = Cli::parse();
+    if cli.power_conflict || (cli.power.is_some() && (cli.smoke_test || cli.restore_taskbar)) {
+        report_power_error(
+            "Use --enable or --disable separately from diagnostics and taskbar recovery.",
+        );
+        std::process::exit(2);
+    }
+    // Recovery must run even when Termielle itself is deliberately off.
     if cli.restore_taskbar {
         run_taskbar_watchdog(cli.watchdog_parent_pid);
         return;
+    }
+
+    if !cli.smoke_test {
+        let directory = data_dir().unwrap_or_else(|| PathBuf::from("."));
+        if let Some(enabled) = cli.power {
+            if let Err(error) = termielle_app::power::set_enabled(&directory, enabled) {
+                report_power_error(&format!(
+                    "Couldn't change Termielle's on/off preference: {error}"
+                ));
+                std::process::exit(1);
+            }
+            if !enabled {
+                return;
+            }
+        }
+        match termielle_app::power::is_disabled(&directory) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                report_power_error(&format!(
+                    "Couldn't read Termielle's on/off preference: {error}"
+                ));
+                std::process::exit(1);
+            }
+        }
     }
 
     // One-time move of user state from the pre-0.2 location.
@@ -192,7 +237,23 @@ fn main() {
     // steal events. The claim is held for the whole process lifetime. A
     // smoke run reports the contention loudly so diagnostics never mistake
     // a silent exit for a passing check.
-    let instance = match acquire_single_instance(&cli.pipe) {
+    // An explicit On may race the previous instance's graceful Off teardown.
+    // Briefly wait for its claim; never force it out or launch a duplicate.
+    let claim = if cli.power == Some(true) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let claim = acquire_single_instance(&cli.pipe);
+            if !matches!(claim, Err(code) if code == ERROR_ALREADY_EXISTS.0)
+                || std::time::Instant::now() >= deadline
+            {
+                break claim;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    } else {
+        acquire_single_instance(&cli.pipe)
+    };
+    let instance = match claim {
         Ok(guard) => guard,
         Err(_) => {
             if cli.smoke_test {
@@ -257,21 +318,22 @@ fn main() {
         };
     sync_taskbar_mode(&config.island);
     let wake = window.wake_handle();
-    if !cli.smoke_test && cli.pipe == DEFAULT_PIPE_NAME {
-        // Only the production overlay gets the tray icon: diagnostics runs on
-        // custom pipes stay out of the notification area. The icon is the
-        // character's idle face when the standby asset is present.
-        let catalog = AssetCatalog::new(asset_roots());
-        let idle_asset = catalog.resolve(VisualState::Idle);
-        if let Err(code) = window.install_tray(idle_asset.as_deref()) {
-            log_error(
-                &log,
-                LogComponent::Window,
-                LogEvent::PresentFailed,
-                code as i32,
-            );
+    let _power_watch = if cli.smoke_test {
+        None
+    } else {
+        let directory = data_dir().unwrap_or_else(|| PathBuf::from("."));
+        match termielle_app::power::Watch::spawn(&directory, move || {
+            let _ = wake.post_power_off();
+        }) {
+            Ok(watch) => Some(watch),
+            Err(error) => {
+                report_power_error(&format!(
+                    "Couldn't initialize Termielle's on/off control: {error}"
+                ));
+                return;
+            }
         }
-    }
+    };
     let mut controller = Controller::new_with_island(
         config.ready_hold_ms,
         config.busy_stall_ms,
@@ -363,6 +425,7 @@ fn main() {
         config.island.is_enabled(),
         config.island.has_widget("music"),
         termielle_app::tasks::should_poll_tasks(&config.island),
+        termielle_app::tasks::should_poll_task_icons(&config.island),
     ));
     let (thumb_sender, thumb_receiver) = channel();
     let backdrop_request: Arc<std::sync::Mutex<Option<termielle_app::tasks::BackdropRequest>>> =
@@ -405,6 +468,18 @@ fn main() {
         ack.as_mut(),
         Some(&backdrop_request),
     );
+    if cli.pipe == DEFAULT_PIPE_NAME {
+        let catalog = AssetCatalog::new(asset_roots());
+        let idle_asset = catalog.resolve(VisualState::Idle);
+        if let Err(code) = window.install_tray(idle_asset.as_deref()) {
+            log_error(
+                &log,
+                LogComponent::Window,
+                LogEvent::PresentFailed,
+                code as i32,
+            );
+        }
+    }
     let restart = run_gui(
         &mut window,
         &mut controller,
@@ -417,13 +492,16 @@ fn main() {
         journal.as_ref(),
         config_watcher.as_ref(),
         &mut config,
+        cli.config_path.as_deref(),
     );
     drop(instance);
     if restart {
         // The single-instance claim is already released, so the new process
         // can take it; the tray "Restart" path lands here.
         if let Ok(exe) = std::env::current_exe() {
-            let _ = Command::new(exe).spawn();
+            let _ = Command::new(exe)
+                .args(std::env::args_os().skip(1).filter(|arg| arg != "--enable"))
+                .spawn();
         }
     }
 }
@@ -498,6 +576,50 @@ const TASKBAR_REASSERT_MS: u64 = 2_000;
 /// The overlay's data directory: `%USERPROFILE%\.termielle`, the same
 /// dot-directory convention as `~/.claude`. All user-facing state lives
 /// here; the installed binaries stay under `%LOCALAPPDATA%\Termielle\bin`.
+fn power_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn report_power_error(message: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    let message = power_wide(message);
+    let title = power_wide("Termielle on/off");
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        )
+    };
+}
+
+/// User-requested persistent off; do not write draft preferences or native-taskbar settings.
+fn request_turn_off(owner: windows::Win32::Foundation::HWND) -> Result<bool, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW,
+    };
+    let text = power_wide(
+        "Turn Termielle off completely?\n\nIt will exit and stay off across logins. Your settings and hooks are kept; unapplied previews are discarded.\n\nTo resume, use Start > Turn Termielle On, or run termielle-app.exe --enable.",
+    );
+    let title = power_wide("Turn Off Termielle");
+    let answer = unsafe {
+        MessageBoxW(
+            Some(owner),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        )
+    };
+    if answer != IDYES {
+        return Ok(false);
+    }
+    let directory = data_dir().unwrap_or_else(|| PathBuf::from("."));
+    termielle_app::power::set_enabled(&directory, false)
+        .map_err(|error| format!("Couldn't turn Termielle off: {error}"))?;
+    Ok(true)
+}
+
 fn data_dir() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE")?;
     Some(PathBuf::from(home).join(".termielle"))
@@ -740,6 +862,10 @@ fn reload_config(
         termielle_app::tasks::should_poll_tasks(&config.island),
         std::sync::atomic::Ordering::Relaxed,
     );
+    thumb_cfg.poll_task_icons.store(
+        termielle_app::tasks::should_poll_task_icons(&config.island),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     true
 }
 
@@ -829,7 +955,7 @@ fn acquire_single_instance(pipe: &str) -> Result<InstanceGuard, u32> {
         format!("Termielle-{label}")
     };
     name.truncate(250);
-    let name: Vec<u16> = name.encode_utf16().collect();
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
 
     // SAFETY: kernel object creation with an in-bounds name; a returned
     // handle is a process-owned kernel handle kept for the claim lifetime.
@@ -840,6 +966,8 @@ fn acquire_single_instance(pipe: &str) -> Result<InstanceGuard, u32> {
     let mutex = match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
         Ok(handle) => {
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                // An On retry must not keep a leaked reference to the old claim.
+                let _ = unsafe { CloseHandle(handle) };
                 return Err(ERROR_ALREADY_EXISTS.0);
             }
             Some(handle)
@@ -853,8 +981,12 @@ fn acquire_single_instance(pipe: &str) -> Result<InstanceGuard, u32> {
         }
     };
 
-    let lock_file = acquire_lock_file(label)?;
-    Ok(InstanceGuard { mutex, lock_file })
+    let mut guard = InstanceGuard {
+        mutex,
+        lock_file: None,
+    };
+    guard.lock_file = acquire_lock_file(label)?;
+    Ok(guard)
 }
 
 /// Takes the exclusive lock file for `label`, stealing it when the recorded
@@ -1094,6 +1226,18 @@ fn apply_setting(event: &WindowEvent, island: &mut termielle_core::IslandConfig)
     }
 }
 
+fn save_preferences(
+    config: &AppConfig,
+    override_path: Option<&Path>,
+) -> Result<(), termielle_core::ConfigError> {
+    let path = override_path.map(Path::to_path_buf).unwrap_or_else(|| {
+        data_dir()
+            .map(|d| d.join("config.json"))
+            .unwrap_or_else(|| PathBuf::from("config.json"))
+    });
+    save_config_atomic(&path, config)
+}
+
 /// Applies a setting toggle end to end: mutate the single config owner,
 /// persist it, and mirror it into the controller.
 fn apply_settings_event(
@@ -1101,6 +1245,7 @@ fn apply_settings_event(
     config: &mut AppConfig,
     controller: &mut Controller,
     thumb_cfg: &Arc<termielle_app::tasks::WorkerConfig>,
+    config_path: Option<&Path>,
 ) -> Option<ControllerActions> {
     if !apply_setting(&event, &mut config.island) {
         return None;
@@ -1111,12 +1256,7 @@ fn apply_settings_event(
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    let _ = save_config_atomic(
-        &data_dir()
-            .map(|d| d.join("config.json"))
-            .unwrap_or_else(|| PathBuf::from("config.json")),
-        config,
-    );
+    let _ = save_preferences(config, config_path);
     controller.set_island_config(config.island.clone(), now_ms());
     Some(ControllerActions {
         present_frame: true,
@@ -1168,6 +1308,11 @@ fn present_current(
     } else {
         window.set_hit_targets(&[], 1.0);
     }
+    let material = &controller.island_config();
+    window.set_frosted_enabled(
+        material.glass.blur_radius > 0 && !(material.is_attached() && material.glass.notch_black),
+    );
+    window.set_navigation_tooltips(controller.navigation_tooltips());
     let anchor = controller.island_anchor();
     let attempt = if controller.island_config().is_bar() {
         window.present_with_bar(
@@ -1210,6 +1355,8 @@ fn present_current(
                 cfg.bar.position == termielle_core::BarPosition::Bottom,
             );
             *request.lock().unwrap() = Some(termielle_app::tasks::BackdropRequest {
+                exclude_hwnd: window.hwnd().0 as isize,
+                generation: window.backdrop_generation(),
                 x,
                 y,
                 w,
@@ -1329,7 +1476,8 @@ fn poll_hover(
     // `manually_expanded` - it is not the island's card - so gating
     // dismissal on that alone left it dismissible only by pressing its own
     // icon: no Escape, no click outside.
-    if controller.is_manually_expanded()
+    if controller.is_navigation_open()
+        || controller.is_manually_expanded()
         || controller.is_panel_open()
         || controller.is_notification_center_open()
     {
@@ -1372,6 +1520,7 @@ fn apply(
     if actions.present_frame {
         present_current(window, controller, log, ack.as_mut(), backdrop_request);
     }
+    window.set_navigation_focus(controller.wants_navigation_focus());
 }
 
 /// Drains background worker rounds (task icons + media state) into the
@@ -1384,10 +1533,9 @@ fn drain_thumbs(
     let mut present = false;
     while let Ok(mut batch) = receiver.try_recv() {
         if let Some(backdrop) = batch.backdrop.take() {
-            window.set_backdrop(backdrop);
-            // Fresh glass with no repaint is invisible: force one so the new
-            // backdrop actually reaches the screen.
-            present = true;
+            // Reject pre-resume/pre-theme captures. Fresh accepted glass
+            // needs a repaint even when no other controller state changed.
+            present |= window.set_backdrop(backdrop);
         }
         if controller.set_task_update_at(batch, now_ms()) {
             present = true;
@@ -1491,6 +1639,7 @@ fn run_gui(
     journal: Option<&EventLog>,
     config_watcher: Option<&ConfigWatcher>,
     config: &mut AppConfig,
+    config_path: Option<&Path>,
 ) -> bool {
     // The animation clock thread paces frames; the smoke test's timeout timer
     // is separate and unaffected.
@@ -1504,6 +1653,18 @@ fn run_gui(
             None
         }
     };
+    let mut preferences = match termielle_app::preferences::PreferencesWindow::create(
+        window.hwnd(),
+        window.wake_handle(),
+        &config.island,
+    ) {
+        Ok(dialog) => Some(dialog),
+        Err(error) => {
+            eprintln!("preferences creation failed: {error}");
+            None
+        }
+    };
+    let mut preferences_preview = false;
     controller.enable_display_pacing();
     // Windows toast forwarding: own STA thread plus channel. Gated on
     // config only — smoke runs never reach run_gui, so diagnostics stays
@@ -1521,9 +1682,28 @@ fn run_gui(
     loop {
         // Only the display clock advances animation. Unrelated window/worker
         // messages must not bypass vertical-blank pacing.
-        bar_service.configure(&config.island);
+        if let Some(preferences) = preferences.as_mut() {
+            if drain_preferences(
+                preferences,
+                &mut preferences_preview,
+                config,
+                config_path,
+                window,
+                controller,
+                thumb_cfg,
+            ) {
+                present_current(
+                    window,
+                    controller,
+                    log,
+                    ack.as_mut(),
+                    Some(backdrop_request),
+                );
+            }
+        }
+        bar_service.configure(controller.island_config());
         if let Some(launcher) = &launcher {
-            launcher.configure(&config.island);
+            launcher.configure(controller.island_config());
         }
         if now_ms() >= next_taskbar_reassert {
             next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);
@@ -1615,7 +1795,25 @@ fn run_gui(
 
         let mut actions = match event {
             WindowEvent::Timer | WindowEvent::AnimationFrame => controller.on_timer(now_ms()),
-            WindowEvent::DisplayChanged => {
+            WindowEvent::DisplayChanged | WindowEvent::Resumed | WindowEvent::DisplayRecovery => {
+                controller.cancel_navigation_drag(now_ms());
+                let restart = !matches!(event, WindowEvent::DisplayRecovery);
+                if let Err(error) = window.schedule_display_recovery(restart) {
+                    log_error(
+                        log,
+                        LogComponent::Window,
+                        LogEvent::PresentFailed,
+                        window_error_code(&error),
+                    );
+                }
+                clock.invalidate_output();
+                window.invalidate_display();
+                if config.island.is_bar() && config.island.bar.reserve_space {
+                    // The shell may have forgotten a same-geometry reservation.
+                    // Work-area changes use a separate event to avoid re-register
+                    // -> broadcast -> re-register loops.
+                    termielle_app::bar::appbar::unregister_appbar(window.hwnd());
+                }
                 if controller.island_config().is_bar()
                     && !controller.island_config().bar.follow_active_monitor
                 {
@@ -1632,10 +1830,21 @@ fn run_gui(
                 // the frame at the new scale before presenting it.
                 controller.set_dpi_scale(window.anchor_dpi_scale());
                 controller.refresh_scale(now_ms());
-                ControllerActions {
-                    present_frame: true,
-                    ..Default::default()
+                let mut actions = controller.on_timer(now_ms());
+                actions.present_frame = true;
+                actions
+            }
+            WindowEvent::WorkAreaChanged => ControllerActions {
+                // Re-clamp Classic / re-present anchored surfaces without
+                // restarting recovery for our own AppBar broadcasts.
+                present_frame: true,
+                ..Default::default()
+            },
+            WindowEvent::TurnOff => {
+                if let Err(error) = request_turn_off(window.hwnd()) {
+                    report_power_error(&error);
                 }
+                ControllerActions::default()
             }
             WindowEvent::Quit => {
                 termielle_app::bar::appbar::leave_bar_shell();
@@ -1674,12 +1883,7 @@ fn run_gui(
                         );
                     }
                 }
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
+                let _ = save_preferences(config, config_path);
                 theme::resolve_theme(&mut config.island);
                 controller.set_island_config(config.island.clone(), now_ms());
                 window.set_island(config.island.is_enabled());
@@ -1698,6 +1902,10 @@ fn run_gui(
                     termielle_app::tasks::should_poll_tasks(&config.island),
                     std::sync::atomic::Ordering::Relaxed,
                 );
+                thumb_cfg.poll_task_icons.store(
+                    termielle_app::tasks::should_poll_task_icons(&config.island),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 ControllerActions {
                     present_frame: true,
                     ..Default::default()
@@ -1706,12 +1914,7 @@ fn run_gui(
             WindowEvent::ThemeChanged(theme) => {
                 theme::select_theme(&mut config.island, &theme);
                 window.set_glass(&config.island.glass);
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
+                let _ = save_preferences(config, config_path);
                 controller.set_island_config(config.island.clone(), now_ms());
                 ControllerActions {
                     present_frame: true,
@@ -1720,12 +1923,7 @@ fn run_gui(
             }
             WindowEvent::BarPositionChanged(position) => {
                 config.island.bar.position = position;
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
+                let _ = save_preferences(config, config_path);
                 controller.set_island_config(config.island.clone(), now_ms());
                 ControllerActions {
                     present_frame: true,
@@ -1735,12 +1933,7 @@ fn run_gui(
             WindowEvent::YOffsetChanged(y) => {
                 config.island.y_offset = y;
                 config.island.clamp();
-                let _ = save_config_atomic(
-                    &data_dir()
-                        .map(|d| d.join("config.json"))
-                        .unwrap_or_else(|| PathBuf::from("config.json")),
-                    config,
-                );
+                let _ = save_preferences(config, config_path);
                 controller.set_island_config(config.island.clone(), now_ms());
                 ControllerActions {
                     present_frame: true,
@@ -1755,7 +1948,27 @@ fn run_gui(
                 }
                 ControllerActions::default()
             }
-            WindowEvent::ClickAt(x, y) => match controller.handle_click(x, y, now_ms()) {
+            WindowEvent::NavigationDismiss => ControllerActions {
+                present_frame: controller.close_navigation(now_ms()),
+                ..Default::default()
+            },
+            WindowEvent::AppLaunchResult(code) => {
+                controller.app_launch_finished(code, now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::ClickAt(..)
+            | WindowEvent::ContextAt(..)
+            | WindowEvent::NavigationKey(_) => match match event {
+                WindowEvent::ClickAt(x, y) => controller
+                    .finish_navigation_pointer(x, y, now_ms())
+                    .unwrap_or_else(|| controller.handle_click(x, y, now_ms())),
+                WindowEvent::ContextAt(x, y) => controller.handle_context_click(x, y, now_ms()),
+                WindowEvent::NavigationKey(key) => controller.handle_navigation_key(key, now_ms()),
+                _ => unreachable!(),
+            } {
                 termielle_app::app::ClickOutcome::MediaToggle => {
                     termielle_app::tasks::toggle_media_playback();
                     ControllerActions {
@@ -1779,6 +1992,74 @@ fn run_gui(
                 }
                 termielle_app::app::ClickOutcome::ActivateWindow(hwnd) => {
                     termielle_app::tasks::activate_window(hwnd);
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::ActivateAssociatedWindow(hwnd, process_id) => {
+                    if !termielle_app::tasks::activate_associated_window(hwnd, process_id) {
+                        controller.navigation_notice("Couldn't switch windows. The window may have closed or Windows blocked focus.",now_ms());
+                    }
+                    bar_service.send(termielle_app::bar::metrics::Command::RefreshForeground);
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::LaunchApp(app) => {
+                    termielle_app::app_navigation::launch(app, window.wake_handle());
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::CloseAppWindow(hwnd, pid) => {
+                    if !termielle_app::app_navigation::close_window(hwnd, pid) {
+                        controller.navigation_notice(
+                            "Couldn't close that window. It may no longer be available.",
+                            now_ms(),
+                        );
+                    }
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::NavigationPinsChanged => {
+                    if preferences_preview {
+                        controller.restore_navigation_pins(
+                            config.island.bar.pinned_apps.clone(),
+                            now_ms(),
+                        );
+                        controller.navigation_notice(
+                            "Apply or Revert your preferences before editing pins.",
+                            now_ms(),
+                        );
+                    } else {
+                        let previous = config.island.bar.pinned_apps.clone();
+                        config.island.bar.pinned_apps = controller.pinned_apps().to_vec();
+                        if save_preferences(config, config_path).is_err() {
+                            config.island.bar.pinned_apps = previous.clone();
+                            controller.restore_navigation_pins(previous, now_ms());
+                            controller.navigation_notice(
+                                "Couldn't save pinned apps. Your previous pins were kept.",
+                                now_ms(),
+                            );
+                        }
+                    }
+                    ControllerActions {
+                        present_frame: true,
+                        ..Default::default()
+                    }
+                }
+                termielle_app::app::ClickOutcome::OpenSettings => {
+                    window.set_navigation_focus(false);
+                    if let Some(preferences) = preferences.as_mut() {
+                        preferences.show(&config.island);
+                    } else {
+                        window.open_settings_menu();
+                    }
                     ControllerActions {
                         present_frame: true,
                         ..Default::default()
@@ -1825,6 +2106,8 @@ fn run_gui(
                     ControllerActions::default()
                 }
                 termielle_app::app::ClickOutcome::AlertDismiss
+                | termielle_app::app::ClickOutcome::NavigationChanged
+                | termielle_app::app::ClickOutcome::ActivityChanged
                 | termielle_app::app::ClickOutcome::Expanded
                 | termielle_app::app::ClickOutcome::Collapsed => ControllerActions {
                     present_frame: true,
@@ -1839,6 +2122,21 @@ fn run_gui(
                     ..Default::default()
                 }
             }
+            WindowEvent::PointerDown(x, y) => {
+                controller.navigation_pointer_down(x, y, now_ms());
+                ControllerActions {
+                    present_frame: true,
+                    ..Default::default()
+                }
+            }
+            WindowEvent::PointerMotion(x, y) => ControllerActions {
+                present_frame: controller.navigation_pointer_motion(x, y, now_ms()),
+                ..Default::default()
+            },
+            WindowEvent::PointerCancelled => ControllerActions {
+                present_frame: controller.cancel_navigation_drag(now_ms()),
+                ..Default::default()
+            },
             WindowEvent::PressChanged(pressed) => {
                 let changed = controller.set_pressed(pressed, now_ms());
                 ControllerActions {
@@ -1860,6 +2158,7 @@ fn run_gui(
                 config,
                 controller,
                 thumb_cfg,
+                config_path,
             )
             .unwrap_or_default(),
             WindowEvent::SystemThemeChanged => {
@@ -1913,6 +2212,111 @@ fn run_gui(
     }
 }
 
+/// Apply a preview/committed view without writing the profile. One GUI owner
+/// synchronizes rendering, sampling and the shell reservation.
+fn apply_runtime_preferences(
+    view: termielle_core::IslandConfig,
+    window: &mut OverlayWindow,
+    controller: &mut Controller,
+    worker: &Arc<termielle_app::tasks::WorkerConfig>,
+) {
+    let was = controller.island_config();
+    if was.is_bar() != view.is_bar()
+        || was.bar.position != view.bar.position
+        || was.bar.reserve_space != view.bar.reserve_space
+    {
+        termielle_app::bar::appbar::leave_bar_shell();
+    }
+    if view.is_bar() && !view.bar.follow_active_monitor {
+        window.pin_primary_monitor();
+    } else {
+        window.reset_anchor_monitor();
+    }
+    window.set_island(view.is_enabled());
+    window.set_bar(view.is_bar());
+    window.set_glass(&view.glass);
+    controller.set_island_config(view.clone(), now_ms());
+    controller.set_dpi_scale(window.anchor_dpi_scale());
+    if view.is_bar() {
+        controller.set_bar_width(
+            (window.monitor_width() as f32 / controller.render_scale()).round() as u32,
+        );
+    }
+    sync_taskbar_mode(&view);
+    let order = std::sync::atomic::Ordering::Relaxed;
+    worker.enabled.store(view.is_enabled(), order);
+    worker.poll_media.store(view.has_widget("music"), order);
+    worker
+        .poll_tasks
+        .store(termielle_app::tasks::should_poll_tasks(&view), order);
+    worker
+        .poll_task_icons
+        .store(termielle_app::tasks::should_poll_task_icons(&view), order);
+}
+
+fn drain_preferences(
+    preferences: &mut termielle_app::preferences::PreferencesWindow,
+    preview: &mut bool,
+    config: &mut AppConfig,
+    config_path: Option<&Path>,
+    window: &mut OverlayWindow,
+    controller: &mut Controller,
+    worker: &Arc<termielle_app::tasks::WorkerConfig>,
+) -> bool {
+    use termielle_app::preferences::model::{self, Request};
+    let mut changed = false;
+    while let Some(request) = preferences.take_request() {
+        match request {
+            Request::Preview(draft) => match model::validate(*draft, &config.island) {
+                Ok(mut view) => {
+                    theme::resolve_theme(&mut view);
+                    view.bar.replace_taskbar = false;
+                    apply_runtime_preferences(view, window, controller, worker);
+                    *preview = true;
+                    changed = true;
+                    preferences.acknowledge(&config.island, Ok(()), false);
+                }
+                Err(error) => preferences.acknowledge(&config.island, Err(error), false),
+            },
+            Request::Apply { baseline, draft } => {
+                let result =
+                    model::prepare_apply(&baseline, &config.island, *draft).and_then(|view| {
+                        let mut next = config.clone();
+                        next.island = view;
+                        save_preferences(&next, config_path).map_err(|_| {
+                            "Couldn't save this profile. Your previous settings were kept."
+                                .to_owned()
+                        })?;
+                        theme::resolve_theme(&mut next.island);
+                        config.island = next.island;
+                        apply_runtime_preferences(
+                            config.island.clone(),
+                            window,
+                            controller,
+                            worker,
+                        );
+                        *preview = false;
+                        changed = true;
+                        Ok(())
+                    });
+                preferences.acknowledge(&config.island, result, true);
+            }
+            Request::TurnOff => match request_turn_off(preferences.hwnd()) {
+                Ok(true) => preferences.acknowledge(&config.island, Ok(()), false),
+                Ok(false) => {}
+                Err(error) => preferences.acknowledge(&config.island, Err(error), false),
+            },
+            Request::Revert => {
+                apply_runtime_preferences(config.island.clone(), window, controller, worker);
+                *preview = false;
+                changed = true;
+                preferences.revert(&config.island);
+            }
+        }
+    }
+    changed
+}
+
 /// Smoke mode: no external assets. Presents every procedural fallback once,
 /// drives one in-process pipe event to `Thinking` (unless a custom pipe asked
 /// for the event to come from outside, as the doctor does), then exits `0`.
@@ -1963,8 +2367,13 @@ fn run_smoke(
                 window.destroy();
                 return 1;
             }
-            Ok(Some(WindowEvent::DisplayChanged)) => {}
-            Ok(Some(WindowEvent::Quit | WindowEvent::Restart)) => {}
+            Ok(Some(
+                WindowEvent::DisplayChanged
+                | WindowEvent::WorkAreaChanged
+                | WindowEvent::Resumed
+                | WindowEvent::DisplayRecovery,
+            )) => {}
+            Ok(Some(WindowEvent::Quit | WindowEvent::Restart | WindowEvent::TurnOff)) => {}
             Ok(Some(
                 WindowEvent::LayoutChanged(_)
                 | WindowEvent::ThemeChanged(_)
@@ -1972,6 +2381,13 @@ fn run_smoke(
                 | WindowEvent::BarPositionChanged(_)
                 | WindowEvent::SystemThemeChanged
                 | WindowEvent::ClickAt(..)
+                | WindowEvent::ContextAt(..)
+                | WindowEvent::PointerDown(..)
+                | WindowEvent::PointerMotion(..)
+                | WindowEvent::PointerCancelled
+                | WindowEvent::NavigationKey(_)
+                | WindowEvent::NavigationDismiss
+                | WindowEvent::AppLaunchResult(_)
                 | WindowEvent::ScrollAt(..)
                 | WindowEvent::PressChanged(_)
                 | WindowEvent::HoverChanged(_)
@@ -2059,6 +2475,39 @@ fn config_error_code(error: &termielle_core::ConfigError) -> i32 {
 #[cfg(test)]
 mod settings_tests {
     use super::*;
+
+    #[test]
+    fn repeated_on_claims_do_not_keep_the_old_instance_alive() {
+        let pipe = format!(
+            r"\\.\pipe\termielle-power-claim-test-{}",
+            std::process::id()
+        );
+        let first = acquire_single_instance(&pipe).unwrap();
+        for _ in 0..8 {
+            assert!(
+                matches!(acquire_single_instance(&pipe), Err(code) if code == ERROR_ALREADY_EXISTS.0)
+            );
+        }
+        drop(first);
+        let next = acquire_single_instance(&pipe)
+            .expect("collision handles must be closed so On can acquire after Off");
+        drop(next);
+    }
+
+    #[test]
+    fn power_cli_keeps_profile_and_rejects_conflicting_actions() {
+        let parse = |args: &[&str]| Cli::parse_args(args.iter().map(|arg| arg.to_string()));
+        let enable = parse(&["--enable", "--config", "custom.json"]);
+        assert_eq!(enable.power, Some(true));
+        assert_eq!(enable.config_path, Some(PathBuf::from("custom.json")));
+        assert!(!enable.power_conflict);
+        let disable = parse(&["--disable"]);
+        assert_eq!(disable.power, Some(false));
+        assert!(parse(&["--enable", "--disable"]).power_conflict);
+        assert!(parse(&["--disable", "--enable"]).power_conflict);
+        assert!(!parse(&[]).power_conflict);
+        assert!(parse(&[]).power.is_none());
+    }
 
     /// The glass samples a captured image, and anything outside it falls back
     /// to a flat tint. A surface mid-morph must therefore be covered for its
@@ -2154,6 +2603,36 @@ mod settings_tests {
             &WindowEvent::ToggleBarModule("not_a_module"),
             &mut island
         ));
+    }
+
+    #[test]
+    fn preferences_and_pins_save_to_the_explicit_profile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("profile.json");
+        let mut config = AppConfig::default();
+        config.island.bar.pinned_apps = vec![termielle_core::PinnedApp {
+            name: "Editor".into(),
+            target: termielle_core::AppLaunchTarget::Executable("C:\\Apps\\Editor.exe".into()),
+        }];
+        assert!(apply_setting(
+            &WindowEvent::ToggleBarModule("cpu"),
+            &mut config.island
+        ));
+        save_preferences(&config, Some(&path)).unwrap();
+        let loaded = load_config(&path).unwrap();
+        assert_eq!(loaded.island.bar.pinned_apps, config.island.bar.pinned_apps);
+        assert_eq!(
+            loaded.island.bar.modules_right,
+            config.island.bar.modules_right
+        );
+        assert!(!loaded.island.bar.replace_taskbar);
+    }
+
+    #[test]
+    fn an_unwritable_preferences_target_reports_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(save_preferences(&AppConfig::default(), Some(directory.path())).is_err());
+        assert!(directory.path().is_dir());
     }
 
     #[test]

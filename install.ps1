@@ -268,6 +268,31 @@ try {
         agy       = $prior['agy']
     }
 
+    # These launchers are the control surface when Off has removed all resident
+    # Termielle UI. They target only this installation, not Explorer or another app.
+    if (Test-Path -LiteralPath (Join-Path $bin 'integrations\termielle-power-v1')) {
+        Write-Step 'Adding on/off Start-menu shortcuts'
+        $powerShortcuts = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Termielle'
+        New-Item -ItemType Directory -Force -Path $powerShortcuts | Out-Null
+        $shortcutShell = New-Object -ComObject WScript.Shell
+        foreach ($entry in @(
+            @{ Name = 'Turn Termielle On'; Argument = '--enable'; Description = 'Enable Termielle and launch with your saved settings' },
+            @{ Name = 'Turn Termielle Off'; Argument = '--disable'; Description = 'Exit Termielle completely and stay off across logins' }
+        )) {
+            $link = Join-Path $powerShortcuts ($entry.Name + '.lnk')
+            $shortcut = $shortcutShell.CreateShortcut($link)
+            if ((Test-Path -LiteralPath $link) -and $shortcut.TargetPath -ine (Join-Path $bin 'termielle-app.exe')) {
+                Write-Warning "Leaving unrelated shortcut unchanged: $link"
+                continue
+            }
+            $shortcut.TargetPath = Join-Path $bin 'termielle-app.exe'
+            $shortcut.Arguments = $entry.Argument
+            $shortcut.WorkingDirectory = $bin
+            $shortcut.Description = $entry.Description
+            $shortcut.Save()
+        }
+    }
+
     if (-not $NoPath) {
         Write-Step 'Adding emitter to PATH'
         $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -390,7 +415,11 @@ try {
 
     Write-Atomic $recordPath ($record | ConvertTo-Json -Depth 10)
 
-    if (-not $NoStart -and -not (Get-Process 'termielle-app' -ErrorAction SilentlyContinue)) {
+    $powerDisabled = Test-Path -LiteralPath (Join-Path $env:USERPROFILE '.termielle\disabled')
+    if ($powerDisabled) {
+        Write-Good 'Termielle left off (deliberate opt-out preserved); use Start > Turn Termielle On to resume'
+    }
+    if (-not $NoStart -and -not $powerDisabled -and -not (Get-Process 'termielle-app' -ErrorAction SilentlyContinue)) {
         Write-Step 'Starting the overlay'
         if (Get-ScheduledTask -TaskName 'Termielle' -ErrorAction SilentlyContinue) {
             Start-ScheduledTask -TaskName 'Termielle' | Out-Null

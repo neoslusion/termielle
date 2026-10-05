@@ -40,6 +40,8 @@ pub const TRAY_EXIT: u32 = 100;
 
 /// Menu command: relaunch the overlay after quitting.
 pub const TRAY_RESTART: u32 = 101;
+/// Persistent, whole-application off (unlike Exit, which is session-only).
+pub const TRAY_TURN_OFF: u32 = 106;
 
 /// Layout switches
 pub const TRAY_LAYOUT_CLASSIC: u32 = 102;
@@ -450,8 +452,17 @@ pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
             PCWSTR::null(),
         )
     };
+    let turn_off = crate::window::encode_wide("Turn &Off Termielle...");
+    let _ = unsafe {
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            TRAY_TURN_OFF as usize,
+            PCWSTR(turn_off.as_ptr()),
+        )
+    };
     let restart = crate::window::encode_wide("Restart");
-    let exit = crate::window::encode_wide("Exit");
+    let exit = crate::window::encode_wide("Exit (until next launch)");
     let _ = unsafe {
         AppendMenuW(
             menu,

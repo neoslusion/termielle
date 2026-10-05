@@ -49,6 +49,8 @@ pub struct BarConfig {
     /// every crossing). `false` pins the bar to the primary monitor.
     /// Defaults true so existing setups keep their behavior.
     pub follow_active_monitor: bool,
+    /// Explicit launch targets in user-chosen order. Never inferred from titles.
+    pub pinned_apps: Vec<crate::PinnedApp>,
     pub modules_left: Vec<String>,
     pub modules_center: Vec<String>,
     pub modules_right: Vec<String>,
@@ -65,6 +67,7 @@ impl Default for BarConfig {
             reserve_space: true,
             replace_taskbar: false,
             follow_active_monitor: true,
+            pinned_apps: Vec::new(),
             modules_left: vec!["apps".to_string(), "window".to_string()],
             modules_center: vec!["termielle".to_string()],
             modules_right: vec![
@@ -349,6 +352,7 @@ impl IslandConfig {
         // unclamped height turns `(bar_h - 10)` into a u32 underflow (release
         // wrap → gigantic pill → GUI-thread hang). Margin never eats more
         // than half the bar, so the visual strip keeps positive height.
+        crate::app_pin::sanitize_pins(&mut self.bar.pinned_apps);
         self.bar.height = self.bar.height.clamp(24, 64);
         self.bar.margin = self.bar.margin.clamp(0, self.bar.height / 2);
         self.bar.corner_radius = self.bar.corner_radius.clamp(0, self.bar.height / 2);

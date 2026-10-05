@@ -58,130 +58,19 @@ impl Controller {
         let room = |x: i32, w: u32| x + w as i32 <= left_limit;
         let apps_enabled = self.bar_module("left", "apps");
 
-        if self.island.is_bar() && self.island.bar.replace_taskbar {
-            use crate::bar::shell::ShellAction;
-            for action in ShellAction::ALL {
-                let control_w = action.control_width();
-                if !room(cur_x, control_w) {
-                    break;
-                }
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    cur_x,
-                    pill_y,
-                    control_w,
-                    pill_h,
-                    8,
-                    // A scrim, not a highlight: the bar is translucent, so a
-                    // light wash would fight the 10 px label instead of
-                    // helping it read over whatever is behind the strip.
-                    [0, 0, 0, 56],
-                    [255, 255, 255, 32],
-                );
-                crate::animation::notch::draw_text_in_rect(
-                    frame,
-                    action.label_of(),
-                    (cur_x, pill_y, control_w, pill_h),
-                    10,
-                    false,
-                    primary,
-                    true,
-                );
-                hits.push((action.hit_id(), cur_x, pill_y, control_w, pill_h));
-                cur_x += control_w as i32 + 4;
-            }
-            cur_x += 6;
-
-            // Native replacement mode keeps real application buttons in the
-            // bar. The worker already filters to visible, non-cloaked windows.
-            if !apps_enabled {
-                let icon = (pill_h.saturating_sub(8)).min(24);
-                for task in self.tasks.iter().take(4) {
-                    if !room(cur_x, icon) {
-                        break;
-                    }
-                    crate::animation::notch::blit_rounded_pixels(
-                        frame,
-                        &task.pixels_pbgra,
-                        task.width,
-                        task.height,
-                        cur_x + 2,
-                        pill_y + (pill_h as i32 - icon as i32) / 2,
-                        icon,
-                        icon,
-                        6,
-                    );
-                    hits.push((task.hwnd, cur_x, pill_y, icon, pill_h));
-                    cur_x += icon as i32 + 6;
-                }
-            }
-        }
-
         let mut grouped_items = false;
-        if apps_enabled {
-            let mut next_x = cur_x + 4;
-            let mut apps = Vec::new();
-            for task in self.tasks.iter().take(6) {
-                if !room(next_x, 32) {
-                    break;
-                }
-                apps.push((task, next_x));
-                next_x += 32;
-            }
-            if !apps.is_empty() {
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    cur_x,
-                    pill_y,
-                    (next_x - cur_x) as u32,
-                    pill_h,
-                    8,
-                    if macchiato {
-                        MACCHIATO_SURFACE
-                    } else {
-                        [0, 0, 0, 96]
-                    },
-                    if macchiato {
-                        MACCHIATO_BORDER
-                    } else {
-                        [255, 255, 255, 32]
-                    },
-                );
-                grouped_items = true;
-            }
-            for (task, slot_x) in apps {
-                if task.hwnd == metrics.foreground_hwnd {
-                    crate::animation::notch::draw_rounded_rect(
-                        frame,
-                        slot_x,
-                        pill_y,
-                        28,
-                        pill_h,
-                        7,
-                        if macchiato {
-                            MACCHIATO_ACTIVE_SURFACE
-                        } else {
-                            [primary[0], primary[1], primary[2], 64]
-                        },
-                        [0; 4],
-                    );
-                }
-                crate::animation::notch::blit_rounded_pixels(
-                    frame,
-                    &task.pixels_pbgra,
-                    task.width,
-                    task.height,
-                    slot_x + 5,
-                    pill_y + (pill_h as i32 - 18) / 2,
-                    18,
-                    18,
-                    5,
-                );
-                hits.push((task.hwnd, slot_x, pill_y, 28, pill_h));
-            }
-            if grouped_items {
-                cur_x = next_x;
-            }
+        if apps_enabled || self.island.bar.replace_taskbar {
+            let (app_hits, next_x) = self.paint_navigation_rail(
+                frame,
+                cur_x,
+                pill_y,
+                pill_h,
+                left_limit,
+                metrics.foreground_hwnd,
+            );
+            grouped_items = !app_hits.is_empty();
+            hits.extend(app_hits);
+            cur_x = next_x;
         } else if self.bar_module("left", "workspaces") {
             let ws = metrics.workspaces;
             let mut next_x = cur_x + if macchiato { 4 } else { 0 };
@@ -810,27 +699,36 @@ impl Controller {
                 self.hover_point = saved_hover;
             }
 
-            // Offset hit targets recorded in sub-frame by (content_x, island_y)
+            let (fade_start, fade_end) = if self.alerts.is_empty() {
+                (0.65, 0.98)
+            } else {
+                (0.35, 0.85)
+            };
+            let alpha = (255.0
+                * crate::animation::notch::smoothstep(fade_start, fade_end, card.progress))
+            .round() as u8;
+            // Activity controls follow visible content, rather than waiting
+            // for the last 2% of the spring. Clip their hits to the actual card.
             let content_x = card.content_x;
-            for hit in &mut self.icon_hits {
+            self.icon_hits.retain_mut(|hit| {
                 hit.1 += content_x;
                 hit.2 += card.island_y;
-            }
-            // A fading or clipped control must not intercept clicks before it is visible.
-            if card.progress < 0.98 {
-                self.icon_hits.clear();
-            }
+                if !crate::app::activity::SessionActivity::is_hit(hit.0) {
+                    return card.progress >= 0.98;
+                }
+                let x0 = hit.1.max(card.island_x);
+                let y0 = hit.2.max(card.island_y);
+                let x1 = (hit.1 + hit.3 as i32).min(card.island_x + card.island_w as i32);
+                let y1 = (hit.2 + hit.4 as i32).min(card.island_y + card.exp_h as i32);
+                hit.1 = x0;
+                hit.2 = y0;
+                hit.3 = x1.saturating_sub(x0).max(0) as u32;
+                hit.4 = y1.saturating_sub(y0).max(0) as u32;
+                alpha >= 128 && hit.3 > 0 && hit.4 > 0
+            });
             self.icon_hits.extend(hits);
 
             if self.bar_module("center", "termielle") {
-                let (fade_start, fade_end) = if self.alerts.is_empty() {
-                    (0.65, 0.98)
-                } else {
-                    (0.35, 0.85)
-                };
-                let alpha = (255.0
-                    * crate::animation::notch::smoothstep(fade_start, fade_end, card.progress))
-                .round() as u8;
                 let mut clipped = self.blank_frame(card.island_w, card.exp_h);
                 crate::animation::notch::blend_frame_over(
                     &mut clipped,

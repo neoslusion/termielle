@@ -70,6 +70,7 @@ fn clear_region(dst: &mut FrameBuffer, y: i32, x0: u32, x1: u32, rows: u32) {
 
 fn is_side_hit(id: isize) -> bool {
     id > 0
+        || super::super::navigation::Navigation::is_rail_hit(id)
         || id == crate::bar::HIT_BAR_VOLUME_TOGGLE
         || id == crate::app::types::HIT_CARD_PANEL
         || id == crate::app::types::HIT_CARD_NOTIFICATIONS
@@ -124,6 +125,12 @@ impl Controller {
         now_ms: u64,
         damage: BarDamage,
     ) -> FrameBuffer {
+        let damage = if self.is_navigation_open() {
+            BarDamage::FULL
+        } else {
+            damage
+        };
+        self.activity.deadline = None;
         // See `render_island`: banner visibility is re-derived per frame so a
         // collapsed popup cannot keep the countdown tick alive.
         self.alert_visible = false;
@@ -315,6 +322,9 @@ impl Controller {
         if (self.panel_open || self.panel_morphing) && expanded {
             self.paint_bar_panel(&mut frame, width, exp_h, bar_y, content_w, now_ms);
         }
+        if self.is_navigation_open() && expanded {
+            self.paint_navigation_popup(&mut frame, width, exp_h, bar_y);
+        }
         frame
     }
 
@@ -371,20 +381,22 @@ impl Controller {
             }
         }
         let progress = (visible_h as f32 / panel_h as f32).clamp(0.0, 1.0);
-        if progress >= 0.98 {
-            for hit in &mut self.icon_hits {
-                hit.1 += panel_x;
-                hit.2 += panel_y;
+        let alpha =
+            (255.0 * crate::animation::notch::smoothstep(0.65, 0.98, progress)).round() as u8;
+        self.icon_hits.retain_mut(|hit| {
+            let bottom = (hit.2 + hit.4 as i32).min(visible_h as i32);
+            hit.4 = bottom.saturating_sub(hit.2).max(0) as u32;
+            if alpha < 128 || hit.4 == 0 {
+                return false;
             }
-        } else {
-            self.icon_hits.clear();
-        }
+            hit.1 += panel_x;
+            hit.2 += panel_y;
+            true
+        });
         self.icon_hits.extend(existing_hits);
 
         let mut clipped = self.blank_frame(panel_w, visible_h);
         crate::animation::notch::blend_frame_over(&mut clipped, &content, 0, 0, 255);
-        let alpha =
-            (255.0 * crate::animation::notch::smoothstep(0.65, 0.98, progress)).round() as u8;
         crate::animation::notch::blend_frame_over(frame, &clipped, panel_x, panel_y, alpha);
     }
 
@@ -445,6 +457,63 @@ mod tests {
     use crate::bar::workspaces::WorkspaceSnapshot;
     use crate::tasks::{TaskIcon, WorkerUpdate};
     use termielle_core::{AssetCatalog, IslandConfig, IslandLayout};
+
+    #[test]
+    fn visible_notification_clear_button_works_before_the_panel_finishes_resizing() {
+        for position in [
+            termielle_core::BarPosition::Top,
+            termielle_core::BarPosition::Bottom,
+        ] {
+            let mut island = IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: false,
+                ..IslandConfig::default()
+            };
+            island.bar.position = position;
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                false,
+                None,
+                island,
+            );
+            controller.trigger_alert(
+                crate::app::types::AlertKind::System,
+                "Message",
+                "A recent notification",
+                [255; 4],
+                6_000,
+                1_000,
+                "clear-morph",
+            );
+            controller.panel_open = true;
+            controller.panel_kind = crate::app::types::RightPanel::Notifications;
+            let panel_height = crate::app::cards::notifications::panel_height(1);
+            let visible_height = panel_height - 12;
+            let height = controller.island.bar.height + BAR_POPUP_GAP + visible_height;
+            controller.current =
+                controller.render_bar(VisualState::Idle, controller.bar_width, height, 1_100);
+            let (_, x, y, width, button_height) = controller
+                .click_regions()
+                .iter()
+                .find(|(id, ..)| *id == crate::app::types::HIT_NOTIFICATIONS_CLEAR)
+                .copied()
+                .expect("a fully painted Clear All must be clickable during a morph");
+            assert_eq!(
+                controller.handle_click(x + width as i32 / 2, y + button_height as i32 / 2, 1_110),
+                crate::app::types::ClickOutcome::NotificationsCleared,
+            );
+            assert_eq!(controller.recent_notification_count(), 0);
+            assert_eq!(controller.unread_notification_count(), 0);
+            assert!(
+                !controller
+                    .click_regions()
+                    .iter()
+                    .any(|(id, ..)| *id == crate::app::types::HIT_NOTIFICATIONS_CLEAR)
+            );
+        }
+    }
 
     #[test]
     fn full_render_installs_cached_side_hit_regions() {
@@ -746,6 +815,20 @@ mod tests {
         controller.set_task_update_at(
             WorkerUpdate {
                 tasks: vec![task(1), task(2)],
+                windows: (1..=2)
+                    .map(|hwnd| crate::tasks::WindowInfo {
+                        hwnd,
+                        process_id: hwnd as u32 + 10,
+                        title: format!("Window {hwnd}"),
+                        application: Some(termielle_core::PinnedApp {
+                            name: format!("App {hwnd}"),
+                            target: termielle_core::AppLaunchTarget::Executable(format!(
+                                "C:\\Apps\\App{hwnd}.exe"
+                            )),
+                        }),
+                        minimized: false,
+                    })
+                    .collect(),
                 ..WorkerUpdate::default()
             },
             60_000,
@@ -754,19 +837,33 @@ mod tests {
         let hits: Vec<_> = controller
             .icon_hits
             .iter()
-            .filter(|(id, ..)| *id > 0)
+            .filter(|(id, ..)| super::super::super::navigation::Navigation::is_rail_hit(*id))
+            .skip(1)
+            .take(2)
             .copied()
             .collect();
         assert_eq!(hits.len(), 2);
         let (_, x, y, width, height) = hits[1];
         assert!(matches!(
             controller.handle_click(x + width as i32 / 2, y + height as i32 / 2, 60_001),
-            crate::app::types::ClickOutcome::ActivateWindow(2)
+            crate::app::types::ClickOutcome::ActivateAssociatedWindow(2, 12)
         ));
 
         controller.set_task_update_at(
             WorkerUpdate {
                 tasks: vec![task(2)],
+                windows: vec![crate::tasks::WindowInfo {
+                    hwnd: 2,
+                    process_id: 12,
+                    title: "Window 2".into(),
+                    application: Some(termielle_core::PinnedApp {
+                        name: "App 2".into(),
+                        target: termielle_core::AppLaunchTarget::Executable(
+                            "C:\\Apps\\App2.exe".into(),
+                        ),
+                    }),
+                    minimized: false,
+                }],
                 ..WorkerUpdate::default()
             },
             60_010,
@@ -774,10 +871,15 @@ mod tests {
         let active_hits: Vec<_> = controller
             .icon_hits
             .iter()
-            .filter(|(id, ..)| *id > 0)
-            .map(|(id, ..)| *id)
+            .filter(|(id, ..)| super::super::super::navigation::Navigation::is_rail_hit(*id))
+            .copied()
             .collect();
-        assert_eq!(active_hits, vec![2]);
+        assert_eq!(active_hits.len(), 3); // Apps, remaining app, overflow.
+        let (_, x, y, w, h) = active_hits[1];
+        assert_eq!(
+            controller.handle_click(x + w as i32 / 2, y + h as i32 / 2, 60_011),
+            crate::app::types::ClickOutcome::ActivateAssociatedWindow(2, 12)
+        );
     }
 
     #[test]

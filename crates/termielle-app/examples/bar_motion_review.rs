@@ -16,6 +16,10 @@ fn main() {
     config.island.layout = IslandLayout::Bar;
     config.island.bar.reserve_space = false;
     config.island.bar.replace_taskbar = false;
+    if std::env::args().any(|argument| argument == "--macchiato") {
+        termielle_app::theme::apply_theme(&mut config.island, "catppuccin-macchiato");
+    }
+    let controls = std::env::args().any(|argument| argument == "--controls");
     let mut window = OverlayWindow::create(&config, false).unwrap();
     let metrics =
         termielle_app::bar::metrics::Service::spawn(window.wake_handle(), config.island.clone());
@@ -43,9 +47,14 @@ fn main() {
     let envelope = ((controller.island_config().bar.height + 320) as f32
         * controller.render_scale())
     .ceil() as u32;
-    if let Some(mut backdrop) =
-        termielle_app::backdrop::capture_backdrop(x, y, width, envelope, glass.tint)
-    {
+    if let Some(mut backdrop) = termielle_app::backdrop::capture_backdrop_excluding(
+        window.hwnd().0 as isize,
+        x,
+        y,
+        width,
+        envelope,
+        glass.tint,
+    ) {
         termielle_app::backdrop::blur_soft(&mut backdrop, glass.blur_radius);
         termielle_app::backdrop::desaturate(&mut backdrop, 0.15);
         window.set_backdrop(backdrop);
@@ -96,7 +105,22 @@ fn main() {
             controller.set_bar_metrics(snapshot, now);
         }
         if costs.len() % 60 == 0 {
-            controller.toggle_expand(now);
+            if controls {
+                let (_, x, y, width, height) = controller
+                    .click_regions()
+                    .iter()
+                    .find(|(id, ..)| *id == termielle_app::app::HIT_CARD_PANEL)
+                    .copied()
+                    .expect("Control Center bar entry");
+                let scale = controller.render_scale();
+                controller.handle_click(
+                    ((x + width as i32 / 2) as f32 * scale).round() as i32,
+                    ((y + height as i32 / 2) as f32 * scale).round() as i32,
+                    now,
+                );
+            } else {
+                controller.toggle_expand(now);
+            }
         }
         controller.on_timer(now);
         paints.push(start.elapsed().as_secs_f64() * 1000.0);

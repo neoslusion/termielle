@@ -47,10 +47,8 @@ impl Controller {
     /// surfaces retain the asset cadence because another animation already
     /// keeps the compositor active there.
     ///
-    /// The bar is the exception even when idle. Its tick repaints only the
-    /// center surface off the cached side zones, and holding a resting bar
-    /// face to 10 fps froze it on the GIF's opening frame, which is nearly
-    /// blank - it read as a missing face rather than a still one.
+    /// The bar fills its first idle loop at the active cadence before settling
+    /// on visible artwork, rather than freezing on a nearly blank opening frame.
     fn face_min_delay_ms(&self) -> u64 {
         let resting = self.state == termielle_core::VisualState::Idle && !self.media_playing();
         if resting && !self.island.is_bar() {
@@ -70,12 +68,46 @@ impl Controller {
         if self.presentation() == crate::animation::notch::Presentation::Hidden {
             return;
         }
-        // A bar face tick is a cached-zone repaint of the center surface, not
-        // a cold rebuild, so it can animate even while the bar rests.
+        if self.settle_idle_bar_face() {
+            return;
+        }
         if self.face_decoder.is_none() && self.face_frames.len() < 2 {
             return;
         }
         self.face_deadline = Some(self.face_deadline_for(now_ms));
+    }
+
+    fn settle_idle_bar_face(&mut self) -> bool {
+        if !self.island.is_bar()
+            || self.state != VisualState::Idle
+            || self.media_playing()
+            || self.face_decoder.is_some()
+            || self.face_frames.is_empty()
+        {
+            return false;
+        }
+        if self.face_frames.len() > 1 {
+            let index = self
+                .face_frames
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, frame)| {
+                    frame
+                        .pixels_pbgra
+                        .chunks_exact(4)
+                        .map(|pixel| u64::from(pixel[3]))
+                        .sum::<u64>()
+                })
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            let delay = self.face_delays.get(index).copied().unwrap_or(40);
+            let frame = self.face_frames.swap_remove(index);
+            self.face_frame = frame.clone();
+            self.face_frames = vec![frame];
+            self.face_delays = vec![delay];
+            self.face_idx = 0;
+        }
+        true
     }
 
     /// When the user configured a `frame_rate`, that cadence wins over the
@@ -124,16 +156,15 @@ impl Controller {
                 self.face_decoder = None;
             }
         }
-        if self.face_frames.len() < 2 {
-            self.arm_face_deadline(now_ms);
-            return;
+        if !self.settle_idle_bar_face() {
+            if self.face_frames.len() < 2 {
+                self.arm_face_deadline(now_ms);
+                return;
+            }
+            self.face_idx = (self.face_idx + 1) % self.face_frames.len();
+            self.face_frame = self.face_frames[self.face_idx].clone();
         }
-        self.face_idx = (self.face_idx + 1) % self.face_frames.len();
-        // `face_frame` is what the bar pill and the short card actually blit,
-        // so advancing the index alone left both showing the GIF's first
-        // frame forever: the animation ticked and nothing moved.
-        self.face_frame = self.face_frames[self.face_idx].clone();
-        self.face_deadline = Some(self.face_deadline_for(now_ms));
+        self.arm_face_deadline(now_ms);
         let (w, h) = self.current_logical_size();
         // A bar face tick redraws only the center surface. The side zones are
         // unchanged by a face frame, so taking the cached-zone path here is

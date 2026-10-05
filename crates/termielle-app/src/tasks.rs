@@ -20,9 +20,10 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GetClassLongPtrW, GetClassNameW,
-    GetIconInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, HICON, ICON_BIG, ICON_SMALL2,
-    ICONINFO, IsIconic, IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL,
-    SW_RESTORE, SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_GETICON, WS_EX_TOOLWINDOW,
+    GetIconInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HICON,
+    ICON_BIG, ICON_SMALL2, ICONINFO, IsIconic, IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS,
+    SMTO_ABORTIFHUNG, SMTO_NORMAL, SW_RESTORE, SendMessageTimeoutW, SetForegroundWindow,
+    ShowWindow, WM_GETICON, WS_EX_TOOLWINDOW,
 };
 
 /// Edge length of a decoded media artwork thumbnail, in pixels (high-resolution).
@@ -125,12 +126,36 @@ pub fn activate_window(hwnd: isize) {
     }
 }
 
+/// Focus a user-associated window only if its owning process still matches.
+/// Returns false for a stale target or a Windows foreground-policy refusal.
+pub fn activate_associated_window(hwnd: isize, process_id: u32) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    let window = HWND(hwnd as *mut core::ffi::c_void);
+    let mut current_pid = 0;
+    // SAFETY: the OS validates the HWND, and the out-parameter is live.
+    unsafe { GetWindowThreadProcessId(window, Some(&mut current_pid)) };
+    if current_pid != process_id {
+        return false;
+    }
+    // SAFETY: this is the existing user-selected window, checked above.
+    unsafe {
+        if IsIconic(window).as_bool() {
+            let _ = ShowWindow(window, SW_RESTORE);
+        }
+        SetForegroundWindow(window).as_bool()
+    }
+}
+
 /// One worker round: the current media state, open window tasks, and (when a capture is due) the
 /// blurred wallpaper backdrop for the glass.
 #[derive(Clone, Debug, Default)]
 pub struct WorkerUpdate {
     pub media: Option<MediaInfo>,
     pub tasks: Vec<TaskIcon>,
+    /// Lightweight window picker catalog; independent of icon extraction.
+    pub windows: Vec<WindowInfo>,
     pub backdrop: Option<crate::backdrop::Backdrop>,
 }
 
@@ -138,6 +163,9 @@ pub struct WorkerUpdate {
 /// on every present. Physical pixels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BackdropRequest {
+    /// Our own overlay only; never change another process's capture policy.
+    pub exclude_hwnd: isize,
+    pub generation: u64,
     pub x: i32,
     pub y: i32,
     pub w: u32,
@@ -155,21 +183,28 @@ pub struct WorkerConfig {
     pub enabled: AtomicBool,
     /// When true, SMTC media metadata and artwork are refreshed.
     pub poll_media: AtomicBool,
-    /// When true, window tasks are enumerated for task switcher.
+    /// When true, window metadata is enumerated for switching/session links.
     pub poll_tasks: AtomicBool,
+    /// Only the app rail/task switcher needs expensive window artwork.
+    pub poll_task_icons: AtomicBool,
 }
 
 impl WorkerConfig {
-    pub fn new(enabled: bool, poll_media: bool, poll_tasks: bool) -> Self {
+    pub fn new(enabled: bool, poll_media: bool, poll_tasks: bool, poll_task_icons: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
             poll_media: AtomicBool::new(poll_media),
             poll_tasks: AtomicBool::new(poll_tasks),
+            poll_task_icons: AtomicBool::new(poll_task_icons),
         }
     }
 }
 
 pub fn should_poll_tasks(config: &IslandConfig) -> bool {
+    (config.is_enabled() && config.has_widget("agents")) || should_poll_task_icons(config)
+}
+
+pub fn should_poll_task_icons(config: &IslandConfig) -> bool {
     (config.has_widget("tasks") && config.show_tasks)
         || (config.is_bar()
             && (config.bar.replace_taskbar
@@ -207,10 +242,12 @@ pub fn spawn_worker(
         let mut last_req: Option<BackdropRequest> = None;
         let mut last_requested: Option<BackdropRequest> = None;
         let mut last_req_ms: u64 = 0;
+        let mut last_scene = None;
         let mut last_media_ms: u64 = 0;
         let mut last_tasks_ms: u64 = 0;
         let mut last_media: Option<MediaInfo> = None;
         let mut last_tasks: Vec<TaskIcon> = Vec::new();
+        let mut last_windows: Vec<WindowInfo> = Vec::new();
         loop {
             if config.enabled.load(Ordering::Relaxed) {
                 let now_ms = std::time::SystemTime::now()
@@ -230,6 +267,7 @@ pub fn spawn_worker(
                     // Routine bar/metric republishes do not reactivate an
                     // unchanged capture forever. Geometry/material changes do.
                     if last_requested != Some(req) {
+                        last_sig = None;
                         last_requested = Some(req);
                         last_req = Some(req);
                         last_req_ms = now_ms;
@@ -240,13 +278,32 @@ pub fn spawn_worker(
                     // Geometry/material changes above explicitly re-arm it.
                     last_req = None;
                 }
+                // Window switches/moves can change what is behind an idle
+                // notch without changing its own geometry. Re-arm on those
+                // scene changes while retaining the five-second quiet cutoff.
+                if let Some(req) = last_requested {
+                    if let Some(scene) = crate::backdrop::foreground_scene(req.exclude_hwnd) {
+                        if last_scene != Some(scene) {
+                            last_scene = Some(scene);
+                            last_req = Some(req);
+                            last_req_ms = now_ms;
+                            last_sig = None;
+                        }
+                    }
+                }
                 let mut backdrop = None;
                 if let Some(req) = last_req {
                     let sig = (req.x, req.y, req.w, req.h, req.radius, req.tint);
                     let due = last_sig != Some(sig)
                         || now_ms.saturating_sub(last_capture_ms) > BACKDROP_REFRESH_MS;
-                    if req.w > 0 && req.h > 0 && req.blur && due {
-                        let mut bg = crate::backdrop::capture_backdrop(
+                    if req.w > 0
+                        && req.h > 0
+                        && req.blur
+                        && due
+                        && now_ms.saturating_sub(last_capture_ms) >= 250
+                    {
+                        let mut bg = crate::backdrop::capture_backdrop_excluding(
+                            req.exclude_hwnd,
                             req.x,
                             req.y,
                             req.w,
@@ -254,6 +311,7 @@ pub fn spawn_worker(
                             [req.tint[0], req.tint[1], req.tint[2], 255],
                         );
                         if let Some(bg) = bg.as_mut() {
+                            bg.capture_token = Some((req.exclude_hwnd, req.generation));
                             crate::backdrop::blur_soft(bg, req.radius);
                             // Acrylic desaturates what it blurs: keeps the
                             // wallpaper's light without its hue taking over.
@@ -297,13 +355,21 @@ pub fn spawn_worker(
                 let mut tasks_changed = false;
                 if tasks_due {
                     last_tasks_ms = now_ms;
-                    let next = enumerate_tasks(6);
-                    tasks_changed = next != last_tasks;
+                    let windows = enumerate_windows(config.poll_task_icons.load(Ordering::Relaxed));
+                    let next = if config.poll_task_icons.load(Ordering::Relaxed) {
+                        task_icons(&windows, 6)
+                    } else {
+                        Vec::new()
+                    };
+                    tasks_changed = next != last_tasks || windows != last_windows;
                     if tasks_changed {
                         last_tasks = next;
+                        last_windows = windows;
                     }
-                } else if !should_poll_tasks && !last_tasks.is_empty() {
+                } else if !should_poll_tasks && (!last_tasks.is_empty() || !last_windows.is_empty())
+                {
                     last_tasks.clear();
+                    last_windows.clear();
                     tasks_changed = true;
                 }
 
@@ -311,6 +377,7 @@ pub fn spawn_worker(
                     let update = WorkerUpdate {
                         media: last_media.clone(),
                         tasks: last_tasks.clone(),
+                        windows: last_windows.clone(),
                         backdrop,
                     };
                     if sender.send(update).is_err() {
@@ -485,19 +552,31 @@ fn decode_media_thumbnail(
     }))
 }
 
-#[derive(Clone)]
-struct TaskWindow {
-    hwnd: isize,
-    title: String,
+/// Local window metadata, never included in lifecycle events or the journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub process_id: u32,
+    pub title: String,
+    /// Process-derived identity and launch target, not a title heuristic.
+    pub application: Option<termielle_core::PinnedApp>,
+    pub minimized: bool,
 }
 
+// Defensive bound, not the rail's six-artwork cap. All enumerated entries
+// remain reachable through paged navigation, including those without icons.
+const MAX_PICKER_WINDOWS: usize = 4096;
+
 thread_local! {
-    static ENUM_BUF: RefCell<Vec<TaskWindow>> = const { RefCell::new(Vec::new()) };
+    static ENUM_BUF: RefCell<Vec<WindowInfo>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Enumerates up to `max_count` open application windows and captures their icons.
 pub fn enumerate_tasks(max_count: usize) -> Vec<TaskIcon> {
-    let windows = enumerate_windows();
+    task_icons(&enumerate_windows(true), max_count)
+}
+
+fn task_icons(windows: &[WindowInfo], max_count: usize) -> Vec<TaskIcon> {
     let mut icons = Vec::new();
     for win in windows {
         if icons.len() >= max_count {
@@ -510,20 +589,31 @@ pub fn enumerate_tasks(max_count: usize) -> Vec<TaskIcon> {
     icons
 }
 
-fn enumerate_windows() -> Vec<TaskWindow> {
-    ENUM_BUF.with(|cell| {
+fn enumerate_windows(include_app_ids: bool) -> Vec<WindowInfo> {
+    let mut windows = ENUM_BUF.with(|cell| {
         cell.borrow_mut().clear();
         unsafe {
             let _ = EnumWindows(Some(enum_proc), LPARAM(0));
         }
         cell.borrow().clone()
-    })
+    });
+    let mut identities = std::collections::HashMap::new();
+    for window in windows.iter_mut().filter(|_| include_app_ids) {
+        window.application = identities
+            .entry(window.process_id)
+            .or_insert_with(|| crate::app_navigation::application_for_process(window.process_id))
+            .clone();
+    }
+    windows
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> windows::core::BOOL {
-    let push = |task: TaskWindow| {
+    let push = |task: WindowInfo| {
         ENUM_BUF.with(|cell| cell.borrow_mut().push(task));
     };
+    if ENUM_BUF.with(|cell| cell.borrow().len() >= MAX_PICKER_WINDOWS) {
+        return windows::core::BOOL(0);
+    }
     if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
         return windows::core::BOOL(1);
     }
@@ -548,7 +638,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> windows::cor
     // Skip our own overlay window.
     let mut class = [0u16; 64];
     let len = unsafe { GetClassNameW(hwnd, &mut class) };
-    if len > 0 && String::from_utf16_lossy(&class[..len as usize]) == "termielle_overlay" {
+    if len > 0 && String::from_utf16_lossy(&class[..len as usize]).starts_with("termielle_") {
         return windows::core::BOOL(1);
     }
     // Must have a non-empty title.
@@ -569,12 +659,21 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> windows::cor
     }
     let w = rect.right - rect.left;
     let h = rect.bottom - rect.top;
-    if w < 120 || h < 60 {
+    if (w < 120 || h < 60) && !unsafe { IsIconic(hwnd) }.as_bool() {
         return windows::core::BOOL(1);
     }
-    push(TaskWindow {
+    let mut process_id = 0;
+    // SAFETY: the OS validates the HWND and the out-parameter is live.
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    if process_id == 0 {
+        return windows::core::BOOL(1);
+    }
+    push(WindowInfo {
         hwnd: hwnd.0 as isize,
-        title: text.chars().take(64).collect(),
+        process_id,
+        title: text.chars().take(128).collect(),
+        application: None,
+        minimized: unsafe { IsIconic(hwnd) }.as_bool(),
     });
     windows::core::BOOL(1)
 }
@@ -904,7 +1003,7 @@ mod icon_mask_tests {
 
 #[cfg(test)]
 mod worker_config_tests {
-    use super::should_poll_tasks;
+    use super::{should_poll_task_icons, should_poll_tasks};
     use termielle_core::{IslandConfig, IslandLayout};
 
     #[test]
@@ -916,9 +1015,30 @@ mod worker_config_tests {
         assert!(should_poll_tasks(&config));
 
         config.bar.modules_left = vec!["workspaces".into(), "window".into()];
+        config.widgets = vec!["face".into(), "music".into()];
         assert!(!should_poll_tasks(&config));
 
         config.bar.replace_taskbar = true;
         assert!(should_poll_tasks(&config));
+    }
+
+    #[test]
+    fn agent_activity_can_link_windows_without_enabling_the_task_switcher() {
+        let mut config = IslandConfig {
+            layout: IslandLayout::Island,
+            widgets: vec!["agents".into()],
+            show_tasks: false,
+            ..IslandConfig::default()
+        };
+        assert!(should_poll_tasks(&config));
+        assert!(
+            !should_poll_task_icons(&config),
+            "linking never requires artwork"
+        );
+        config.widgets.clear();
+        assert!(!should_poll_tasks(&config));
+        config.layout = IslandLayout::Classic;
+        config.widgets = vec!["agents".into()];
+        assert!(!should_poll_tasks(&config));
     }
 }

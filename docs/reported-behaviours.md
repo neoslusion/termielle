@@ -16,6 +16,8 @@ current contract. Control Center and recent notifications share only the
 right-popover slot; neither claims the notch.
 
 Reports 5–10 record later desktop refinements and the launcher integration fix.
+Report 11 records the subsequent Clear All click-readiness fix; the related
+idle/caching changes and measurements are in the [performance follow-up](performance.md).
 See the [development handoff](development-handoff.md) for the complete feature
 inventory, configuration, source map, and build/redeployment checklist.
 
@@ -235,6 +237,7 @@ launched the app inside a job that later timed out and killed it.
 | 8 | Pill hover does not work; clicking shows an unhelpful Idle view | Scoped hover detection/deadlines; empty hover stays collapsed; click opens Today | Hover/controller tests and subsequent user acceptance |
 | 9 | Expanded notifications are hard to dismiss; a clear action is needed | Popup-scoped outside dismissal, visible close button, Clear All | Geometry/interaction regressions and subsequent user acceptance |
 | 10 | Alt+Space does nothing | Thread-wide GUI message pump dispatches launcher/EDIT messages | Failing-before/passing-after regression, installed-binary checks, explicit user confirmation |
+| 11 | Clear All sometimes cannot be clicked and feels delayed | Visible popup controls accept clicks during the opening morph; clearing invalidates the unread clock cache | Failing-before/passing-after top/bottom regression; real pointer confirmation pending |
 
 ## 5. Concurrent cards instead of mutual exclusion
 
@@ -345,3 +348,80 @@ explicitly confirmed the real Alt+Space experience works.
 The final fix run recorded 403 passing workspace tests, with the two manual
 launcher review/launch tests normally ignored. That is the 2026-09-30 baseline,
 not a claim of a new full test run during this documentation update.
+
+## 11. Clear All was visible but not clickable
+
+**Reported.** “The clear all button sometime cannot be clicked, and if its
+clicked, it feels a little delay.” This is a click-readiness report, not a
+request to remove active/queued pill banners or Windows notifications.
+
+**Cause.** The right-panel painter discarded every hit region until the
+opening card reached 98% of its target height. Clear All could be fully painted
+before that point, so clicking the visible button did nothing during the morph.
+
+**Fix.** Controls become hit-testable with the visible, sufficiently opaque
+panel content. Their hit regions are clipped to the currently painted card,
+never the hidden remainder. Clearing immediately resets the recent list/unread
+count and invalidates the right-strip cache so the unread clock dot is fresh.
+The scope agreed in report 9 is unchanged.
+
+**Verification.**
+`visible_notification_clear_button_works_before_the_panel_finishes_resizing`
+renders a card with a fully visible footer below the former 98% threshold,
+clicks Clear All, and checks the list, unread count, and stale control removal
+for both top and bottom placement. It failed before the fix and passes after
+it. The follow-up workspace run has 414 passing tests and two ignored manual
+launcher tests. Real pointer confirmation on the redeployed app is still
+pending; these tests do not prove every possible source of input delay gone.
+
+The accompanying idle/caching changes and measured limitations are recorded
+in [the performance follow-up](performance.md).
+
+## 12. The bar disappeared after reopening the laptop lid
+
+**Reported.** The bar disappears after closing/reopening the lid.
+
+**Evidence.** The installed process was absent, the task's last result was
+0xC0000409, and the panic log showed `min > max. min = 0, max = -640` at
+`window.rs:198`, followed by a non-unwinding-callback panic. Windows events
+corroborated the installed executable crash and Modern Standby lid transitions.
+
+**Cause.** Display/DPI callbacks tried to clamp a full-width 2560px bar inside a
+1920px work area before the GUI owner resized/re-anchored it. The inverted clamp
+bounds panicked inside Win32, beyond the GUI loop's catch-unwind boundary.
+
+**Fix.** Safe oversized/transient work-area bounds; defer anchored placement to
+the GUI owner; recover on resume and session display-on with fresh surface,
+backdrop, monitor/DPI, and shell reservation. Three bounded native-timer retries
+are independent of the DXGI clock. Work-area broadcasts do not restart recovery.
+
+**Verification.** The exact crash regression failed before the fix and passes
+after it. Workspace: 440 passing tests, two manual launcher tests ignored;
+release build and all seven doctor checks pass. The updated app (including
+multi-session activity) was backed up and installed through the existing task.
+Targeted synthetic resume/display messages left the same installed process
+alive with a visible full-width bar, native taskbar visible, no new panic bytes,
+and unchanged config. A real physical lid cycle remains user acceptance, not
+something these synthetic checks prove. See [display recovery](display-recovery.md)
+for evidence, deployment checksum, backup, and validation artifacts.
+
+## 13. Notch background / glass composition
+
+**Report:** fix the notch's background alongside the app-navigation milestone.
+
+A narrow center-strip probe confirmed that the installed desktop-copy path
+captures the pill itself: the old claim that plain BitBlt excludes layered
+windows is false on this DWM build. Reusing that picture causes glass feedback.
+The worker now scopes exclusion to its own HWND for the copy, restores the
+original capture policy, and uses flat material if reliable exclusion fails.
+DIB fringes, premultiplied edge coverage, missing samples, foreground-scene
+refresh and pre-resume/theme capture epochs are also repaired.
+
+An isolated 64x32 live marker verified self-exclusion from a background thread,
+real underlying pixels rather than black redaction, restored ordinary capture,
+unchanged foreground and cleanup. Combined navigation/background validation:
+476 tests passed, 0 failed, 2 existing manual launcher tests ignored. This build
+was installed at user request on 2026-10-04, preserving config and native taskbar;
+a user screenshot/full visual review is still needed if
+"background problem" refers to another appearance defect. See
+[notch background](notch-background.md) for the concurrent-recording tradeoff.

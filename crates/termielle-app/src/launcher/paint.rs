@@ -145,7 +145,8 @@ mod tests {
         model.set_apps(super::super::catalog::enumerate().unwrap());
         model.set_query("chrome".into());
         for index in model.results.clone() {
-            model.apps[index].icon = super::super::catalog::read_icon(&model.apps[index].target);
+            model.apps[index].icon = super::super::catalog::read_icon(&model.apps[index].target)
+                .map(std::sync::Arc::new);
         }
         let mut island = termielle_core::IslandConfig::default();
         crate::theme::apply_theme(&mut island, "catppuccin-macchiato");

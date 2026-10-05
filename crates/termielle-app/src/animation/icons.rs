@@ -15,6 +15,57 @@
 use super::FrameBuffer;
 use super::notch::su;
 use super::notch::sx;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+
+const COVERAGE_CACHE_BYTES: usize = 512 * 1024;
+
+struct IconCoverage {
+    paths: &'static [&'static str],
+    side: u32,
+    pixels: Vec<f32>,
+}
+
+#[derive(Default)]
+struct CoverageCache {
+    entries: VecDeque<IconCoverage>,
+    bytes: usize,
+}
+
+impl CoverageCache {
+    fn get(&mut self, icon: Icon, side: u32) -> Option<&[f32]> {
+        let bytes = (side as usize)
+            .checked_mul(side as usize)?
+            .checked_mul(size_of::<f32>())?;
+        if bytes > COVERAGE_CACHE_BYTES {
+            return None;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.paths == icon.0 && entry.side == side)
+        {
+            let entry = self.entries.remove(index).unwrap();
+            self.entries.push_back(entry);
+        } else {
+            while self.bytes + bytes > COVERAGE_CACHE_BYTES {
+                let entry = self.entries.pop_front().unwrap();
+                self.bytes -= entry.pixels.len() * size_of::<f32>();
+            }
+            self.entries.push_back(IconCoverage {
+                paths: icon.0,
+                side,
+                pixels: rasterize_coverage(icon, side),
+            });
+            self.bytes += bytes;
+        }
+        Some(&self.entries.back().unwrap().pixels)
+    }
+}
+
+thread_local! {
+    static COVERAGE_CACHE: RefCell<CoverageCache> = RefCell::new(CoverageCache::default());
+}
 
 /// The viewBox every published Tabler outline icon is drawn in.
 const VIEWBOX: f32 = 24.0;
@@ -425,23 +476,54 @@ pub(crate) fn draw_icon(
     if side == 0 {
         return;
     }
-    let k = side as f32 / VIEWBOX;
-    let half = STROKE * k / 2.0;
+    COVERAGE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(coverage) = cache.get(icon, side as u32) {
+            paint_coverage(frame, dx, dy, side, color, coverage);
+        } else {
+            let coverage = rasterize_coverage(icon, side as u32);
+            paint_coverage(frame, dx, dy, side, color, &coverage);
+        }
+    });
+}
 
-    // Flatten once, in viewBox units, then work in the same space as the
-    // pixels: a pixel centre maps back by `k`.
+fn rasterize_coverage(icon: Icon, side: u32) -> Vec<f32> {
+    let scale_factor = side as f32 / VIEWBOX;
+    let half = STROKE * scale_factor / 2.0;
     let mut segments: Vec<((f32, f32), (f32, f32))> = Vec::new();
-    for d in icon.0 {
-        for line in parse_path(d) {
+    for path in icon.0 {
+        for line in parse_path(path) {
             for pair in line.0.windows(2) {
                 segments.push((pair[0], pair[1]));
             }
         }
     }
-    if segments.is_empty() {
-        return;
+    let mut coverage = vec![0.0; side as usize * side as usize];
+    if !segments.is_empty() {
+        for row in 0..side {
+            let pixel_y = (row as f32 + 0.5) / scale_factor;
+            for column in 0..side {
+                let pixel_x = (column as f32 + 0.5) / scale_factor;
+                let mut best = f32::MAX;
+                for (start, end) in &segments {
+                    best = best.min(dist_to_segment((pixel_x, pixel_y), *start, *end));
+                }
+                coverage[(row * side + column) as usize] =
+                    (half + 0.5 - best.sqrt() * scale_factor).clamp(0.0, 1.0);
+            }
+        }
     }
+    coverage
+}
 
+fn paint_coverage(
+    frame: &mut FrameBuffer,
+    dx: i32,
+    dy: i32,
+    side: i32,
+    color: [u8; 4],
+    coverage: &[f32],
+) {
     let alpha = u32::from(color[3]);
     let tint = [
         (u32::from(color[0]) * alpha / 255) as u8,
@@ -451,17 +533,8 @@ pub(crate) fn draw_icon(
     ];
 
     for row in 0..side {
-        let py = (row as f32 + 0.5) / k;
         for col in 0..side {
-            let px = (col as f32 + 0.5) / k;
-            let mut best = f32::MAX;
-            for (a, b) in &segments {
-                let d = dist_to_segment((px, py), *a, *b);
-                if d < best {
-                    best = d;
-                }
-            }
-            let cov = (half + 0.5 - best.sqrt() * k).clamp(0.0, 1.0);
+            let cov = coverage[(row * side + col) as usize];
             if cov <= 0.0 {
                 continue;
             }
@@ -484,6 +557,62 @@ pub(crate) fn draw_icon(
 mod tests {
     use super::FrameBuffer;
     use super::*;
+
+    #[test]
+    fn coverage_cache_reuses_rasterization_and_separates_device_sizes() {
+        let mut cache = CoverageCache::default();
+        let first = cache.get(CLOCK, 18).unwrap().as_ptr();
+        assert_eq!(cache.get(CLOCK, 18).unwrap().as_ptr(), first);
+        cache.get(CLOCK, 36).unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.bytes, (18 * 18 + 36 * 36) * size_of::<f32>());
+    }
+
+    #[test]
+    fn coverage_cache_is_byte_bounded_and_does_not_retain_oversized_icons() {
+        let mut cache = CoverageCache::default();
+        for side in 1..=128 {
+            cache.get(CLOCK, side).unwrap();
+            assert!(cache.bytes <= COVERAGE_CACHE_BYTES);
+        }
+        let bytes = cache.bytes;
+        assert!(cache.get(CLOCK, 512).is_none());
+        assert_eq!(cache.bytes, bytes);
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .iter()
+                .map(|entry| entry.pixels.len() * size_of::<f32>())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn cached_coverage_preserves_pixels_across_colors_and_dpi() {
+        for scale in [1.0, 1.5, 2.0] {
+            for color in [[255, 255, 255, 255], [80, 140, 220, 120]] {
+                let mut cached = frame();
+                cached.scale = scale;
+                cached.pixels_pbgra.fill(16);
+                let mut expected = cached.clone();
+                draw_icon(&mut cached, ADJUSTMENTS, 2, 2, 18, color);
+                let side = su(&expected, 18);
+                let coverage = rasterize_coverage(ADJUSTMENTS, side);
+                let device_x = sx(&expected, 2);
+                let device_y = sx(&expected, 2);
+                paint_coverage(
+                    &mut expected,
+                    device_x,
+                    device_y,
+                    side as i32,
+                    color,
+                    &coverage,
+                );
+                assert_eq!(cached, expected);
+            }
+        }
+    }
 
     fn frame() -> FrameBuffer {
         FrameBuffer {

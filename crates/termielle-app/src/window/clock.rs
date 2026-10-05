@@ -17,8 +17,13 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 /// from overshooting into the next frame before it starts.
 const TIMER_PERIOD_MS: u32 = 1;
 
+enum Command {
+    Arm(Option<u64>),
+    InvalidateOutput,
+}
+
 pub struct AnimationClock {
-    sender: Sender<Option<u64>>,
+    sender: Sender<Command>,
 }
 
 fn find_output(factory: &IDXGIFactory1, monitor: usize) -> Option<IDXGIOutput> {
@@ -40,7 +45,7 @@ fn find_output(factory: &IDXGIFactory1, monitor: usize) -> Option<IDXGIOutput> {
 
 impl AnimationClock {
     pub fn spawn(wake: WakeHandle) -> Self {
-        let (sender, receiver) = mpsc::channel::<Option<u64>>();
+        let (sender, receiver) = mpsc::channel::<Command>();
         let hwnd = wake.hwnd.0 as usize;
         std::thread::spawn(move || {
             unsafe { timeBeginPeriod(TIMER_PERIOD_MS) };
@@ -60,8 +65,15 @@ impl AnimationClock {
                     },
                 };
                 match command {
-                    Ok(value) => {
+                    Ok(Command::Arm(value)) => {
                         deadline = value;
+                        continue;
+                    }
+                    Ok(Command::InvalidateOutput) => {
+                        factory = None;
+                        output = None;
+                        monitor = 0;
+                        retry = Instant::now();
                         continue;
                     }
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -90,8 +102,14 @@ impl AnimationClock {
                     // Remote/secure desktops may expose no DXGI output. Remain
                     // interruptible and avoid a hot retry loop in that case.
                     match receiver.recv_timeout(Duration::from_millis(16)) {
-                        Ok(value) => {
+                        Ok(Command::Arm(value)) => {
                             deadline = value;
+                            continue;
+                        }
+                        Ok(Command::InvalidateOutput) => {
+                            factory = None;
+                            monitor = 0;
+                            retry = Instant::now();
                             continue;
                         }
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -111,6 +129,13 @@ impl AnimationClock {
 
     /// A new command interrupts an older wait, including an idle wait.
     pub fn arm(&self, deadline: Option<u64>) {
-        let _ = self.sender.send(deadline);
+        let _ = self.sender.send(Command::Arm(deadline));
+    }
+
+    /// Re-resolve the output after display topology/resume, even when Windows
+    /// reused the HMONITOR and DXGI still reports the old factory as current.
+    /// GUI recovery uses its own Win32 timer and never waits on this worker.
+    pub fn invalidate_output(&self) {
+        let _ = self.sender.send(Command::InvalidateOutput);
     }
 }

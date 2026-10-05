@@ -1,4 +1,6 @@
+mod app_pin;
 mod config;
+pub use app_pin::{AppLaunchTarget, MAX_PINNED_APPS, PinnedApp};
 mod event_log;
 mod island;
 mod protocol;
@@ -17,4 +19,4 @@ pub use protocol::{
     EventKind, EventMessage, MAX_EVENT_BYTES, MAX_SESSION_ID_BYTES, MAX_SOURCE_BYTES,
     PROTOCOL_VERSION, ProtocolError, Source, decode_event_line, encode_event_line,
 };
-pub use reducer::{ApplyOutcome, SessionReducer, VisualState};
+pub use reducer::{ApplyOutcome, SessionReducer, SessionSummary, VisualState};

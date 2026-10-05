@@ -1,15 +1,16 @@
 //! Live frosted-glass backdrop: captures the wallpaper (and whatever is
 //! behind the pill) and box-blurs it underneath the theme tint.
 //!
-//! The capture deliberately uses a plain `BitBlt` **without** `CAPTUREBLT`,
-//! so layered windows — including our own pill — are excluded and the glass
-//! can never feed back into itself. Anything outside the virtual screen is
-//! filled with the theme tint first, so the blur has defined edges.
+//! Modern DWM can include layered windows even without CAPTUREBLT. Production
+//! captures temporarily exclude our own HWND, then restore its original
+//! capture policy. If exclusion is unavailable, use flat translucent glass.
+//! Anything outside the virtual screen is filled before the copy.
 //!
 //! Cost is trivial for pill sizes (720x56): a separable box blur at radius
 //! 24 is ~3.4M ops on the worker thread. The window caches the capture and
 //! only re-captures when the geometry moves or the cache ages out.
 
+mod exclusion;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
@@ -26,6 +27,9 @@ pub const BACKDROP_CACHE_MS: u64 = 1000;
 /// Captured backdrop in straight (non-premultiplied) opaque BGRA, row-major.
 #[derive(Clone, Debug, Default)]
 pub struct Backdrop {
+    /// Production capture ownership/epoch. Unstamped synthetic images are
+    /// supported by render-review examples, never produced by the worker.
+    pub capture_token: Option<(isize, u64)>,
     pub origin: (i32, i32),
     pub width: u32,
     pub height: u32,
@@ -71,6 +75,44 @@ pub fn cover_rect(a: (i32, i32, u32, u32), b: (i32, i32, u32, u32)) -> (i32, i32
     )
 }
 
+/// Production path: never capture our own visible material into its backdrop.
+/// Exclusion lasts only for the desktop copy (not the blur or app lifetime).
+pub fn capture_backdrop_excluding(
+    hwnd: isize,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    fill: [u8; 4],
+) -> Option<Backdrop> {
+    if w == 0 || h == 0 || w > 4096 || h > 4096 {
+        return None;
+    }
+    let _exclusion = exclusion::Exclusion::begin(hwnd)?;
+    capture_backdrop(x, y, w, h, fill)
+}
+
+/// Source-window geometry re-arms the short capture burst without a permanent
+/// full-rate desktop poll. No titles or content are read here.
+pub(crate) fn foreground_scene(exclude: isize) -> Option<(isize, i32, i32, i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect};
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() || hwnd.0 as isize == exclude {
+        return None;
+    }
+    let mut rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
+    Some((
+        hwnd.0 as isize,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+    ))
+}
+
+/// Raw desktop-copy primitive, also used by diagnostics. It does NOT promise
+/// to exclude layered windows; use `capture_backdrop_excluding` for glass.
 /// Captures the virtual-screen region `(x, y, w, h)` in physical pixels.
 /// Out-of-screen areas are filled with `fill` (straight BGRA). Returns `None`
 /// when no device context is available (locked/secure desktop) so the caller
@@ -79,6 +121,7 @@ pub fn capture_backdrop(x: i32, y: i32, w: u32, h: u32, fill: [u8; 4]) -> Option
     if w == 0 || h == 0 || w > 4096 || h > 4096 {
         return None;
     }
+    let _dpi = exclusion::PhysicalDpi::enter();
     let screen = unsafe { GetDC(Some(HWND::default())) };
     if screen.is_invalid() {
         return None;
@@ -116,7 +159,15 @@ pub fn capture_backdrop(x: i32, y: i32, w: u32, h: u32, fill: [u8; 4]) -> Option
         px.copy_from_slice(&fill);
     }
 
-    // Intersect with the virtual screen; BitBlt cannot source negative coords.
+    // Initialize the actual DIB too: a partial BitBlt leaves off-screen areas
+    // untouched. Copying an uninitialized DIB would turn those fringes black.
+    if !bits.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
+        }
+    }
+    let mut copied = false;
+    // Intersect with the virtual screen, including negative-origin monitors.
     let vx = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
     let vy = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
     let vw = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
@@ -143,6 +194,7 @@ pub fn capture_backdrop(x: i32, y: i32, w: u32, h: u32, fill: [u8; 4]) -> Option
             // SAFETY: bits points at w*h*4 bytes of live DIB memory.
             let src = unsafe { std::slice::from_raw_parts(bits as *const u8, pixels.len()) };
             pixels.copy_from_slice(src);
+            copied = true;
         }
     }
     // GDI leaves alpha at 0; the backdrop is conceptually opaque.
@@ -156,7 +208,11 @@ pub fn capture_backdrop(x: i32, y: i32, w: u32, h: u32, fill: [u8; 4]) -> Option
         let _ = DeleteDC(memory);
         let _ = ReleaseDC(None, screen);
     }
+    if ix1 > ix0 && iy1 > iy0 && !copied {
+        return None;
+    }
     Some(Backdrop {
+        capture_token: None,
         origin: (x, y),
         width: w,
         height: h,
@@ -284,12 +340,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn off_screen_and_partial_capture_fringe_is_initialized_to_tint() {
+        let fill = [11, 22, 33, 255];
+        if let Some(bg) = capture_backdrop(i32::MAX - 16, i32::MAX - 16, 8, 1, fill) {
+            assert!(bg.pixels.chunks_exact(4).all(|p| p == fill));
+        }
+        let _dpi = exclusion::PhysicalDpi::enter();
+        let right =
+            unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        if let Some(bg) = capture_backdrop(right - 1, top, 3, 1, fill) {
+            assert_eq!(&bg.pixels[4..], &fill.repeat(2));
+        }
+    }
+    #[test]
+    fn desktop_copy_restores_its_callers_dpi_context() {
+        use windows::Win32::UI::HiDpi::*;
+        let previous = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE) };
+        let before = unsafe { GetThreadDpiAwarenessContext() };
+        let _ = capture_backdrop(i32::MAX - 16, i32::MAX - 16, 8, 1, [0; 4]);
+        let after = unsafe { GetThreadDpiAwarenessContext() };
+        let restored = unsafe { AreDpiAwarenessContextsEqual(before, after) }.as_bool();
+        if !previous.0.is_null() {
+            let _ = unsafe { SetThreadDpiAwarenessContext(previous) };
+        }
+        assert!(restored);
+    }
+
+    #[test]
     fn cached_capture_stays_anchored_when_window_resizes_or_moves() {
         let bg = Backdrop {
             origin: (-10, 20),
             width: 2,
             height: 2,
             pixels: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+            capture_token: None,
         };
         assert_eq!(bg.sample(-9, 21), Some(&[10, 11, 12, 255][..]));
         assert_eq!(bg.sample(-10, 20), Some(&[1, 2, 3, 255][..]));
@@ -304,6 +389,7 @@ mod tests {
             width: 16,
             height: 16,
             pixels: vec![77u8; 16 * 16 * 4],
+            capture_token: None,
         };
         box_blur(&mut bg, 6);
         assert!(bg.pixels.iter().all(|&b| b == 77));
@@ -316,6 +402,7 @@ mod tests {
             width: 8,
             height: 8,
             pixels: (0..8 * 8 * 4).map(|i| (i % 251) as u8).collect(),
+            capture_token: None,
         };
         let before = bg.pixels.clone();
         box_blur(&mut bg, 0);
@@ -334,6 +421,7 @@ mod tests {
             width: w,
             height: h,
             pixels: vec![0u8; (w * h * 4) as usize],
+            capture_token: None,
         };
         for y in 0..h {
             for x in 0..w {
@@ -378,6 +466,7 @@ mod tests {
             width: w,
             height: h,
             pixels,
+            capture_token: None,
         };
         box_blur(&mut bg, 4);
         let edge = (((h / 2) * w + w / 2) * 4) as usize;
@@ -398,6 +487,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![0, 120, 212, 255, 128, 128, 128, 255],
+            capture_token: None,
         };
         desaturate(&mut bg, 0.5);
         let spread_before = 212u32.abs_diff(0);
@@ -417,6 +507,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![10, 200, 30, 255],
+            capture_token: None,
         };
         desaturate(&mut flat, 0.0);
         assert_eq!(flat.pixels, vec![10, 200, 30, 255]);

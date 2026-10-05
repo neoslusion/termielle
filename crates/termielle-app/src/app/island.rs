@@ -29,6 +29,7 @@ impl Controller {
         height: u32,
         now_ms: u64,
     ) -> FrameBuffer {
+        self.activity.deadline = None;
         if self.island.is_bar() {
             return self.render_bar(state, width, height, now_ms);
         }
@@ -80,6 +81,20 @@ impl Controller {
                 (255.0 * crate::animation::notch::smoothstep(0.35, 0.9, fit)).round() as u8;
             dy = ((1.0 - fit).max(0.0) * 4.0).round() as i32;
         }
+        self.icon_hits.retain_mut(|hit| {
+            if !super::activity::SessionActivity::is_hit(hit.0) {
+                return true;
+            }
+            hit.1 += dx;
+            hit.2 += dy;
+            let right = (hit.1 + hit.3 as i32).min(width as i32);
+            let bottom = (hit.2 + hit.4 as i32).min(height as i32);
+            hit.1 = hit.1.max(0);
+            hit.2 = hit.2.max(0);
+            hit.3 = right.saturating_sub(hit.1).max(0) as u32;
+            hit.4 = bottom.saturating_sub(hit.2).max(0) as u32;
+            motion_alpha >= 128 && hit.3 > 0 && hit.4 > 0
+        });
         let swap = self.content_transition.as_ref().map(|transition| {
             let elapsed = now_ms.saturating_sub(transition.started_ms);
             let linear = (elapsed as f32 / transition.duration_ms.max(1) as f32).clamp(0.0, 1.0);
@@ -154,7 +169,7 @@ impl Controller {
         if !self.alerts.is_empty() {
             return Presentation::Expanded;
         }
-        if self.manually_expanded || self.panel_open {
+        if self.manually_expanded || self.panel_open || self.is_navigation_open() {
             // Waybar mode is a persistent status surface: an explicit click on
             // the Termielle module opens its focused popup. Control Center is a
             // separate surface that expands the window on its own account.
@@ -204,7 +219,10 @@ impl Controller {
     }
 
     pub(crate) fn hover_content_available(&self) -> bool {
-        self.state != VisualState::Idle || self.media_available() || !self.alerts.is_empty()
+        self.activity_available()
+            || self.state != VisualState::Idle
+            || self.media_available()
+            || !self.alerts.is_empty()
     }
 
     /// The largest size this surface can reach from here, in logical pixels.
@@ -215,7 +233,17 @@ impl Controller {
         // Reserve the tallest combined media/tasks dashboard even while the
         // surface is mid-morph.
         w = w.max(self.island.expanded_width.max(320));
-        h = h.max(210u32).max(self.island.height);
+        let activity_height = super::activity::MAX_CARD_HEIGHT
+            + if self.island.is_bar() {
+                self.island.bar.height + BAR_POPUP_GAP
+            } else {
+                0
+            };
+        let navigation_height = 328 + self.island.bar.height + BAR_POPUP_GAP;
+        h = h
+            .max(activity_height)
+            .max(navigation_height)
+            .max(self.island.height);
         (w, h)
     }
 
@@ -255,6 +283,12 @@ impl Controller {
         match self.presentation() {
             crate::animation::notch::Presentation::Expanded => {
                 let exp_w = self.island.expanded_width;
+                if self.activity_available() && !self.panel_open {
+                    return (
+                        exp_w,
+                        self.activity_height().max(154).max(self.island.height),
+                    );
+                }
                 let tasks_active = self.island.has_widget("tasks")
                     && self.island.show_tasks
                     && !self.tasks.is_empty();
@@ -638,10 +672,12 @@ impl Controller {
             .bar_metrics_cache
             .as_ref()
             .is_some_and(|previous| previous.volume != snapshot.volume);
-        let mut damage = metrics_damage(self.bar_metrics_cache.as_ref(), &snapshot);
-        if damage == BarDamage::NONE {
-            return false;
-        }
+        let mut damage = metrics_damage(
+            self.bar_metrics_cache.as_ref(),
+            &snapshot,
+            &self.island.bar,
+            self.is_panel_open(),
+        );
         self.bar_metrics_cache = Some(snapshot);
         if !self.island.is_bar() {
             return false;
@@ -649,6 +685,9 @@ impl Controller {
         if volume_changed && self.bar_module("center", "termielle") {
             self.volume_feedback_deadline = Some(now_ms.saturating_add(1_500));
             damage = damage.union(BarDamage::CENTER);
+        }
+        if damage == BarDamage::NONE {
+            return false;
         }
         if damage.contains(BarDamage::CENTER) {
             self.bar_left_cache = None;
@@ -670,6 +709,14 @@ impl Controller {
             .map(|&(id, ..)| id);
 
         if let Some(id) = hit_id {
+            if super::navigation::Navigation::is_rail_hit(id)
+                || super::navigation::Navigation::is_popup_hit(id)
+            {
+                return self.handle_navigation_hit(id, now_ms);
+            }
+            if super::activity::SessionActivity::is_hit(id) {
+                return self.handle_activity_hit(id, now_ms);
+            }
             match id {
                 HIT_MEDIA_PLAY_PAUSE => return ClickOutcome::MediaToggle,
                 HIT_ALERT_DISMISS => {
@@ -710,6 +757,7 @@ impl Controller {
                 crate::app::types::HIT_NOTIFICATIONS_CLEAR => {
                     self.recent_notifications.clear();
                     self.unread_notifications = 0;
+                    self.bar_right_cache = None;
                     self.morph_to_target(now_ms);
                     return ClickOutcome::NotificationsCleared;
                 }
@@ -883,6 +931,9 @@ impl Controller {
     pub fn collapse_if_expanded(&mut self, now_ms: u64) -> bool {
         if !self.island.is_enabled() {
             return false;
+        }
+        if self.is_navigation_open() {
+            return self.close_navigation(now_ms);
         }
         if self.panel_open {
             return self.close_panel(now_ms);

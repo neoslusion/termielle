@@ -271,6 +271,7 @@ fn click_extends_to_tall_card_and_second_click_collapses() {
 fn set_task_update_repaints_only_when_visible() {
     use termielle_app::tasks::{MediaInfo, WorkerUpdate};
     let update = || WorkerUpdate {
+        windows: Vec::new(),
         media: Some(MediaInfo {
             title: "demo".into(),
             artist: "artist".into(),
@@ -334,6 +335,7 @@ fn task_switcher_honors_max_thumbnails() {
             })
             .collect(),
         backdrop: None,
+        ..Default::default()
     });
     c.toggle_expand(1000);
 
@@ -411,6 +413,33 @@ fn static_face_never_advances() {
         first,
         "static face must not advance"
     );
+}
+
+#[test]
+fn idle_bar_face_stops_repainting_after_its_first_loop() {
+    let directory = tempfile::tempdir().unwrap();
+    write_gif(directory.path(), "standby.gif", &[(2, 0), (2, 1)]);
+    let config = IslandConfig {
+        layout: IslandLayout::Bar,
+        face_animated: true,
+        forward_toasts: false,
+        ..IslandConfig::default()
+    };
+    let mut controller = Controller::new_with_island(
+        5_000,
+        60_000,
+        AssetCatalog::new(vec![directory.path().to_path_buf()]),
+        false,
+        None,
+        config,
+    );
+    assert!(controller.on_timer(20).present_frame);
+    assert!(controller.on_timer(40).present_frame);
+    assert!(!controller.on_timer(60).present_frame);
+    assert_eq!(controller.next_deadline_ms(), Some(2_000));
+    let settled = controller.current_frame().clone();
+    assert!(!controller.on_timer(1_000).present_frame);
+    assert_eq!(controller.current_frame(), &settled);
 }
 
 #[test]
@@ -702,6 +731,7 @@ fn island_compact_media_sizing() {
         }),
         tasks: Vec::new(),
         backdrop: None,
+        ..Default::default()
     });
     c.on_timer(10050);
     c.on_timer(10200);
@@ -781,6 +811,7 @@ fn split_island_two_blobs_when_agent_and_media_both_live() {
         }),
         tasks: Vec::new(),
         backdrop: None,
+        ..Default::default()
     });
     let _ = c.on_timer(10200);
     let _ = c.on_timer(10400);
@@ -826,6 +857,7 @@ fn paused_media_stays_visible_and_can_resume() {
         }),
         tasks: Vec::new(),
         backdrop: None,
+        ..Default::default()
     });
     let _ = c.on_timer(10400);
     c.set_task_update(WorkerUpdate {
@@ -838,6 +870,7 @@ fn paused_media_stays_visible_and_can_resume() {
         }),
         tasks: Vec::new(),
         backdrop: None,
+        ..Default::default()
     });
     for t in (10800..11200).step_by(16) {
         let _ = c.on_timer(t);
@@ -877,6 +910,7 @@ fn media_arriving_during_compact_morph_retargets_the_active_spring() {
         }),
         tasks: Vec::new(),
         backdrop: None,
+        ..Default::default()
     }));
 
     // Still inside the one-second thinking hold: only the worker-driven
@@ -1112,7 +1146,7 @@ fn manual_expansion_survives_mid_turn_flips() {
 }
 
 #[test]
-fn ending_the_turn_retires_the_open_card() {
+fn ending_the_session_retires_the_open_card_but_completion_keeps_it_available() {
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island_140_320());
     c.handle_event(event("s1", EventKind::PromptSubmitted, 10000), 10000);
     c.set_hover(true, 10000);
@@ -1127,10 +1161,13 @@ fn ending_the_turn_retires_the_open_card() {
     // The turn completes: the card stays open through Ready ...
     c.handle_event(event("s1", EventKind::TurnCompleted, 10400), 10400);
     c.on_timer(10600);
-    // ... and retires once the ready hold expires into Idle. Leaving the
-    // hover lets it fall all the way back to the hidden sensor.
+    // ... and remains available as a finished session after Ready expires.
     c.on_timer(15600);
     assert_eq!(c.visible_state(), termielle_core::VisualState::Idle);
+    assert!(c.is_manually_expanded());
+    assert_eq!(c.current_frame().height, 154);
+    // Explicit session end removes it and retires the card.
+    c.handle_event(event("s1", EventKind::SessionEnded, 15600), 15600);
     c.set_hover(false, 15600);
     c.on_timer(15760);
     c.on_timer(16000);
@@ -1756,10 +1793,10 @@ fn bar_module_list_gates_volume_hit() {
     assert!(c.is_notification_center_open());
 }
 
-/// Replacement-mode bar: the shell controls each resolve to their own Windows
-/// surface, and the controls are absent when the native taskbar is kept.
+/// Replacement mode always has an app-launcher entry and navigation menu,
+/// even when the optional apps module wasn't listed.
 #[test]
-fn shell_controls_drive_windows_surfaces_only_in_replacement_mode() {
+fn replacement_mode_has_one_launcher_and_keeps_the_center_independent() {
     use termielle_app::app::ClickOutcome;
     use termielle_app::bar::shell::ShellAction;
 
@@ -1774,18 +1811,16 @@ fn shell_controls_drive_windows_surfaces_only_in_replacement_mode() {
     let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     c.set_bar_width(1920);
 
-    // Left zone: 12 px inset, label-sized controls, 4 px gaps. The hit rect
-    // is the painted button, so the center of each control is its own action.
-    let mut x = 12i32;
-    for (index, action) in ShellAction::ALL.iter().enumerate() {
-        let width = action.control_width() as i32;
-        assert_eq!(
-            c.handle_click(x + width / 2, 18, 1000 + index as u64),
-            ClickOutcome::Shell(*action),
-            "control {action:?} must own its own hit"
-        );
-        x += width + 4;
-    }
+    assert_eq!(
+        c.handle_click(44, 18, 1000),
+        ClickOutcome::Shell(ShellAction::Search)
+    );
+    assert_eq!(
+        c.handle_click(98, 18, 1010),
+        ClickOutcome::NavigationChanged
+    );
+    assert!(c.is_navigation_open());
+    c.close_navigation(1050);
 
     // The center pill and the right zone are untouched by replacement mode.
     assert_eq!(c.handle_click(960, 18, 1100), ClickOutcome::Expanded);
@@ -1811,63 +1846,62 @@ fn shell_controls_drive_windows_surfaces_only_in_replacement_mode() {
     );
 }
 
-/// Left-zone content is laid out up to the center pill, so a narrow bar drops
-/// the overflow instead of painting it under the pill and leaving a live hit
-/// target on an invisible control.
+/// Narrow layouts reserve overflow instead of silently dropping open apps.
 #[test]
-fn left_zone_drops_overflow_instead_of_crossing_the_center_pill() {
+fn left_navigation_stays_clear_of_the_center_and_keeps_overflow_reachable() {
     use termielle_app::app::ClickOutcome;
-    use termielle_app::bar::metrics::Snapshot;
-    use termielle_app::bar::shell::ShellAction;
-    use termielle_app::bar::workspaces::WorkspaceSnapshot;
-
+    use termielle_app::tasks::{WindowInfo, WorkerUpdate};
     let mut island = IslandConfig {
         layout: IslandLayout::Bar,
         ..Default::default()
     };
-    island.bar.height = 36;
     island.bar.replace_taskbar = true;
-    island.bar.modules_left = vec!["workspaces".to_string()];
-    island.bar.modules_right = vec!["clock".to_string()];
-    let metrics = Snapshot {
-        workspaces: WorkspaceSnapshot {
-            total: 6,
-            active: 1,
-        },
-        window_title: "Editor — a fairly long window title".into(),
-        ..Default::default()
-    };
-
-    // The first workspace button follows the shell controls and their gap,
-    // exactly where the painter puts it.
-    let first_workspace_x = 12
-        + ShellAction::ALL
+    island.bar.modules_right = vec!["clock".into()];
+    for width in [640, 1920] {
+        let mut c = Controller::new_with_island(5000, 60000, catalog(), true, None, island.clone());
+        c.set_bar_width(width);
+        c.set_task_update_at(
+            WorkerUpdate {
+                windows: (1..=18)
+                    .map(|i| WindowInfo {
+                        hwnd: i,
+                        process_id: i as u32,
+                        title: format!("Window {i}"),
+                        minimized: false,
+                        application: Some(termielle_core::PinnedApp {
+                            name: format!("App {i:02}"),
+                            target: termielle_core::AppLaunchTarget::Executable(format!(
+                                "C:\\Apps\\App{i:02}.exe"
+                            )),
+                        }),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            1000,
+        );
+        let rail = c
+            .click_regions()
             .iter()
-            .map(|action| action.control_width() as i32 + 4)
-            .sum::<i32>()
-        + 6
-        + 14;
-
-    // Room to spare: the switcher follows the shell controls.
-    let mut wide = Controller::new_with_island(5000, 60000, catalog(), false, None, island.clone());
-    wide.set_bar_width(1920);
-    wide.set_bar_metrics(metrics.clone(), 1000);
-    assert_eq!(
-        wide.handle_click(first_workspace_x, 18, 1100),
-        ClickOutcome::WorkspaceSwitch(1)
-    );
-
-    // Narrow: the center pill moves left, so the switcher is dropped instead
-    // of painted underneath it — no pixel, and no live hit target either.
-    let mut narrow = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
-    narrow.set_bar_width(640);
-    narrow.set_bar_metrics(metrics, 1000);
-    // The same point is now inside the center pill's own space: the pill
-    // answers instead of a workspace switch that was dropped.
-    assert_eq!(
-        narrow.handle_click(first_workspace_x, 18, 1200),
-        ClickOutcome::Expanded
-    );
+            .copied()
+            .filter(|h| h.0 <= -1000 && h.0 > -2000)
+            .collect::<Vec<_>>();
+        assert!(rail.len() >= 2);
+        assert!(
+            rail.iter()
+                .all(|h| h.1 + h.3 as i32 <= width as i32 / 2 - 98)
+        );
+        let (_, x, y, w, h) = *rail.last().unwrap();
+        assert_eq!(
+            c.handle_click(x + w as i32 / 2, y + h as i32 / 2, 1100),
+            ClickOutcome::NavigationChanged
+        );
+        assert!(c.is_navigation_open());
+        assert_eq!(
+            c.handle_click(width as i32 / 2, 18, 1200),
+            ClickOutcome::Expanded
+        );
+    }
 }
 
 /// The strip's Control Center entry toggles its own panel while the pill

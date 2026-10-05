@@ -113,6 +113,8 @@ pub(crate) fn module_enabled(config: &BarConfig, zone: BarZone, id: &str) -> boo
 pub(crate) fn metrics_damage(
     previous: Option<&BarMetricsCache>,
     next: &BarMetricsCache,
+    config: &BarConfig,
+    controls_open: bool,
 ) -> BarDamage {
     let Some(previous) = previous else {
         return BarDamage::FULL;
@@ -125,12 +127,14 @@ pub(crate) fn metrics_damage(
     {
         damage = damage.union(BarDamage::LEFT);
     }
-    if previous.time_str != next.time_str
-        || previous.battery != next.battery
-        || previous.volume != next.volume
-        || previous.connectivity != next.connectivity
-        || previous.memory_pct != next.memory_pct
-        || previous.cpu_pct != next.cpu_pct
+    let visible = |name| module_enabled(config, BarZone::Right, name);
+    if (visible("clock") && previous.time_str != next.time_str)
+        || (visible("battery") && previous.battery != next.battery)
+        || ((visible("volume") || controls_open) && previous.volume != next.volume)
+        || (visible("network") && previous.connectivity.network != next.connectivity.network)
+        || (controls_open && previous.connectivity != next.connectivity)
+        || ((visible("memory") || controls_open) && previous.memory_pct != next.memory_pct)
+        || ((visible("cpu") || controls_open) && previous.cpu_pct != next.cpu_pct)
     {
         damage = damage.union(BarDamage::RIGHT);
     }
@@ -142,6 +146,10 @@ mod tests {
     use super::*;
     use crate::bar::metrics::Snapshot;
     use termielle_core::BarConfig;
+
+    fn damage(previous: Option<&BarMetricsCache>, next: &BarMetricsCache) -> BarDamage {
+        metrics_damage(previous, next, &BarConfig::default(), false)
+    }
 
     #[test]
     fn descriptors_own_the_expected_zones() {
@@ -157,12 +165,12 @@ mod tests {
         let empty = Snapshot::empty();
         let mut volume = empty.clone();
         volume.volume.level = 42;
-        assert_eq!(metrics_damage(Some(&empty), &volume), BarDamage::RIGHT);
+        assert_eq!(damage(Some(&empty), &volume), BarDamage::RIGHT);
 
         let mut title = empty.clone();
         title.window_title = "editor".into();
-        assert_eq!(metrics_damage(Some(&empty), &title), BarDamage::LEFT);
-        assert_eq!(metrics_damage(Some(&empty), &empty), BarDamage::NONE);
+        assert_eq!(damage(Some(&empty), &title), BarDamage::LEFT);
+        assert_eq!(damage(Some(&empty), &empty), BarDamage::NONE);
 
         let mut icon = empty.clone();
         icon.foreground_icon = Some(crate::tasks::TaskIcon {
@@ -172,7 +180,7 @@ mod tests {
             height: 1,
             pixels_pbgra: vec![20, 80, 180, 255],
         });
-        assert_eq!(metrics_damage(Some(&empty), &icon), BarDamage::LEFT);
+        assert_eq!(damage(Some(&empty), &icon), BarDamage::LEFT);
     }
 
     #[test]
@@ -181,7 +189,7 @@ mod tests {
         let mut both = empty.clone();
         both.window_title = "editor".into();
         both.time_str = "12:01".into();
-        let damage = metrics_damage(Some(&empty), &both);
+        let damage = damage(Some(&empty), &both);
         assert!(damage.contains(BarDamage::LEFT));
         assert!(damage.contains(BarDamage::RIGHT));
         assert!(!damage.contains(BarDamage::CENTER));

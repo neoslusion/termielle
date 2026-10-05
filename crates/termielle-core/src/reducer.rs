@@ -79,6 +79,17 @@ pub enum ApplyOutcome {
     Rejected,
 }
 
+/// Content-free snapshot of one tracked session, ordered by attention priority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionSummary {
+    pub source: Source,
+    pub session_id: String,
+    pub state: VisualState,
+    pub state_since_ms: u64,
+    pub last_activity_ms: u64,
+    pub last_event: EventKind,
+}
+
 type SessionKey = (Source, String);
 
 /// A pending automatic transition for a single session.
@@ -91,6 +102,7 @@ struct Deadline {
 #[derive(Debug)]
 struct Session {
     state: VisualState,
+    state_since_ms: u64,
     /// Kind of the last accepted event, paired with `last_activity_ms` to spot
     /// duplicate deliveries.
     last_kind: EventKind,
@@ -129,6 +141,7 @@ pub struct SessionReducer {
     sessions: HashMap<SessionKey, Session>,
     ready_hold_ms: u64,
     busy_stall_ms: u64,
+    revision: u64,
 }
 
 impl SessionReducer {
@@ -141,6 +154,7 @@ impl SessionReducer {
             sessions: HashMap::new(),
             ready_hold_ms,
             busy_stall_ms,
+            revision: 0,
         }
     }
 
@@ -165,10 +179,16 @@ impl SessionReducer {
                 self.sessions.remove(&key);
             }
             Some((state, deadline)) => {
+                let state_since_ms = self
+                    .sessions
+                    .get(&key)
+                    .filter(|session| session.state == state)
+                    .map_or(timestamp_ms, |session| session.state_since_ms);
                 self.sessions.insert(
                     key,
                     Session {
                         state,
+                        state_since_ms,
                         last_kind: kind,
                         last_activity_ms: timestamp_ms,
                         deadline,
@@ -178,6 +198,7 @@ impl SessionReducer {
             }
         }
 
+        self.revision = self.revision.wrapping_add(1);
         if self.observable() == before {
             ApplyOutcome::Unchanged
         } else {
@@ -210,13 +231,17 @@ impl SessionReducer {
     pub fn advance(&mut self, now_ms: u64) -> bool {
         let before = self.visible_state();
 
+        let count = self.sessions.len();
         self.sessions
             .retain(|_, session| now_ms < session.stale_at_ms());
+        let mut changed = count != self.sessions.len();
 
         for session in self.sessions.values_mut() {
             if let Some(deadline) = session.deadline {
                 if now_ms >= deadline.at_ms {
+                    changed = true;
                     session.state = deadline.next;
+                    session.state_since_ms = deadline.at_ms;
                     session.deadline = None;
                 }
             }
@@ -229,12 +254,17 @@ impl SessionReducer {
             if matches!(session.state, VisualState::Thinking | VisualState::Working)
                 && session.busy_stall_at_ms.is_some_and(|at| now_ms >= at)
             {
+                changed = true;
                 session.state = VisualState::Idle;
+                session.state_since_ms = session.busy_stall_at_ms.unwrap_or(now_ms);
                 session.deadline = None;
                 session.busy_stall_at_ms = None;
             }
         }
 
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
         self.visible_state() != before
     }
 
@@ -266,6 +296,37 @@ impl SessionReducer {
                     .then_with(|| stable_cmp(right_key, left_key))
             })
             .map(|(key, session)| (key.0.clone(), key.1.clone(), session.state))
+    }
+
+    /// Changes whenever any session changes, including a non-primary session.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// All tracked sessions, highest attention priority first, then newest
+    /// activity, then source/id for deterministic ties. This does not advance
+    /// time; callers use `advance` before requesting a snapshot.
+    pub fn session_summaries(&self) -> Vec<SessionSummary> {
+        let mut entries: Vec<_> = self.sessions.iter().collect();
+        entries.sort_by(|(left_key, left), (right_key, right)| {
+            right
+                .state
+                .priority()
+                .cmp(&left.state.priority())
+                .then(right.last_activity_ms.cmp(&left.last_activity_ms))
+                .then_with(|| stable_cmp(left_key, right_key))
+        });
+        entries
+            .into_iter()
+            .map(|(key, session)| SessionSummary {
+                source: key.0.clone(),
+                session_id: key.1.clone(),
+                state: session.state,
+                state_since_ms: session.state_since_ms,
+                last_activity_ms: session.last_activity_ms,
+                last_event: session.last_kind,
+            })
+            .collect()
     }
 
     /// The earliest moment [`SessionReducer::advance`] can change anything.

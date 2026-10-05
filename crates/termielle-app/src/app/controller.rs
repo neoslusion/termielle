@@ -39,6 +39,7 @@ use termielle_core::{
 /// controller, because [`GifAnimation`] is deliberately not `Send`.
 pub struct Controller {
     pub(crate) reducer: SessionReducer,
+    pub(crate) activity: super::activity::SessionActivity,
     pub(crate) assets: AssetCatalog,
     pub(crate) reduced_motion: bool,
     pub(crate) state: VisualState,
@@ -120,6 +121,8 @@ pub struct Controller {
     pub(crate) media: Option<MediaInfo>,
     /// Open window task icons from the background worker.
     pub(crate) tasks: Vec<crate::tasks::TaskIcon>,
+    pub(crate) windows: Vec<crate::tasks::WindowInfo>,
+    pub(crate) navigation: super::navigation::Navigation,
     /// Queued notification alert banners; the front one shows.
     pub(crate) alerts: VecDeque<AlertBanner>,
     pub(crate) recent_notifications: VecDeque<RecentNotification>,
@@ -198,6 +201,7 @@ impl Controller {
         let bar_deadline = island.is_bar().then_some(BAR_REFRESH_MS);
         let mut controller = Self {
             reducer: SessionReducer::new(ready_hold_ms, busy_stall_ms),
+            activity: super::activity::SessionActivity::default(),
             assets,
             reduced_motion,
             state,
@@ -234,6 +238,8 @@ impl Controller {
             hover_point: None,
             media: None,
             tasks: Vec::new(),
+            windows: Vec::new(),
+            navigation: super::navigation::Navigation::default(),
             glass_caches: Vec::new(),
             clock_ms: 0,
             state_since_ms: 0,
@@ -252,6 +258,7 @@ impl Controller {
             bar_left_cache: None,
             bar_right_cache: None,
         };
+        controller.sync_navigation();
         if controller.island.is_enabled() {
             controller.refresh_face(state);
             let (w, h) = controller.target_size(state);
@@ -278,6 +285,7 @@ impl Controller {
     pub fn set_task_update_at(&mut self, update: WorkerUpdate, now_ms: u64) -> bool {
         self.clock_ms = now_ms;
         let from = self.current_logical_size();
+        let media_was_playing = self.media_playing();
         let media_changed = self
             .media
             .as_ref()
@@ -294,14 +302,33 @@ impl Controller {
                     || a.height != b.height
                     || a.pixels_pbgra != b.pixels_pbgra
             });
+        let windows_changed = self.windows != update.windows;
         self.media = update.media;
         self.tasks = update.tasks;
+        self.windows = update.windows;
+        self.sync_navigation();
+        if windows_changed {
+            self.activity
+                .reconcile(&self.reducer.session_summaries(), &self.windows);
+        }
+        if self.island.is_bar() && media_was_playing != self.media_playing() {
+            if self.media_playing()
+                && self.state == VisualState::Idle
+                && self.face_decoder.is_none()
+                && self.face_frames.len() < 2
+            {
+                self.refresh_face(self.state);
+            }
+            self.arm_face_deadline(now_ms);
+        }
         let hover_closed = self.hover_expanded && !self.hover_content_available();
         if !self.hover_content_available() {
             self.hover_deadline = None;
             self.hover_expanded = false;
         }
-        if !self.island.is_enabled() || (!media_changed && !tasks_changed && !hover_closed) {
+        if !self.island.is_enabled()
+            || (!media_changed && !tasks_changed && !windows_changed && !hover_closed)
+        {
             return false;
         }
 
@@ -310,13 +337,13 @@ impl Controller {
             self.morph_to_target(now_ms);
             return true;
         }
-        if tasks_changed
+        if (tasks_changed || windows_changed)
             && self.island.is_bar()
             && (self.island.bar.replace_taskbar || self.bar_module("left", "apps"))
         {
             self.bar_left_cache = None;
-            let damage = if media_changed {
-                BarDamage::LEFT.union(BarDamage::CENTER)
+            let damage = if media_changed || self.is_navigation_open() {
+                BarDamage::FULL
             } else {
                 BarDamage::LEFT
             };
@@ -495,6 +522,10 @@ impl Controller {
         let is_enabled = island.is_enabled();
         let mode_changed = self.island.layout != island.layout;
         self.island = island;
+        self.sync_navigation();
+        if mode_changed || (!self.bar_module("left", "apps") && !self.island.bar.replace_taskbar) {
+            self.navigation.dismiss();
+        }
         self.glass_caches.clear();
         self.bar_left_cache = None;
         self.bar_right_cache = None;
@@ -580,6 +611,7 @@ impl Controller {
             ApplyOutcome::Stale | ApplyOutcome::Duplicate | ApplyOutcome::Rejected
         );
         let mut actions = self.sync_state(now_ms);
+        actions.present_frame |= self.sync_activity(now_ms);
 
         if accepted && self.island.is_enabled() {
             match kind {
@@ -622,6 +654,16 @@ impl Controller {
         self.clock_ms = now_ms;
         self.reducer.advance(now_ms);
         let mut actions = self.sync_state(now_ms);
+        actions.present_frame |= self.refresh_pending_launches(now_ms);
+        actions.present_frame |= self.sync_activity(now_ms);
+        if self.activity.deadline.is_some_and(|at| now_ms >= at) {
+            self.activity.deadline = None;
+            if self.activity_visible() {
+                let (w, h) = self.current_logical_size();
+                self.current = self.render_island(self.state, w, h, now_ms);
+                actions.present_frame = true;
+            }
+        }
         if self.volume_feedback_deadline.is_some_and(|at| now_ms >= at) {
             self.volume_feedback_deadline = None;
             if self.island.is_bar() {
@@ -808,9 +850,11 @@ impl Controller {
         if self.island.is_bar() {
             if self.bar_deadline.is_some_and(|d| now_ms >= d) {
                 self.bar_deadline = Some(now_ms.saturating_add(BAR_REFRESH_MS));
-                let (w, h) = self.current_logical_size();
-                self.current = self.render_island(self.state, w, h, now_ms);
-                actions.present_frame = true;
+                if self.bar_metrics_cache.is_none() {
+                    let (w, h) = self.current_logical_size();
+                    self.current = self.render_island(self.state, w, h, now_ms);
+                    actions.present_frame = true;
+                }
             } else if self.bar_deadline.is_none() {
                 self.bar_deadline = Some(now_ms.saturating_add(BAR_REFRESH_MS));
             }
@@ -830,7 +874,8 @@ impl Controller {
         // not set `manually_expanded`. It kept working only by accident,
         // because the face tick wakes the loop anyway.
         self.interaction_deadline =
-            (self.manually_expanded || self.panel_open).then(|| now_ms.saturating_add(100));
+            (self.manually_expanded || self.panel_open || self.is_navigation_open())
+                .then(|| now_ms.saturating_add(100));
         actions.next_deadline_ms = self.next_deadline_ms();
         actions
     }
@@ -895,6 +940,12 @@ impl Controller {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        if let Some(activity_at) = self.activity.deadline {
+            deadline = Some(deadline.map_or(activity_at, |at| at.min(activity_at)));
+        }
+        if let Some(launch_at) = self.navigation.pending_deadline() {
+            deadline = Some(deadline.map_or(launch_at, |at| at.min(launch_at)));
+        }
         if let Some(interaction_at) = self.interaction_deadline {
             deadline = Some(deadline.map_or(interaction_at, |at| at.min(interaction_at)));
         }
@@ -968,7 +1019,7 @@ impl Controller {
             // A manual expansion is the user's explicit open: mid-turn flips
             // (thinking -> working) must not collapse it from under them.
             // Only the turn ending retires the card.
-            if state == VisualState::Idle {
+            if state == VisualState::Idle && !self.activity_available() {
                 self.manually_expanded = false;
                 self.interaction_deadline = None;
             }
@@ -1382,11 +1433,84 @@ mod tests {
         assert!(c.face_deadline.is_none());
     }
 
-    /// A resting bar face must still advance. Suppressing its deadline pinned
-    /// the pill to the GIF's opening frame, which is nearly blank, so the face
-    /// looked like it had vanished rather than sitting still.
     #[test]
-    fn a_resting_bar_face_still_schedules_its_next_frame() {
+    fn completed_idle_bar_face_settles_on_visible_art_and_releases_loop_frames() {
+        let mut controller = quiet_island();
+        controller.island.layout = IslandLayout::Bar;
+        controller.island.face_animated = true;
+        let mut empty = controller.face_frame.clone();
+        empty.pixels_pbgra.fill(0);
+        let mut visible = empty.clone();
+        visible.pixels_pbgra.fill(255);
+        controller.face_frames = vec![empty, visible.clone()];
+        controller.face_delays = vec![20, 20];
+        controller.face_idx = 0;
+        controller.arm_face_deadline(1_000);
+        assert!(controller.face_deadline.is_none());
+        assert_eq!(controller.face_frames.len(), 1);
+        assert_eq!(controller.face_frame, visible);
+        assert_eq!(controller.face_idx, 0);
+    }
+
+    #[test]
+    fn cached_idle_bar_skips_hidden_metrics_and_unchanged_periodic_paints() {
+        let mut controller = volume_bar();
+        let mut snapshot = controller.bar_metrics_cache.clone().unwrap();
+        snapshot.cpu_pct = 62;
+        snapshot.memory_pct = 49;
+        assert!(!controller.set_bar_metrics(snapshot.clone(), 2_100));
+        assert_eq!(controller.bar_metrics_cache.as_ref().unwrap().cpu_pct, 62);
+        assert!(!controller.on_timer(4_000).present_frame);
+        controller.open_control_panel(4_100);
+        snapshot.cpu_pct = 72;
+        assert!(controller.set_bar_metrics(snapshot, 4_200));
+    }
+
+    #[test]
+    fn playing_media_restarts_a_settled_bar_face() {
+        let config = IslandConfig {
+            layout: IslandLayout::Bar,
+            face_animated: true,
+            ..IslandConfig::default()
+        };
+        let assets = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(vec![assets]),
+            false,
+            None,
+            config,
+        );
+        controller.set_bar_width(800);
+        for step in 1..=121 {
+            if controller.face_decoder.is_none() {
+                break;
+            }
+            controller.advance_face(step * 40);
+        }
+        assert_eq!(controller.face_frames.len(), 1);
+        assert!(controller.face_decoder.is_none());
+        assert!(controller.face_deadline.is_none());
+        controller.set_task_update_at(
+            WorkerUpdate {
+                media: Some(MediaInfo {
+                    title: "A playing track".into(),
+                    playing: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            6_000,
+        );
+        assert!(controller.face_decoder.is_some());
+        assert!(controller.face_deadline.is_some());
+        controller.advance_face(6_040);
+        assert!(controller.face_deadline.is_some());
+    }
+
+    #[test]
+    fn an_active_bar_face_still_schedules_its_next_frame() {
         let mut c = Controller::new_with_island(
             5_000,
             60_000,
@@ -1405,10 +1529,11 @@ mod tests {
         c.face_frames.push(c.face_frame.clone());
         c.face_delays.push(40);
 
+        c.state = VisualState::Working;
         c.arm_face_deadline(1_000);
         let armed = c
             .face_deadline
-            .expect("a resting bar face must arm its next frame");
+            .expect("an active bar face must arm its next frame");
         // The asset's own 40 ms cadence, floored at 20: not the island's
         // 10 fps resting throttle, which is what froze it.
         assert_eq!(armed, 1_040);
@@ -1448,6 +1573,7 @@ mod tests {
         c.face_delays = vec![40; 4];
         c.face_frame = c.face_frames[0].clone();
 
+        c.state = VisualState::Working;
         c.advance_face(1_000);
         assert_eq!(c.face_idx, 1);
         assert_eq!(
@@ -1825,6 +1951,7 @@ mod tests {
         c.face_frames.push(c.face_frame.clone());
         c.face_delays.push(200);
 
+        c.state = VisualState::Working;
         c.arm_face_deadline(1_000);
         // 200 ms of authored delay, overridden by the 17 ms cadence.
         assert_eq!(c.face_deadline, Some(1_017));

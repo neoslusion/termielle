@@ -57,6 +57,8 @@ pub enum Command {
     SetVolume(u8),
     RefreshConnectivity,
     RefreshVolume,
+    /// Wake the next foreground snapshot after an explicit app switch.
+    RefreshForeground,
 }
 
 pub struct Service {
@@ -178,7 +180,7 @@ impl Service {
                     match command {
                         Command::Configure(next) => config = *next,
                         Command::RefreshConnectivity => connectivity_ticks = 0,
-                        Command::RefreshVolume => {}
+                        Command::RefreshVolume | Command::RefreshForeground => {}
                         Command::ToggleMute => {
                             if let Err(error) = super::volume::toggle_mute() {
                                 eprintln!("volume toggle failed: {error}");
