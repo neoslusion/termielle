@@ -5,6 +5,7 @@ members = [
   "crates/termielle-emit",
   "crates/termielle-asset",
   "crates/termielle-app",
+  "crates/termielle-runtime",
 ]
 resolver = "3"
 

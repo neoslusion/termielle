@@ -331,19 +331,7 @@ impl Controller {
     /// The compact pill's primary (leading) content width: the termielle
     /// face plus the live agent session dots, or the idle label.
     pub(crate) fn compact_primary_width(&self) -> u32 {
-        let agent_visible = self.state != VisualState::Idle || self.reducer.session_count() > 0;
-        if !agent_visible {
-            return self.island.collapsed_width;
-        }
-        let mut w = 12u32;
-        if self.island.has_widget("face") {
-            w += 28 + 10;
-        }
-        if self.island.has_widget("agents") {
-            let dots = self.reducer.session_count().clamp(1, 4) as u32;
-            w += dots * 10 + 6;
-        }
-        w.max(56)
+        self.fitted_primary_width()
     }
 
     /// The compact pill's media (trailing) content width: album art plus

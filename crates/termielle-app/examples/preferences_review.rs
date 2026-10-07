@@ -12,7 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(2)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0)
-        .min(3);
+        .min(4);
     let config = termielle_core::AppConfig::default();
     let owner = OverlayWindow::create(&config, true)?;
     let preferences = PreferencesWindow::create(owner.hwnd(), owner.wake_handle(), &config.island)?;

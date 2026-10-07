@@ -79,12 +79,13 @@ fn is_side_hit(id: isize) -> bool {
             && id > crate::bar::HIT_BAR_WORKSPACE_BASE - 50)
 }
 
-fn cache_key(controller: &Controller, width: u32, bar_h: u32) -> (u32, u32, f32, u32) {
+fn cache_key(controller: &Controller, width: u32, bar_h: u32) -> (u32, u32, f32, u32, u32) {
     (
         width,
         bar_h,
         controller.render_scale(),
         controller.island.bar.margin,
+        controller.bar_pill_rect(width).2,
     )
 }
 
@@ -99,7 +100,7 @@ struct ZonePaint {
     /// the right zone own everything past it, so left-zone content stops
     /// here instead of being clipped away after the fact.
     left_limit: i32,
-    key: (u32, u32, f32, u32),
+    key: (u32, u32, f32, u32, u32),
 }
 
 impl Controller {

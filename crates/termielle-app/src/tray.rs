@@ -77,6 +77,7 @@ pub const TRAY_TOGGLE_BAR_MEMORY: u32 = 134;
 pub const TRAY_TOGGLE_BAR_VOLUME: u32 = 135;
 pub const TRAY_TOGGLE_BAR_BATTERY: u32 = 136;
 pub const TRAY_TOGGLE_BAR_NETWORK: u32 = 137;
+pub const TRAY_TOGGLE_NAME: u32 = 138;
 
 /// Current user-visible settings used to mark tray menu choices.
 #[derive(Clone, Debug, Default)]
@@ -87,6 +88,7 @@ pub struct MenuState {
     pub y_offset: i32,
     pub music: bool,
     pub face: bool,
+    pub show_name: bool,
     pub hover: bool,
     pub bar_cpu: bool,
     pub bar_memory: bool,
@@ -114,6 +116,7 @@ impl MenuState {
             y_offset: island.y_offset,
             music: island.has_widget("music"),
             face: island.has_widget("face"),
+            show_name: island.show_name,
             hover: island.expand_on_hover,
             bar_cpu: island.bar.modules_right.iter().any(|item| item == "cpu"),
             bar_memory: island.bar.modules_right.iter().any(|item| item == "memory"),
@@ -396,6 +399,7 @@ pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
         (TRAY_TOGGLE_MUSIC, "Media widget", state.music),
         (TRAY_TOGGLE_HOVER, "Hover to expand", state.hover),
         (TRAY_TOGGLE_FACE, "Termielle face", state.face),
+        (TRAY_TOGGLE_NAME, "Show Termielle name", state.show_name),
     ] {
         let label = if active {
             format!("[x] {label}")

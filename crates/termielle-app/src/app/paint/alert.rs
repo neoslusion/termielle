@@ -8,11 +8,11 @@ use crate::animation::notch::{
 };
 use termielle_core::IslandConfig;
 
-fn alert_copy(alert: &AlertBanner) -> (&str, &str, &str) {
+fn alert_copy(alert: &AlertBanner, show_name: bool) -> (&str, &str, &str) {
     match alert.kind {
         AlertKind::Agent => {
             let source = if alert.subtitle.trim().is_empty() {
-                "Termielle"
+                if show_name { "Termielle" } else { "Agent" }
             } else {
                 alert.subtitle.as_str()
             };
@@ -58,7 +58,7 @@ impl Controller {
         self.icon_hits
             .push((HIT_ALERT_DISMISS, 0, 0, width, height));
 
-        let (source, headline, detail) = alert_copy(alert);
+        let (source, headline, detail) = alert_copy(alert, island.show_name);
         let accent = alert.accent;
         let avatar_x = 16;
         let avatar_y = 27;
@@ -182,18 +182,31 @@ mod tests {
     #[test]
     fn agent_alert_uses_the_agent_as_source_and_a_clear_action() {
         let alert = banner(AlertKind::Agent, "Input", "claude");
-        assert_eq!(alert_copy(&alert), ("claude", "Needs your input", ""));
+        assert_eq!(alert_copy(&alert, true), ("claude", "Needs your input", ""));
+        assert_eq!(
+            alert_copy(&alert, false),
+            ("claude", "Needs your input", "")
+        );
+        let unnamed = banner(AlertKind::Agent, "Input", "");
+        assert_eq!(
+            alert_copy(&unnamed, true),
+            ("Termielle", "Needs your input", "")
+        );
+        assert_eq!(
+            alert_copy(&unnamed, false),
+            ("Agent", "Needs your input", "")
+        );
     }
 
     #[test]
     fn system_toast_separates_app_title_and_body() {
         let alert = banner(AlertKind::System, "Release ready", "Updates: Download now");
         assert_eq!(
-            alert_copy(&alert),
+            alert_copy(&alert, false),
             ("Updates", "Release ready", "Download now")
         );
 
         let alert = banner(AlertKind::System, "Updates", "Updates: Download now");
-        assert_eq!(alert_copy(&alert), ("Updates", "Download now", ""));
+        assert_eq!(alert_copy(&alert, false), ("Updates", "Download now", ""));
     }
 }

@@ -57,6 +57,11 @@ pub fn validate(mut draft: IslandConfig, baseline: &IslandConfig) -> Result<Isla
             "Keep Control Center and Clock enabled while reviewing replacement features.".into(),
         );
     }
+    if let termielle_core::MonitorSelection::Named(device) = &draft.monitor {
+        if device.is_empty() || device.len() > 128 || device.chars().any(char::is_control) {
+            return Err("Choose a valid display device name.".into());
+        }
+    }
     draft.clamp();
     Ok(draft)
 }
@@ -72,6 +77,46 @@ pub fn prepare_apply(
     validate(draft, baseline)
 }
 
+/// Custom is index 0 and deliberately does not rewrite hand-tuned physics.
+pub const ANIMATION_FEELS: &[&str] = &[
+    "Custom — preserve current tuning",
+    "Smooth",
+    "Balanced",
+    "Snappy",
+    "Bouncy",
+];
+fn animation_values(index: usize) -> Option<(u32, u32, u32, f32)> {
+    match index {
+        1 => Some((420, 320, 230, 0.05)),
+        2 => Some((350, 300, 220, 0.18)),
+        3 => Some((220, 180, 160, 0.06)),
+        4 => Some((400, 290, 220, 0.30)),
+        _ => None,
+    }
+}
+pub fn animation_feel(config: &IslandConfig) -> usize {
+    (1..ANIMATION_FEELS.len())
+        .find(|&i| {
+            animation_values(i).is_some_and(|v| {
+                v == (
+                    config.animation_ms,
+                    config.collapse_ms,
+                    config.alert_ms,
+                    config.spring_bounce,
+                )
+            })
+        })
+        .unwrap_or(0)
+}
+pub fn set_animation_feel(config: &mut IslandConfig, index: usize) {
+    if let Some((open, close, alert, bounce)) = animation_values(index) {
+        config.animation_ms = open;
+        config.collapse_ms = close;
+        config.alert_ms = alert;
+        config.spring_bounce = bounce;
+    }
+}
+
 pub fn move_pin(config: &mut IslandConfig, index: usize, delta: i32) -> Option<usize> {
     let target = index.checked_add_signed(delta as isize)?;
     if index >= config.bar.pinned_apps.len() || target >= config.bar.pinned_apps.len() {
@@ -85,6 +130,36 @@ pub fn move_pin(config: &mut IslandConfig, index: usize, delta: i32) -> Option<u
 mod tests {
     use super::*;
     use termielle_core::{AppLaunchTarget, PinnedApp};
+    #[test]
+    fn animation_presets_and_custom_tuning_are_deliberate() {
+        let mut config = IslandConfig {
+            animation_ms: 517,
+            spring_bounce: 0.27,
+            ..Default::default()
+        };
+        let custom = config.clone();
+        assert_eq!(animation_feel(&config), 0);
+        set_animation_feel(&mut config, 0);
+        assert_eq!(config, custom);
+        for i in 1..ANIMATION_FEELS.len() {
+            set_animation_feel(&mut config, i);
+            assert_eq!(animation_feel(&config), i);
+            assert_eq!(config.glass, custom.glass);
+        }
+        assert!(config.animation_ms >= 100 && config.spring_bounce <= 0.5);
+    }
+    #[test]
+    fn unavailable_display_is_preserved_but_invalid_names_are_rejected() {
+        let original = IslandConfig::default();
+        let mut config = original.clone();
+        config.monitor = termielle_core::MonitorSelection::Named(r"\\.\DISPLAY99".into());
+        assert_eq!(
+            validate(config.clone(), &original).unwrap().monitor,
+            config.monitor
+        );
+        config.monitor = termielle_core::MonitorSelection::Named("bad\nname".into());
+        assert!(validate(config, &original).is_err());
+    }
     #[test]
     fn validation_preserves_custom_material_and_unedited_values() {
         let mut original = IslandConfig::default();

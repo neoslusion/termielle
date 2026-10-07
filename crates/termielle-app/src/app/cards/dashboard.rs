@@ -142,16 +142,18 @@ impl Controller {
         } else {
             ctx.pad
         };
-        crate::animation::notch::draw_text(
-            frame,
-            "Termielle",
-            tag_x,
-            16,
-            ctx.width.saturating_sub((tag_x as u32) + 70),
-            10,
-            true,
-            self.ink_dim(),
-        );
+        if island.show_name {
+            crate::animation::notch::draw_text(
+                frame,
+                "Termielle",
+                tag_x,
+                16,
+                ctx.width.saturating_sub((tag_x as u32) + 70),
+                10,
+                true,
+                self.ink_dim(),
+            );
+        }
 
         let stats = crate::system::collect();
 

@@ -94,7 +94,9 @@ impl Controller {
     /// `render_bar`, its hit target, and the `set_hover` sensor.
     pub(crate) fn bar_pill_rect(&self, width: u32) -> (i32, i32, u32, u32) {
         let (_, _, _, pill_off, pill_h, _) = self.bar_row();
-        let pill_w = 180.min(width.max(1).saturating_sub(16));
+        let pill_w = self
+            .fitted_bar_pill_width(pill_h)
+            .min(width.max(1).saturating_sub(16));
         let pill_cx = ((width.saturating_sub(pill_w)) / 2) as i32;
         (pill_cx, pill_off, pill_w, pill_h)
     }

@@ -145,6 +145,9 @@ pub fn theme_roots() -> Vec<PathBuf> {
         // Back-compat: also check .termielle
         roots.push(PathBuf::from(home).join(".termielle").join("themes"));
     }
+    if let Some(directory) = crate::hosted::payload_directory() {
+        roots.push(directory.join("themes"));
+    }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             roots.push(dir.join("themes"));

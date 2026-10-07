@@ -13,12 +13,16 @@
 pub(crate) mod activity;
 pub(crate) mod bar;
 pub(crate) mod cards;
+mod compact_layout;
 pub(crate) mod controller;
 pub(crate) mod face;
 pub(crate) mod island;
 pub(crate) mod navigation;
 pub(crate) mod paint;
 pub(crate) mod types;
+
+#[cfg(test)]
+mod name_visibility_tests;
 
 pub use controller::Controller;
 pub use types::{

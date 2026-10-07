@@ -6,6 +6,7 @@
 //! activities only** (agent sessions + media), matching the iOS Dynamic
 //! Island — not a window switcher.
 
+use crate::win32_ptr::{class_long_ptr as GetClassLongPtrW, window_long_ptr as GetWindowLongPtrW};
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,11 +20,10 @@ use windows::Win32::Graphics::Gdi::{
     GetObjectW, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GetClassLongPtrW, GetClassNameW,
-    GetIconInfo, GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, HICON,
-    ICON_BIG, ICON_SMALL2, ICONINFO, IsIconic, IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS,
-    SMTO_ABORTIFHUNG, SMTO_NORMAL, SW_RESTORE, SendMessageTimeoutW, SetForegroundWindow,
-    ShowWindow, WM_GETICON, WS_EX_TOOLWINDOW,
+    EnumWindows, GCLP_HICON, GCLP_HICONSM, GWL_EXSTYLE, GetClassNameW, GetIconInfo, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, HICON, ICON_BIG, ICON_SMALL2, ICONINFO, IsIconic,
+    IsWindowVisible, SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SMTO_NORMAL, SW_RESTORE,
+    SendMessageTimeoutW, SetForegroundWindow, ShowWindow, WM_GETICON, WS_EX_TOOLWINDOW,
 };
 
 /// Edge length of a decoded media artwork thumbnail, in pixels (high-resolution).
@@ -931,8 +931,8 @@ fn icon_handle(hwnd: HWND) -> Option<HICON> {
     let mut candidates = vec![
         query(ICON_BIG as usize),
         query(ICON_SMALL2 as usize),
-        unsafe { GetClassLongPtrW(hwnd, GCLP_HICON) as usize },
-        unsafe { GetClassLongPtrW(hwnd, GCLP_HICONSM) as usize },
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HICON) },
+        unsafe { GetClassLongPtrW(hwnd, GCLP_HICONSM) },
     ];
     candidates.retain(|h| *h != 0);
     candidates.dedup();

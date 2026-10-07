@@ -31,7 +31,9 @@ labels, combo boxes, check boxes, edit fields, lists and buttons. Native dialog
 navigation handles Tab, access keys and Escape. Pages include:
 
 1. Appearance: layout, top/bottom edge, height/density, theme, hover, animation,
-   and frosted/recording-safe glass.
+   and frosted/recording-safe glass. The later **Show Termielle name** checkbox
+   controls decorative pill/dashboard branding without hiding live content;
+   see [configuration](island.md#widgets--configurable-termielle-content).
 2. Bar items: left/right module order via validated comma-separated lists.
 3. Pins: keyboard-accessible Move up, Move down and Remove in a draft list.
 4. System/readiness: native Windows sound/output, network, power, clock/calendar
@@ -80,10 +82,22 @@ cargo run -p termielle-app --example preferences_review -- target/preferences-ap
 # Pages: 0 Appearance, 1 Bar items, 2 Pins, 3 System/readiness
 ```
 
-No installed executable or real user profile was replaced for this increment.
-Before deployment, manually exercise mouse/keyboard, Preview/Apply/Revert,
-save failure and custom profiles, top/bottom and DPI, native tooltip visibility,
-drag threshold/capture loss and foreground restoration.
+The later name-visibility follow-up passed **505 workspace tests, 0 failed,
+2 existing manual launcher tests ignored**, release workspace build, Clippy with
+the same pre-existing allowances, format/diff checks and all 7 doctor checks.
+Additional regressions cover default-on compatibility, atomic explicit-profile
+round trips, native checkbox Preview/Apply/Revert, scaled pill/notch rendering,
+unchanged live agent/media content and unchanged bar click targets. The initial
+isolated reviews did not replace the installed executable or real user profile.
+
+**Deployment update — 2026-10-06:** these controls and name visibility are now in
+the installed standalone binary, deployed at user request with profile/task/assets
+preserved. Passive startup checks observed one process, visible top bar, native
+taskbars available and no new panic bytes. The later shared-runtime milestone
+passed 508 workspace tests. See [deployment evidence](development-handoff.md).
+Interactive acceptance remains pending: mouse/keyboard, Preview/Apply/Revert,
+save failure/custom profiles, top/bottom/DPI, tooltip visibility, drag threshold,
+capture loss and foreground restoration.
 
 ## Still pending — do not call complete
 

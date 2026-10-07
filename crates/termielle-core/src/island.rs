@@ -84,6 +84,17 @@ impl Default for BarConfig {
     }
 }
 
+/// Explicit display choice. Automatic preserves legacy per-layout behavior.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "device", rename_all = "snake_case")]
+pub enum MonitorSelection {
+    #[default]
+    Automatic,
+    Primary,
+    Pointer,
+    Named(String),
+}
+
 // ---- Glass ----------------------------------------------------------------
 
 /// Custom layered glass material — baked into the DIB, not DWM acrylic.
@@ -175,6 +186,10 @@ const DEFAULT_SPRING_BOUNCE: f32 = 0.18;
 #[serde(default, deny_unknown_fields)]
 pub struct IslandConfig {
     pub layout: IslandLayout,
+    pub monitor: MonitorSelection,
+    /// Island/Notch only: hide behind a foreground fullscreen application.
+    /// Off by default; never changes taskbar reservations or replacement.
+    pub hide_on_fullscreen: bool,
     /// Compact width in logical pixels — the resting pill while an agent
     /// session or media is live (iOS "compact" presentation).
     pub collapsed_width: u32,
@@ -218,7 +233,10 @@ pub struct IslandConfig {
     /// Animate the termielle face inside the notch (advance its GIF frames).
     /// When false the face is a still of the state's first frame.
     pub face_animated: bool,
-    /// Visual widgets rendered inside the pill (no text anywhere).
+    /// Show the decorative Termielle name in idle pills and dashboard headers.
+    /// Does not hide agent status, media titles or source identities.
+    pub show_name: bool,
+    /// Visual widgets rendered inside the pill.
     /// Known names: `face` (animated character), `tasks` (running-task app
     /// icons), `agents` (one dot per live agent session), `music` (indicator
     /// strip while media plays), `ring` (progress ring around the face).
@@ -253,6 +271,8 @@ impl Default for IslandConfig {
             layout: IslandLayout::Bar,
             collapsed_width: DEFAULT_COLLAPSED_W,
             expanded_width: DEFAULT_EXPANDED_W,
+            monitor: MonitorSelection::Automatic,
+            hide_on_fullscreen: false,
             animation_ms: DEFAULT_ANIM_MS,
             collapse_ms: DEFAULT_COLLAPSE_MS,
             alert_ms: DEFAULT_ALERT_MS,
@@ -267,6 +287,7 @@ impl Default for IslandConfig {
             show_tasks: false,
             max_thumbnails: 4,
             face_animated: true,
+            show_name: true,
             ring_metric: "battery".to_string(),
             widgets: Self::default_widgets(),
             expand_on_hover: true,

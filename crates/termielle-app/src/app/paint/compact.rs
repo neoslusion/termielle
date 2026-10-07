@@ -198,18 +198,20 @@ impl Controller {
                     );
                 }
             } else if state == VisualState::Idle && !self.media_available() {
-                let text_x = if island.has_widget("face") { 46 } else { 16 };
-                let text_w = width.saturating_sub((text_x as u32) + 18);
-                crate::animation::notch::draw_text(
-                    frame,
-                    "Termielle",
-                    text_x,
-                    cy - 6,
-                    text_w,
-                    11,
-                    true,
-                    self.ink_dim(),
-                );
+                let text_x = self.compact_label_x() as i32;
+                let text_w = width.saturating_sub((text_x as u32) + 24);
+                if island.show_name {
+                    crate::animation::notch::draw_text(
+                        frame,
+                        "Termielle",
+                        text_x,
+                        cy - 6,
+                        text_w,
+                        11,
+                        true,
+                        self.ink_dim(),
+                    );
+                }
                 crate::animation::notch::draw_disc(
                     frame,
                     width as i32 - 16,

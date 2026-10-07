@@ -13,6 +13,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all -- --check
@@ -30,6 +31,24 @@ jobs:
             Get-Content "$env:RUNNER_TEMP\test.log" | Select-Object -Last 40 |
               ForEach-Object { Write-Host "::error::CI-TAIL $_" }
           }
+      - name: Isolated Windhawk runtime host
+        shell: pwsh
+        run: |
+          cargo build -p termielle-runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p termielle-app --example windhawk_host_review
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File scripts\review-windhawk-runtime.ps1 -BinDir target\debug
+      - name: Consolidated x86 Windhawk runtime
+        shell: pwsh
+        run: |
+          cargo test -p termielle-runtime --target i686-pc-windows-msvc --features windhawk-x86
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p termielle-runtime --target i686-pc-windows-msvc --features windhawk-x86 --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p termielle-app --target i686-pc-windows-msvc --example windhawk_host_review
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pwsh -NoProfile -File scripts\review-windhawk-runtime.ps1 -BinDir target\i686-pc-windows-msvc\debug -Consolidated
       - name: Doctor
         shell: pwsh
         run: pwsh -NoProfile -File scripts\doctor.ps1 -BinDir target\debug

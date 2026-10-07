@@ -12,7 +12,7 @@ pub(crate) type BarHit = (isize, i32, i32, u32, u32);
 /// monitor width so zone compositing keeps one coordinate system; only the
 /// configured side range is copied into the destination.
 pub(crate) struct BarZoneCache {
-    pub(crate) key: (u32, u32, f32, u32),
+    pub(crate) key: (u32, u32, f32, u32, u32),
     pub(crate) frame: Rc<FrameBuffer>,
     pub(crate) hits: Vec<BarHit>,
     /// Centre x of this zone's Control Center entry, when it drew one. The
@@ -26,9 +26,9 @@ pub(crate) struct BarZoneCache {
 /// Transparent breathing room between the persistent strip and its popup.
 /// The popup is a separate island surface, not a continuation of the bar.
 pub(crate) const BAR_POPUP_GAP: u32 = 6;
-/// Logical pixels the left zone keeps clear of the center pill. The pill and
-/// the right zone are fixed, so left-side content is laid out up to this
-/// edge rather than painted past it and clipped.
+/// Logical pixels the left zone keeps clear of the measured center pill.
+/// Left-side content is laid out up to that shared geometry's edge rather
+/// than painted past it and clipped.
 pub(crate) const BAR_ZONE_GAP: u32 = 8;
 /// Right-zone layout, all logical px. A module is a glyph and its number, so
 /// these are the glyph box, the gap to the number, and the number's own

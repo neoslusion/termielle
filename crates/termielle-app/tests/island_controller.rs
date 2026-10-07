@@ -735,9 +735,9 @@ fn island_compact_media_sizing() {
     });
     c.on_timer(10050);
     c.on_timer(10200);
-    // Width hugs the live content: idle label width (140) plus the media
-    // art + equalizer, minus the shared edge padding.
-    assert_eq!(c.current_frame().width, 186);
+    // No unused idle-label reservation beside media: primary face (60)
+    // plus art/equalizer (54), minus shared edge padding (8).
+    assert_eq!(c.current_frame().width, 106);
     assert_eq!(c.current_frame().height, 36);
 }
 
@@ -816,15 +816,16 @@ fn split_island_two_blobs_when_agent_and_media_both_live() {
     let _ = c.on_timer(10200);
     let _ = c.on_timer(10400);
     let frame = c.current_frame();
-    // Union width: primary (66) + gap (9) + media (54).
-    assert_eq!(frame.width, 129);
+    // Union width: primary (70), including a clear face/dot gap,
+    // plus separation (9) and media (54).
+    assert_eq!(frame.width, 133);
     assert_eq!(frame.height, 36);
     let alpha_at = |x: u32, y: u32| frame.pixels_pbgra[(((y * frame.width + x) * 4) + 3) as usize];
     // Both blob interiors are opaque...
     assert!(alpha_at(20, 18) > 150, "primary blob must render");
     assert!(alpha_at(102, 18) > 150, "media blob must render");
     // ...and the gap between them is fully transparent: two blobs.
-    for gap_x in [67u32, 70, 74] {
+    for gap_x in [71u32, 74, 78] {
         assert_eq!(alpha_at(gap_x, 18), 0, "gap must be transparent at {gap_x}");
     }
     // Once separation settles it must be removed, or procedural motion stays
@@ -876,7 +877,7 @@ fn paused_media_stays_visible_and_can_resume() {
         let _ = c.on_timer(t);
     }
     let frame = c.current_frame();
-    assert_eq!((frame.width, frame.height), (129, 36));
+    assert_eq!((frame.width, frame.height), (133, 36));
     let alpha_at = |x: u32, y: u32| frame.pixels_pbgra[(((y * frame.width + x) * 4) + 3) as usize];
     assert!(
         alpha_at(20, 18) > 150,
@@ -921,7 +922,7 @@ fn media_arriving_during_compact_morph_retargets_the_active_spring() {
     }
     assert_eq!(
         (c.current_frame().width, c.current_frame().height),
-        (129, 36)
+        (133, 36)
     );
 }
 

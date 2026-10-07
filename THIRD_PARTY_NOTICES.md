@@ -1,5 +1,17 @@
 # Third-party notices
 
+## Dynamic Island for Windows — Windhawk tool-host compatibility pattern
+
+The compatibility loaders in `windhawk/termielle.wh.cpp` and
+`crates/termielle-runtime/src/windhawk.rs` adapt the dedicated host pattern from https://github.com/devcode90/Dynamic-Island-for-Windows,
+snapshot `0ce97cdd4e1d98c79ae2946d419004c35c6ffe12`, together with official Windhawk
+mods-as-tools guidance. The reference is MIT licensed, copyright 2026 devcode90;
+the full notice is retained in `windhawk/LICENSES/Dynamic-Island-MIT.txt` and
+included with distributions. Its author/README credits include Himanshu and the
+upstream contributors. Only the tool-host lifecycle pattern is adapted; its
+rendering, clipboard, weather, notification scraping and system modules were not
+imported. Termielle's Rust runtime remains the shared implementation.
+
 ## Gemielle
 
 Termielle was inspired by Gemielle by Rainan1010:

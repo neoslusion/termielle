@@ -574,59 +574,30 @@ impl Controller {
                         compact_frame,
                         (pill_cx, local_pill_y, pill_w, pill_h),
                     );
-                } else if self.media_available() && self.island.has_widget("music") {
-                    if let Some(media) = &self.media {
-                        let track = media.title.as_str();
-                        crate::animation::notch::draw_text_in_rect(
+                } else {
+                    let (label, bold, status) = self.bar_center_label(state);
+                    if status {
+                        let (sc, _) = crate::animation::notch::accent_colors(state);
+                        crate::animation::notch::draw_disc(
                             compact_frame,
-                            track,
-                            (label_x, local_pill_y, label_max_w, pill_h),
-                            12,
-                            false,
-                            primary,
-                            false,
-                        );
-                    } else {
-                        crate::animation::notch::draw_text_in_rect(
-                            compact_frame,
-                            "Media",
-                            (label_x, local_pill_y, label_max_w, pill_h),
-                            12,
-                            false,
-                            primary,
-                            false,
+                            label_x + 4,
+                            local_pill_y + (pill_h / 2) as i32,
+                            3,
+                            sc,
                         );
                     }
-                } else if state != VisualState::Idle {
-                    let (sc, _) = crate::animation::notch::accent_colors(state);
-                    crate::animation::notch::draw_disc(
-                        compact_frame,
-                        label_x + 4,
-                        local_pill_y + (pill_h / 2) as i32,
-                        3,
-                        sc,
-                    );
+                    let inset = if status { 12 } else { 0 };
                     crate::animation::notch::draw_text_in_rect(
                         compact_frame,
-                        state.display_name(),
+                        label,
                         (
-                            label_x + 12,
+                            label_x + inset,
                             local_pill_y,
-                            label_max_w.saturating_sub(14),
+                            label_max_w.saturating_sub(if status { 14 } else { 0 }),
                             pill_h,
                         ),
                         12,
-                        false,
-                        primary,
-                        false,
-                    );
-                } else {
-                    crate::animation::notch::draw_text_in_rect(
-                        compact_frame,
-                        "Termielle",
-                        (label_x, local_pill_y, label_max_w, pill_h),
-                        12,
-                        true,
+                        bold,
                         primary,
                         false,
                     );

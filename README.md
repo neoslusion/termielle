@@ -1,5 +1,15 @@
 # Termielle
 
+**Experimental Windhawk edition:** the standalone app remains supported, and a
+[Windhawk tool edition](windhawk/README.md) now combines the adapter and shared
+Rust runtime in one x86 mod DLL, running in Windhawk's own dedicated tool process.
+Native remains x64. It does not inject the renderer into Explorer or replace the
+native taskbar. The October 7 local preview passed initial live switching checks;
+use the Native/Windhawk edition launchers to choose one frontend at a time.
+Windhawk supports the full Bar, Island and Notch while retaining Windows' taskbar.
+[Shared desktop improvements](docs/desktop-improvements.md) add display choice,
+optional fullscreen hiding and animation presets. Physical acceptance remains pending.
+
 Termielle is a low-overhead animated desktop companion for the terminal. A
 transparent overlay character follows Claude Code, Codex CLI, opencode (1.x
 and 2.x), and Antigravity CLI (`agy`) lifecycle events, received over a local
@@ -217,7 +227,7 @@ nor replay.
 
 ## Workspace
 
-The Rust workspace (edition 2024) is split into five crates:
+The Rust workspace (edition 2024) is split into six crates:
 
 - `crates/termielle-core` — event protocol, session reducer, configuration,
   and the replayed event journal.
@@ -230,7 +240,12 @@ The Rust workspace (edition 2024) is split into five crates:
   .NET, and the gif crate all read identically.
 - `crates/termielle-app` — the GIF overlay, single-instance guard, tray, and
   diagnostics (`--smoke-test`, `--ack-file`). Its assets test validates the
-  shipped artwork frame by frame through WIC, the overlay's own decoder.
+  shipped artwork frame by frame through WIC, the overlay's own decoder. The
+  shared startup/UI runtime is also used by the experimental hosted edition.
+  `termielle-runtime` can build its consolidated x86 Windhawk adapter with the
+  `windhawk-x86` feature; native remains x64.
+- `crates/termielle-runtime` — thin Windows DLL/C-ABI packaging for the shared
+  runtime; dedicated one-shot hosts only, not an unload-safe general plugin SDK.
 
 `scripts/` holds the PowerShell 7 harnesses, and `.github/workflows/` runs
 fmt/clippy/tests in CI on Windows, packages checksummed release builds, and

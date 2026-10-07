@@ -1,7 +1,17 @@
 # Whole-application On / Off
 
+The experimental [Windhawk edition](../windhawk/README.md) shares the same Off
+marker. New `--enable-only` explicitly clears Off without starting a frontend,
+for switching to a fresh Windhawk tool host. `--enable` retains its original
+standalone launch behavior. Mod activation never clears Off implicitly.
+
 Termielle now has a persistent, per-user power switch. This is distinct from
 hiding the surface, changing layout, disabling a widget, or exiting temporarily.
+
+Executable controls were deployed in the standalone build on **2026-10-06**.
+The binary-only deployment did not rerun the installer or add new Start-menu
+shortcuts; external On remains available through the installed executable's
+`--enable` command. Windhawk activation remains separate and opt-in.
 
 ## Controls
 

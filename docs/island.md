@@ -283,6 +283,7 @@ alternate surfaces; live-content hover may use a smaller compact step than Bar.
   "theme": "auto",
   "glass": { "tint": [30,22,18,190], "blur_radius": 12, "border_alpha": 24, "highlight_alpha": 42, "shadow_alpha": 48 },
   "face_animated": true,
+  "show_name": true,
   "widgets": ["face","agents","music"],
   "expand_on_hover": true
 }
@@ -305,8 +306,19 @@ part of the default Waybar module. `tasks` remains available in the focused
 popup when explicitly enabled by configuration.
 
 Remove a name to hide it, e.g. `"widgets": ["face","music"]` for a minimal
-module. The tray toggles media, hover expansion, and the face; layout changes
-remain explicit choices.
+module. The tray toggles media, hover expansion, the face, and **Show Termielle
+name**; layout changes remain explicit choices.
+
+`show_name` (default `true` for existing profiles) controls decorative branding
+in the idle pill, the bar's center pill and the standalone dashboard header.
+Set it to `false`, uncheck **Show Termielle name** under tray → Widgets, or use
+Preferences → Appearance → **Show Termielle name** with Preview/Apply/Revert.
+This does not hide agent status, media content, the face or real source names;
+an unnamed agent alert uses "Agent" instead of the branding fallback. Geometry
+and click targets remain unchanged. Tray tooltips/window accessibility identities
+remain named. This setting is in the new source/build, not the installed October
+4 binary; do not add the field to an older binary's profile (older versions reject
+unknown configuration fields).
 
 ### Interactivity
 

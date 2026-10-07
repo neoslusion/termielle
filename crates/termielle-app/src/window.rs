@@ -27,24 +27,25 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DEVICE_NOTIFY_WINDOW_HANDLE, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, HTCAPTION, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer,
-    LWA_COLORKEY, LoadCursorW, MONITORINFOF_PRIMARY, MSG, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND, PBT_POWERSETTINGCHANGE, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetCursor,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY,
-    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowRect,
+    HTCAPTION, HTCLIENT, HTTRANSPARENT, IDC_ARROW, IDC_HAND, KillTimer, LWA_COLORKEY, LoadCursorW,
+    MONITORINFOF_PRIMARY, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMECRITICAL, PBT_APMRESUMESUSPEND,
+    PBT_POWERSETTINGCHANGE, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER,
+    SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowPos, ShowWindow, TranslateMessage,
+    ULW_ALPHA, UpdateLayeredWindow, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_DWMCOLORIZATIONCOLORCHANGED, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NCHITTEST, WM_POWERBROADCAST, WM_SETCURSOR, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::BOOL;
 use windows::core::PCWSTR;
 
 use crate::animation::FrameBuffer;
 use crate::tray;
+use crate::win32_ptr::{
+    set_window_long_ptr as SetWindowLongPtrW, window_long_ptr as GetWindowLongPtrW,
+};
 
 /// Minimum per-pixel alpha (0-255) for the overlay to claim a hit; any pixel
 /// below the threshold passes clicks through to the terminal underneath.
@@ -186,6 +187,7 @@ pub enum WindowEvent {
     ToggleHoverExpand,
     /// Tray toggled the Termielle face widget.
     ToggleFace,
+    ToggleName,
     ToggleBarModule(&'static str),
     /// Windows light/dark theme setting changed; re-resolve `auto`.
     SystemThemeChanged,
@@ -918,6 +920,9 @@ unsafe extern "system" fn window_proc(
                         tray::TRAY_TOGGLE_HOVER => {
                             let _ = unsafe { (*state).events.send(WindowEvent::ToggleHoverExpand) };
                         }
+                        tray::TRAY_TOGGLE_NAME => {
+                            let _ = unsafe { (*state).events.send(WindowEvent::ToggleName) };
+                        }
                         tray::TRAY_TOGGLE_FACE => {
                             let _ = unsafe { (*state).events.send(WindowEvent::ToggleFace) };
                         }
@@ -968,6 +973,9 @@ unsafe extern "system" fn window_proc(
 /// only becomes visible when the first frame is presented.
 pub struct OverlayWindow {
     hwnd: HWND,
+    diagnostic_hidden: bool,
+    fullscreen_suppressed: bool,
+    monitor_selection: Option<(termielle_core::MonitorSelection, bool)>,
     destroyed: std::cell::Cell<bool>,
     state: Box<WindowState>,
     receiver: Receiver<WindowEvent>,
@@ -1086,6 +1094,9 @@ impl OverlayWindow {
         };
         let window = Self {
             hwnd,
+            diagnostic_hidden: hidden,
+            fullscreen_suppressed: false,
+            monitor_selection: None,
             recovery: recovery::DisplayRecovery::default(),
             power_notification: Cell::new(power_notification),
             destroyed: std::cell::Cell::new(false),
@@ -1356,7 +1367,9 @@ impl OverlayWindow {
         self.surface.borrow_mut().take();
         self.backdrop.borrow_mut().take();
         self.backdrop_generation = self.backdrop_generation.wrapping_add(1);
-        let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        if !self.diagnostic_hidden && !self.fullscreen_suppressed {
+            let _ = unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        }
     }
 
     /// Open our existing preferences menu without depending on the system tray.
@@ -1568,6 +1581,83 @@ impl OverlayWindow {
             }
         }
         false
+    }
+
+    pub fn is_fullscreen_suppressed(&self) -> bool {
+        self.fullscreen_suppressed
+    }
+    pub fn is_diagnostic_hidden(&self) -> bool {
+        self.diagnostic_hidden
+    }
+    pub fn set_fullscreen_suppressed(&mut self, suppressed: bool) -> bool {
+        if self.fullscreen_suppressed == suppressed {
+            return false;
+        }
+        self.fullscreen_suppressed = suppressed;
+        if suppressed {
+            self.set_navigation_focus(false);
+            self.backdrop.borrow_mut().take();
+            self.backdrop_generation = self.backdrop_generation.wrapping_add(1);
+        }
+        if !self.diagnostic_hidden {
+            let _ = unsafe {
+                ShowWindow(
+                    self.hwnd,
+                    if suppressed {
+                        windows::Win32::UI::WindowsAndMessaging::SW_HIDE
+                    } else {
+                        SW_SHOWNOACTIVATE
+                    },
+                )
+            };
+        }
+        true
+    }
+    /// Resolve named displays only on config/recovery changes; pointer following
+    /// is explicit. Missing named displays fall back to primary without saving.
+    pub fn configure_monitor(&mut self, config: &termielle_core::IslandConfig) -> bool {
+        use termielle_core::MonitorSelection;
+        let before = self.anchor_monitor;
+        let key = (
+            config.monitor.clone(),
+            config.is_bar() && !config.bar.follow_active_monitor,
+        );
+        if self.monitor_selection.as_ref() != Some(&key) {
+            self.anchor_monitor = None;
+            self.monitor_selection = Some(key);
+        }
+        match &config.monitor {
+            MonitorSelection::Pointer => {
+                self.update_active_monitor();
+            }
+            MonitorSelection::Automatic if self.anchor_monitor.is_none() => {
+                if config.is_bar() && !config.bar.follow_active_monitor {
+                    self.pin_primary_monitor();
+                } else {
+                    self.update_active_monitor();
+                }
+            }
+            MonitorSelection::Automatic if config.is_bar() && config.bar.follow_active_monitor => {
+                self.update_active_monitor();
+            }
+            MonitorSelection::Primary | MonitorSelection::Named(_)
+                if self.anchor_monitor.is_none() =>
+            {
+                let displays = crate::desktop::displays();
+                let chosen = match &config.monitor {
+                    MonitorSelection::Named(device) => displays
+                        .iter()
+                        .find(|m| m.device.eq_ignore_ascii_case(device)),
+                    _ => None,
+                }
+                .or_else(|| displays.iter().find(|m| m.primary));
+                if let Some(display) = chosen {
+                    self.anchor_monitor = Some(display.handle);
+                }
+            }
+            _ => {}
+        }
+        before != self.anchor_monitor
     }
 
     /// Pins the anchor to the primary monitor (bar `follow_active_monitor: false`).

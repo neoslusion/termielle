@@ -13,9 +13,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
       - name: Build release
         run: cargo build --release
+      - name: Build consolidated x86 mod
+        run: cargo build -p termielle-runtime --release --target i686-pc-windows-msvc --features windhawk-x86 --lib
       - name: Stage and verify
         shell: pwsh
         run: |
@@ -23,6 +27,11 @@ jobs:
           $stage = Join-Path $env:RUNNER_TEMP "termielle-$tag"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item target\release\termielle-app.exe $stage
+          Copy-Item target\release\termielle_runtime.dll $stage
+          Copy-Item target\release\termielle-windhawk-host.exe $stage
+          Copy-Item windhawk $stage -Recurse
+          Copy-Item target\i686-pc-windows-msvc\release\termielle_runtime.dll (Join-Path $stage 'windhawk\termielle-x86.dll')
+          Copy-Item scripts\switch-termielle-edition.ps1 (Join-Path $stage 'windhawk')
           Copy-Item target\release\termielle-emit.exe $stage
           Copy-Item THIRD_PARTY_NOTICES.md $stage
           Copy-Item README.md $stage

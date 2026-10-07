@@ -1,5 +1,8 @@
 //! Native, keyboard/screen-reader-friendly preferences. Drafts never write files.
 pub mod model;
+use crate::win32_ptr::{
+    set_window_long_ptr as SetWindowLongPtrW, window_long_ptr as GetWindowLongPtrW,
+};
 use model::Request;
 use std::{cell::Cell, collections::HashMap, sync::mpsc};
 use termielle_core::{BarPosition, IslandConfig, IslandLayout};
@@ -24,6 +27,10 @@ const THEME: i32 = 105;
 const HOVER: i32 = 106;
 const FACE: i32 = 107;
 const BLUR: i32 = 108;
+const SHOW_NAME: i32 = 109;
+const DISPLAY: i32 = 160;
+const FULLSCREEN: i32 = 161;
+const ANIMATION: i32 = 162;
 const LEFT: i32 = 111;
 const RIGHT: i32 = 112;
 const PINS: i32 = 120;
@@ -57,6 +64,7 @@ struct State {
     page: usize,
     themes: Vec<String>,
     heights: Vec<u32>,
+    monitors: Vec<termielle_core::MonitorSelection>,
 }
 impl State {
     fn emit(&self, request: Request) {
@@ -95,6 +103,12 @@ impl State {
         self.draft.theme = self.themes[self.selected(THEME).min(self.themes.len() - 1)].clone();
         self.draft.expand_on_hover = self.check(HOVER);
         self.draft.face_animated = self.check(FACE);
+        self.draft.show_name = self.check(SHOW_NAME);
+        self.draft.monitor =
+            self.monitors[self.selected(DISPLAY).min(self.monitors.len() - 1)].clone();
+        self.draft.hide_on_fullscreen = self.check(FULLSCREEN);
+        let feel = self.selected(ANIMATION);
+        model::set_animation_feel(&mut self.draft, feel);
         self.draft.glass.blur_radius = if self.selected(BLUR) == 1 {
             0
         } else {
@@ -181,6 +195,7 @@ impl State {
         );
         check(self.controls[&HOVER], self.draft.expand_on_hover);
         check(self.controls[&FACE], self.draft.face_animated);
+        check(self.controls[&SHOW_NAME], self.draft.show_name);
         choose(
             self.controls[&BLUR],
             usize::from(self.draft.glass.blur_radius == 0),
@@ -193,8 +208,60 @@ impl State {
             self.controls[&RIGHT],
             &self.draft.bar.modules_right.join(", "),
         );
+        use termielle_core::MonitorSelection;
+        self.monitors = vec![
+            MonitorSelection::Automatic,
+            MonitorSelection::Primary,
+            MonitorSelection::Pointer,
+        ];
+        let mut labels = vec![
+            "Automatic — existing layout behavior".into(),
+            "Primary display".into(),
+            "Follow pointer — recheck at 500ms".into(),
+        ];
+        for display in crate::desktop::displays() {
+            labels.push(format!(
+                "{} — {}×{}{}",
+                display.device,
+                i64::from(display.bounds.2) - i64::from(display.bounds.0),
+                i64::from(display.bounds.3) - i64::from(display.bounds.1),
+                if display.primary { " (primary)" } else { "" }
+            ));
+            self.monitors.push(MonitorSelection::Named(display.device));
+        }
+        if !self.monitors.contains(&self.draft.monitor) {
+            labels.push(format!(
+                "{:?} — unavailable; primary fallback",
+                self.draft.monitor
+            ));
+            self.monitors.push(self.draft.monitor.clone());
+        }
+        items(self.controls[&DISPLAY], &labels);
+        choose(
+            self.controls[&DISPLAY],
+            self.monitors
+                .iter()
+                .position(|v| v == &self.draft.monitor)
+                .unwrap_or(0),
+        );
+        check(self.controls[&FULLSCREEN], self.draft.hide_on_fullscreen);
+        items(
+            self.controls[&ANIMATION],
+            &model::ANIMATION_FEELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        );
+        choose(
+            self.controls[&ANIMATION],
+            model::animation_feel(&self.draft),
+        );
         self.fill_pins(None);
-        self.status("Changes are drafts until Apply. Preview does not save your profile.");
+        self.status(if crate::hosted::is_hosted() {
+            "Windhawk edition — Preview is temporary; Apply saves the shared profile."
+        } else {
+            "Native edition — Preview is temporary; Apply saves your profile."
+        });
     }
     fn fill_pins(&self, selection: Option<usize>) {
         let list = self.controls[&PINS];
@@ -462,6 +529,7 @@ impl PreferencesWindow {
             page: 0,
             themes: Vec::new(),
             heights: Vec::new(),
+            monitors: Vec::new(),
         });
         let dpi = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
         let hwnd = unsafe {
@@ -510,6 +578,7 @@ impl PreferencesWindow {
                 "Bar items",
                 "Pinned applications",
                 "System / readiness",
+                "Behavior / display",
             ]
             .map(str::to_owned),
         );
@@ -570,6 +639,14 @@ impl PreferencesWindow {
             (18, 312, 300, 26),
             WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
         )?;
+        window.child(
+            "BUTTON",
+            "Show Termielle &name",
+            SHOW_NAME,
+            Some(0),
+            (18, 346, 300, 26),
+            WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
+        )?;
         for (label, id, y) in [
             ("&Left items (comma-separated, in order)", LEFT, 74),
             ("&Right items (comma-separated, in order)", RIGHT, 174),
@@ -627,6 +704,36 @@ impl PreferencesWindow {
             window.child("BUTTON", label, id, Some(3), (x, y, 250, 32), WS_TABSTOP)?;
         }
         window.child("STATIC","Windows taskbar and notification-area icons remain available.\nQuick Settings is not tray overflow.\n\nReplacement is not ready for automatic enablement: native tray,\ncustom-bar screen readers, multiple monitors, fullscreen, wake and\nrecording checks still require acceptance.\n\nRecording-safe glass avoids capture-exclusion omissions.\nTurn Off exits fully and persists across logins.\nUse Start > Turn Termielle On to resume; settings are retained.",0,Some(3),(18,210,540,168),WINDOW_STYLE(0))?;
+        for (label, id, y) in [
+            ("&Display", DISPLAY, 70),
+            ("Animation &feel", ANIMATION, 130),
+        ] {
+            window.child(
+                "STATIC",
+                label,
+                0,
+                Some(4),
+                (18, y, 150, 26),
+                WINDOW_STYLE(0),
+            )?;
+            window.child(
+                "COMBOBOX",
+                "",
+                id,
+                Some(4),
+                (175, y - 3, 370, 180),
+                WINDOW_STYLE(CBS_DROPDOWNLIST as u32) | WS_TABSTOP | WS_VSCROLL,
+            )?;
+        }
+        window.child(
+            "BUTTON",
+            "Hide pill in &fullscreen (Island / Notch)",
+            FULLSCREEN,
+            Some(4),
+            (18, 195, 530, 28),
+            WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
+        )?;
+        window.child("STATIC", "Explicit displays apply to Bar, Island and Notch; Classic freely drags.\nUnavailable displays fall back to primary without rewriting the choice.\nWindows may renumber display names after hardware changes.\nFullscreen hiding never changes native taskbar visibility/reservations.\nThe hidden pill parks its animation clock; session events still arrive.\nCustom preserves your existing animation timings and bounce.", 0, Some(4), (18,238,540,132), WINDOW_STYLE(0))?;
         window.child(
             "STATIC",
             "",
@@ -644,6 +751,15 @@ impl PreferencesWindow {
             window.child("BUTTON", label, id, None, (x, 414, 114, 30), WS_TABSTOP)?;
         }
         window.state.fill();
+        if crate::hosted::is_hosted() {
+            // The host's temporary pill view must not rewrite the standalone layout.
+            let _ = unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(
+                    window.state.controls[&LAYOUT],
+                    false,
+                )
+            };
+        }
         window.state.layout(hwnd);
         Ok(window)
     }

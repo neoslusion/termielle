@@ -7,7 +7,7 @@ use termielle_app::{
 use termielle_core::{AppConfig, AppLaunchTarget, PinnedApp};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, PostMessageW, WM_KEYDOWN, WS_EX_NOACTIVATE,
+    GWL_EXSTYLE, GetWindowLongW, PostMessageW, WM_KEYDOWN, WS_EX_NOACTIVATE,
 };
 fn event(window: &mut OverlayWindow) -> WindowEvent {
     window.set_timer(Some(2000)).unwrap();
@@ -22,19 +22,19 @@ fn chooser_keys_route_through_the_native_pump_and_restore_nonactivating_style() 
     std::thread::spawn(|| {
         let mut window = OverlayWindow::create(&AppConfig::default(), true).unwrap();
         assert_ne!(
-            unsafe { GetWindowLongPtrW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as isize,
+            unsafe { GetWindowLongW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as i32,
             0
         );
         window.set_navigation_focus(true);
         assert_eq!(
-            unsafe { GetWindowLongPtrW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as isize,
+            unsafe { GetWindowLongW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as i32,
             0
         );
         unsafe { PostMessageW(Some(window.hwnd()), WM_KEYDOWN, WPARAM(40), LPARAM(0)) }.unwrap();
         assert_eq!(event(&mut window), WindowEvent::NavigationKey(40));
         window.set_navigation_focus(false);
         assert_ne!(
-            unsafe { GetWindowLongPtrW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as isize,
+            unsafe { GetWindowLongW(window.hwnd(), GWL_EXSTYLE) } & WS_EX_NOACTIVATE.0 as i32,
             0
         );
         window.destroy();

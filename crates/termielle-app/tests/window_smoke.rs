@@ -2,8 +2,11 @@ use std::thread;
 use std::time::Duration;
 
 use termielle_app::animation::FrameBuffer;
-use termielle_app::window::OverlayWindow;
+use termielle_app::window::{OverlayWindow, Rect, position_within_work_area};
 use termielle_core::{AppConfig, WindowPosition};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+};
 use windows::Win32::UI::WindowsAndMessaging::{GWL_EXSTYLE, GetWindowLongW, WS_EX_NOACTIVATE};
 
 const RED_PIXEL: [u8; 4] = [0, 0, 255, 255];
@@ -66,10 +69,10 @@ fn window_position_roundtrip_restores_placement() {
 }
 
 #[test]
-fn window_invalid_persisted_position_clamps_to_default() {
+fn window_invalid_persisted_position_clamps_to_available_work_area() {
     let mut fresh = OverlayWindow::create(&AppConfig::default(), true).expect("create window");
     fresh.present(&red_frame(360, 360)).expect("present frame");
-    let (fresh_rect, monitor) = fresh.position();
+    let (_, monitor) = fresh.position();
     fresh.destroy();
 
     let config = AppConfig {
@@ -83,9 +86,33 @@ fn window_invalid_persisted_position_clamps_to_default() {
     let mut bogus = OverlayWindow::create(&config, true).expect("create window");
     bogus.present(&red_frame(360, 360)).expect("present frame");
     let (bogus_rect, _) = bogus.position();
+    // Off-screen coordinates can resolve to a different monitor than a fresh
+    // (0,0) window, notably when a display sits left of primary. The contract is
+    // safe placement in an available work area, not always the primary corner.
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    assert!(
+        unsafe {
+            GetMonitorInfoW(
+                MonitorFromWindow(bogus.hwnd(), MONITOR_DEFAULTTONEAREST),
+                &mut info,
+            )
+        }
+        .as_bool()
+    );
     bogus.destroy();
-
-    assert_eq!(fresh_rect, bogus_rect);
+    assert!(position_within_work_area(
+        (bogus_rect.left, bogus_rect.top),
+        (bogus_rect.width(), bogus_rect.height()),
+        Rect {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom
+        }
+    ));
 }
 
 #[test]

@@ -1,0 +1,21 @@
+[package]
+name = "termielle-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+# Consolidated adapter/runtime for Windhawk 1.7.3's own x86 tool process.
+windhawk-x86 = []
+
+[dependencies]
+termielle-app = { path = "../termielle-app" }
+serde_json.workspace = true
+windows = { workspace = true, features = ["Win32_System_LibraryLoader", "Win32_System_Environment", "Win32_System_RemoteDesktop"] }
+
+[dev-dependencies]
+tempfile.workspace = true
