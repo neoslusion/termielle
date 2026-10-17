@@ -9,15 +9,23 @@ use super::types::{
 use crate::animation::FrameBuffer;
 use termielle_core::VisualState;
 
-const MACCHIATO_SURFACE: [u8; 4] = [79, 58, 54, 232];
-const MACCHIATO_ACTIVE_SURFACE: [u8; 4] = [100, 77, 73, 255];
-const MACCHIATO_BORDER: [u8; 4] = [246, 160, 198, 44];
-const MACCHIATO_TEXT: [u8; 4] = [245, 211, 202, 255];
-const MACCHIATO_MAUVE: [u8; 4] = [246, 160, 198, 255];
-const MACCHIATO_PEACH: [u8; 4] = [127, 169, 245, 255];
-const MACCHIATO_ICON_SIZE: i32 = 18;
+const STATUS_ICON_SIZE: i32 = 18;
 
-fn paint_macchiato_chip(frame: &mut FrameBuffer, x: i32, y: i32, width: u32, height: u32) {
+fn paint_status_chip(
+    frame: &mut FrameBuffer,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    palette: crate::theme::Palette,
+    hover: f32,
+) {
+    let mix = |normal: [u8; 4], active: [u8; 4]| {
+        std::array::from_fn(|index| {
+            (normal[index] as f32 + (active[index] as f32 - normal[index] as f32) * hover).round()
+                as u8
+        })
+    };
     crate::animation::notch::draw_rounded_rect(
         frame,
         x,
@@ -25,8 +33,8 @@ fn paint_macchiato_chip(frame: &mut FrameBuffer, x: i32, y: i32, width: u32, hei
         width,
         height,
         8,
-        MACCHIATO_SURFACE,
-        MACCHIATO_BORDER,
+        mix(palette.surface, palette.raised),
+        mix(palette.border, palette.hover_border),
     );
 }
 
@@ -46,187 +54,192 @@ impl Controller {
         let mut hits = Vec::new();
         // 2. Modules Left: Workspaces + Window Title
         let mut cur_x = bar_x + 12;
-        let macchiato = self.island.theme == "catppuccin-macchiato";
-        let (primary, secondary) = if macchiato {
-            (MACCHIATO_TEXT, MACCHIATO_MAUVE)
-        } else {
-            crate::animation::notch::ink_pair(&self.island.glass)
-        };
+        let palette = crate::theme::Palette::for_bar(&self.island);
+        let styled = matches!(
+            self.island.theme.as_str(),
+            "catppuccin-macchiato" | "macos-dark"
+        );
+        let (primary, secondary) = (palette.primary, palette.secondary);
         // Everything the left zone paints is laid out from the same anchor and
         // dropped, lowest priority first, when the center pill runs out of
         // room. Hidden controls must not keep hit targets either.
         let room = |x: i32, w: u32| x + w as i32 <= left_limit;
-        let apps_enabled = self.bar_module("left", "apps");
 
         let mut grouped_items = false;
-        if apps_enabled || self.island.bar.replace_taskbar {
-            let (app_hits, next_x) = self.paint_navigation_rail(
-                frame,
-                cur_x,
-                pill_y,
-                pill_h,
-                left_limit,
-                metrics.foreground_hwnd,
-            );
-            grouped_items = !app_hits.is_empty();
-            hits.extend(app_hits);
-            cur_x = next_x;
-        } else if self.bar_module("left", "workspaces") {
-            let ws = metrics.workspaces;
-            let mut next_x = cur_x + if macchiato { 4 } else { 0 };
-            let mut slots = Vec::new();
-            for index in 1..=ws.total.min(10) {
-                let slot_w = if macchiato && index == ws.active {
-                    46
-                } else {
-                    28
-                };
-                if !room(next_x, slot_w + if macchiato { 4 } else { 0 }) {
-                    break;
-                }
-                slots.push((index, next_x, slot_w));
-                next_x += slot_w as i32 + if macchiato { 4 } else { 6 };
-            }
-            if macchiato && !slots.is_empty() {
-                crate::animation::notch::draw_rounded_rect(
+        let mut modules: Vec<&str> = self
+            .island
+            .bar
+            .modules_left
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if self.island.bar.replace_taskbar && !modules.contains(&"apps") {
+            modules.insert(0, "apps");
+        }
+        for module in modules {
+            if module == "apps" {
+                let (app_hits, next_x) = self.paint_navigation_rail(
                     frame,
                     cur_x,
                     pill_y,
-                    (next_x - cur_x) as u32,
                     pill_h,
-                    8,
-                    MACCHIATO_SURFACE,
-                    MACCHIATO_BORDER,
+                    left_limit,
+                    metrics.foreground_hwnd,
                 );
-                grouped_items = true;
-            }
-            for (index, slot_x, slot_w) in &slots {
-                let active = *index == ws.active;
-                let (bg, border, text_col) = if macchiato && active {
-                    (MACCHIATO_ACTIVE_SURFACE, [0; 4], MACCHIATO_PEACH)
-                } else if macchiato {
-                    ([0; 4], [0; 4], secondary)
-                } else if active {
-                    ([primary[0], primary[1], primary[2], 28], [0; 4], primary)
-                } else {
-                    ([0; 4], [0; 4], secondary)
-                };
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    *slot_x,
-                    pill_y,
-                    *slot_w,
-                    pill_h,
-                    if macchiato {
-                        7
+                grouped_items = !app_hits.is_empty();
+                hits.extend(app_hits);
+                cur_x = next_x;
+            } else if module == "workspaces" {
+                let ws = metrics.workspaces;
+                let mut next_x = cur_x + if styled { 4 } else { 0 };
+                let mut slots = Vec::new();
+                for index in 1..=ws.total.min(10) {
+                    let slot_w = if styled && index == ws.active { 46 } else { 28 };
+                    if !room(next_x, slot_w + if styled { 4 } else { 0 }) {
+                        break;
+                    }
+                    slots.push((index, next_x, slot_w));
+                    next_x += slot_w as i32 + if styled { 4 } else { 6 };
+                }
+                if styled && !slots.is_empty() {
+                    crate::animation::notch::draw_rounded_rect(
+                        frame,
+                        cur_x,
+                        pill_y,
+                        (next_x - cur_x) as u32,
+                        pill_h,
+                        8,
+                        palette.surface,
+                        palette.border,
+                    );
+                    grouped_items = true;
+                }
+                for (index, slot_x, slot_w) in &slots {
+                    let active = *index == ws.active;
+                    let (bg, border, text_col) = if styled && active {
+                        (palette.raised, [0; 4], palette.accent)
+                    } else if styled {
+                        ([0; 4], [0; 4], secondary)
+                    } else if active {
+                        ([primary[0], primary[1], primary[2], 28], [0; 4], primary)
                     } else {
-                        (*slot_w).min(pill_h) / 2
-                    },
-                    bg,
-                    border,
-                );
-                let icon = if macchiato && active {
-                    metrics.foreground_icon.as_ref()
-                } else {
-                    None
-                };
-                crate::animation::notch::draw_text_in_rect(
-                    frame,
-                    &index.to_string(),
-                    (
+                        ([0; 4], [0; 4], secondary)
+                    };
+                    crate::animation::notch::draw_rounded_rect(
+                        frame,
                         *slot_x,
                         pill_y,
-                        if icon.is_some() { 20 } else { *slot_w },
+                        *slot_w,
                         pill_h,
-                    ),
-                    12,
-                    active,
-                    text_col,
-                    true,
-                );
-                if let Some(icon) = icon {
-                    crate::animation::notch::blit_rounded_pixels(
+                        if styled { 7 } else { (*slot_w).min(pill_h) / 2 },
+                        bg,
+                        border,
+                    );
+                    let icon = if styled && active {
+                        metrics.foreground_icon.as_ref()
+                    } else {
+                        None
+                    };
+                    crate::animation::notch::draw_text_in_rect(
                         frame,
-                        &icon.pixels_pbgra,
-                        icon.width,
-                        icon.height,
-                        *slot_x + 24,
-                        pill_y + (pill_h as i32 - 16) / 2,
-                        16,
-                        16,
-                        4,
+                        &index.to_string(),
+                        (
+                            *slot_x,
+                            pill_y,
+                            if icon.is_some() { 20 } else { *slot_w },
+                            pill_h,
+                        ),
+                        12,
+                        active,
+                        text_col,
+                        true,
+                    );
+                    if let Some(icon) = icon {
+                        crate::animation::notch::blit_rounded_pixels(
+                            frame,
+                            &icon.pixels_pbgra,
+                            icon.width,
+                            icon.height,
+                            *slot_x + 24,
+                            pill_y + (pill_h as i32 - 16) / 2,
+                            16,
+                            16,
+                            4,
+                        );
+                    }
+                    hits.push((
+                        crate::bar::HIT_BAR_WORKSPACE_BASE - *index as isize,
+                        *slot_x,
+                        pill_y,
+                        *slot_w,
+                        pill_h,
+                    ));
+                }
+                if !slots.is_empty() {
+                    cur_x = next_x;
+                }
+            }
+
+            // Window Title
+            if module == "window" && !metrics.window_title.is_empty() {
+                let title_x = cur_x + if grouped_items { 24 } else { 6 };
+                let app_name = crate::media::app_name_from_title(&metrics.window_title);
+                let display_text = if styled && !app_name.is_empty() {
+                    app_name
+                } else if app_name.chars().count() < metrics.window_title.chars().count() {
+                    format!("{} — {}", app_name, metrics.window_title)
+                } else {
+                    metrics.window_title.clone()
+                };
+                // Taskbar style: keep head and tail so a long
+                // `HOST: session` title keeps its distinctive tail.
+                let truncated = ellipsize_middle(&display_text, if styled { 20 } else { 36 });
+                let title_w = (truncated.chars().count() as u32 * 8 + 24)
+                    .clamp(60, if styled { 184 } else { 260 });
+                // Nothing legible fits: the title yields to the fixed zones.
+                let title_w = if room(title_x, title_w) {
+                    title_w
+                } else {
+                    let available = (left_limit - title_x).max(0) as u32;
+                    if available < 60 { 0 } else { available }
+                };
+                if title_w == 0 {
+                    continue;
+                }
+                if grouped_items {
+                    crate::animation::notch::draw_text_in_rect(
+                        frame,
+                        "›",
+                        (cur_x + 7, pill_y, 12, pill_h),
+                        20,
+                        true,
+                        palette.accent,
+                        true,
                     );
                 }
-                hits.push((
-                    crate::bar::HIT_BAR_WORKSPACE_BASE - *index as isize,
-                    *slot_x,
-                    pill_y,
-                    *slot_w,
-                    pill_h,
-                ));
-            }
-            if !slots.is_empty() {
-                cur_x = next_x;
-            }
-        }
 
-        // Window Title
-        if self.bar_module("left", "window") && !metrics.window_title.is_empty() {
-            let title_x = cur_x + if grouped_items { 24 } else { 6 };
-            let app_name = crate::media::app_name_from_title(&metrics.window_title);
-            let display_text = if macchiato && !app_name.is_empty() {
-                app_name
-            } else if app_name.chars().count() < metrics.window_title.chars().count() {
-                format!("{} — {}", app_name, metrics.window_title)
-            } else {
-                metrics.window_title.clone()
-            };
-            // Taskbar style: keep head and tail so a long
-            // `HOST: session` title keeps its distinctive tail.
-            let truncated = ellipsize_middle(&display_text, if macchiato { 20 } else { 36 });
-            let title_w = (truncated.chars().count() as u32 * 8 + 24)
-                .clamp(60, if macchiato { 184 } else { 260 });
-            // Nothing legible fits: the title yields to the fixed zones.
-            let title_w = if room(title_x, title_w) {
-                title_w
-            } else {
-                let available = (left_limit - title_x).max(0) as u32;
-                if available < 60 { 0 } else { available }
-            };
-            if title_w == 0 {
-                return hits;
-            }
-            if grouped_items {
+                crate::animation::notch::draw_rounded_rect(
+                    frame,
+                    title_x,
+                    pill_y,
+                    title_w,
+                    pill_h,
+                    if styled { 8 } else { pill_h / 2 },
+                    if styled { palette.surface } else { [0; 4] },
+                    if styled { palette.border } else { [0; 4] },
+                );
                 crate::animation::notch::draw_text_in_rect(
                     frame,
-                    "›",
-                    (cur_x + 7, pill_y, 12, pill_h),
-                    20,
-                    true,
-                    MACCHIATO_PEACH,
-                    true,
+                    &truncated,
+                    (title_x + 10, pill_y, title_w - 16, pill_h),
+                    12,
+                    false,
+                    primary,
+                    false,
                 );
+                cur_x = title_x + title_w as i32 + 6;
+                grouped_items = false;
             }
-
-            crate::animation::notch::draw_rounded_rect(
-                frame,
-                title_x,
-                pill_y,
-                title_w,
-                pill_h,
-                if macchiato { 8 } else { pill_h / 2 },
-                if macchiato { MACCHIATO_SURFACE } else { [0; 4] },
-                if macchiato { MACCHIATO_BORDER } else { [0; 4] },
-            );
-            crate::animation::notch::draw_text_in_rect(
-                frame,
-                &truncated,
-                (title_x + 10, pill_y, title_w - 16, pill_h),
-                12,
-                false,
-                primary,
-                false,
-            );
         }
 
         hits
@@ -246,237 +259,250 @@ impl Controller {
         bar_x: i32,
         pill_y: i32,
         pill_h: u32,
-    ) -> Vec<BarHit> {
+    ) -> (Vec<BarHit>, Vec<super::hover::Capsule>) {
         use crate::animation::icons;
-        use crate::animation::notch::{draw_text_in_rect, ink_pair};
+        use crate::animation::notch::draw_text_in_rect;
         let mut hits = Vec::new();
-        let macchiato = self.island.theme == "catppuccin-macchiato";
-        let (primary, secondary) = if macchiato {
-            (MACCHIATO_TEXT, MACCHIATO_MAUVE)
-        } else {
-            ink_pair(&self.island.glass)
+        let mut capsules = Vec::new();
+        let palette = crate::theme::Palette::for_bar(&self.island);
+        let mut chip = |frame: &mut FrameBuffer, x, y, width, height| {
+            let capsule = (x, y, width, height);
+            capsules.push(capsule);
+            paint_status_chip(
+                frame,
+                x,
+                y,
+                width,
+                height,
+                palette,
+                self.bar_hover.amount(capsule, self.clock_ms),
+            );
         };
-        let capsule_padding = if macchiato { 6 } else { 0 };
-        let icon_size = if macchiato { MACCHIATO_ICON_SIZE } else { ICON };
-        let clock_icon_size = if macchiato {
-            MACCHIATO_ICON_SIZE
-        } else {
-            CLOCK_ICON
-        };
-        let control_center_icon_size = if macchiato {
-            MACCHIATO_ICON_SIZE
+        let styled = matches!(
+            self.island.theme.as_str(),
+            "catppuccin-macchiato" | "macos-dark"
+        );
+        let (primary, secondary) = (palette.primary, palette.secondary);
+        let capsule_padding = if styled { 6 } else { 0 };
+        let icon_size = if styled { STATUS_ICON_SIZE } else { ICON };
+        let clock_icon_size = if styled { STATUS_ICON_SIZE } else { CLOCK_ICON };
+        let control_center_icon_size = if styled {
+            STATUS_ICON_SIZE
         } else {
             CONTROL_CENTER_W
         };
-        let volume_icon_size = if macchiato {
-            MACCHIATO_ICON_SIZE
-        } else {
-            VOLUME_W
-        };
+        let volume_icon_size = if styled { STATUS_ICON_SIZE } else { VOLUME_W };
         let mut right = width as i32 - bar_x - 12;
-        if self.bar_module("right", "clock") {
-            let capsule_width = CLOCK_W + (clock_icon_size - CLOCK_ICON) + capsule_padding * 2;
-            right -= capsule_width;
-            if macchiato {
-                paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
-            }
-            let content_x = right + capsule_padding;
-            icons::draw_icon(
-                frame,
-                icons::CLOCK,
-                content_x,
-                pill_y + (pill_h as i32 - clock_icon_size) / 2,
-                clock_icon_size as u32,
-                secondary,
-            );
-            draw_text_in_rect(
-                frame,
-                &metrics.time_str,
-                (
-                    content_x + clock_icon_size + ICON_GAP,
-                    pill_y,
-                    CLOCK_TEXT_W,
-                    pill_h,
-                ),
-                12,
-                true,
-                primary,
-                true,
-            );
-            hits.push((
-                crate::app::types::HIT_CARD_NOTIFICATIONS,
-                right,
-                pill_y,
-                capsule_width as u32,
-                pill_h,
-            ));
-            if self.unread_notifications > 0 {
-                crate::animation::notch::draw_rounded_rect(
-                    frame,
-                    right + capsule_width - 8,
-                    pill_y + 3,
-                    5,
-                    5,
-                    3,
-                    secondary,
-                    [0; 4],
-                );
-            }
-            right -= MODULE_GAP;
-        }
-        if self.bar_module("right", "control_center") {
-            // Where macOS puts it: a menu-bar item between the status icons
-            // and the clock, live whether or not a card is open. It used to
-            // live as a glyph inside the pill, which made it unreachable the
-            // moment hovering the pill opened that card.
-            let capsule_width = control_center_icon_size + capsule_padding * 2;
-            right -= capsule_width;
-            if macchiato {
-                paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
-            }
-            icons::draw_icon(
-                frame,
-                icons::ADJUSTMENTS,
-                right + capsule_padding,
-                pill_y + (pill_h as i32 - control_center_icon_size) / 2,
-                control_center_icon_size as u32,
-                primary,
-            );
-            hits.push((
-                crate::app::types::HIT_CARD_PANEL,
-                right - if macchiato { 0 } else { 4 },
-                pill_y,
-                (capsule_width + if macchiato { 0 } else { 8 }) as u32,
-                pill_h,
-            ));
-            right -= MODULE_GAP;
-        }
-        if self.bar_module("right", "battery") {
-            if let Some(percent) = metrics.battery.0 {
-                let capsule_width = BATTERY_W + (icon_size - ICON) + capsule_padding * 2;
-                right -= capsule_width;
-                if macchiato {
-                    paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
+        for module in self.island.bar.modules_right.iter().rev() {
+            let module = module.as_str();
+            match module {
+                "clock" => {
+                    let capsule_width =
+                        CLOCK_W + (clock_icon_size - CLOCK_ICON) + capsule_padding * 2;
+                    right -= capsule_width;
+                    if styled {
+                        chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                    }
+                    let content_x = right + capsule_padding;
+                    icons::draw_icon(
+                        frame,
+                        icons::CLOCK,
+                        content_x,
+                        pill_y + (pill_h as i32 - clock_icon_size) / 2,
+                        clock_icon_size as u32,
+                        secondary,
+                    );
+                    draw_text_in_rect(
+                        frame,
+                        &metrics.time_str,
+                        (
+                            content_x + clock_icon_size + ICON_GAP,
+                            pill_y,
+                            CLOCK_TEXT_W,
+                            pill_h,
+                        ),
+                        12,
+                        true,
+                        primary,
+                        true,
+                    );
+                    hits.push((
+                        crate::app::types::HIT_CARD_NOTIFICATIONS,
+                        right,
+                        pill_y,
+                        capsule_width as u32,
+                        pill_h,
+                    ));
+                    if self.unread_notifications > 0 {
+                        crate::animation::notch::draw_rounded_rect(
+                            frame,
+                            right + capsule_width - 8,
+                            pill_y + 3,
+                            5,
+                            5,
+                            3,
+                            secondary,
+                            [0; 4],
+                        );
+                    }
+                    right -= MODULE_GAP;
                 }
-                let content_x = right + capsule_padding;
-                // Low battery is the one case that outranks the theme's ink,
-                // and charging is the one state worth a different glyph.
-                let ink = if percent <= 20 && !metrics.battery.1 {
-                    [85, 85, 240, 255]
-                } else {
-                    primary
-                };
-                draw_text_in_rect(
-                    frame,
-                    &format!("{percent}%"),
-                    (content_x, pill_y, VALUE_W, pill_h),
-                    13,
-                    true,
-                    ink,
-                    true,
-                );
-                icons::draw_icon(
-                    frame,
-                    if metrics.battery.1 {
-                        icons::BATTERY_CHARGING
+                "control_center" => {
+                    // Where macOS puts it: a menu-bar item between the status icons
+                    // and the clock, live whether or not a card is open. It used to
+                    // live as a glyph inside the pill, which made it unreachable the
+                    // moment hovering the pill opened that card.
+                    let capsule_width = control_center_icon_size + capsule_padding * 2;
+                    right -= capsule_width;
+                    if styled {
+                        chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                    }
+                    icons::draw_icon(
+                        frame,
+                        icons::ADJUSTMENTS,
+                        right + capsule_padding,
+                        pill_y + (pill_h as i32 - control_center_icon_size) / 2,
+                        control_center_icon_size as u32,
+                        primary,
+                    );
+                    hits.push((
+                        crate::app::types::HIT_CARD_PANEL,
+                        right - if styled { 0 } else { 4 },
+                        pill_y,
+                        (capsule_width + if styled { 0 } else { 8 }) as u32,
+                        pill_h,
+                    ));
+                    right -= MODULE_GAP;
+                }
+                "battery" => {
+                    if let Some(percent) = metrics.battery.0 {
+                        let capsule_width = BATTERY_W + (icon_size - ICON) + capsule_padding * 2;
+                        right -= capsule_width;
+                        if styled {
+                            chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                        }
+                        let content_x = right + capsule_padding;
+                        // Low battery is the one case that outranks the theme's ink,
+                        // and charging is the one state worth a different glyph.
+                        let ink = if percent <= 20 && !metrics.battery.1 {
+                            [85, 85, 240, 255]
+                        } else {
+                            primary
+                        };
+                        draw_text_in_rect(
+                            frame,
+                            &format!("{percent}%"),
+                            (content_x, pill_y, VALUE_W, pill_h),
+                            13,
+                            true,
+                            ink,
+                            true,
+                        );
+                        icons::draw_icon(
+                            frame,
+                            if metrics.battery.1 {
+                                icons::BATTERY_CHARGING
+                            } else {
+                                icons::BATTERY
+                            },
+                            content_x + VALUE_W as i32 + ICON_GAP,
+                            pill_y + (pill_h as i32 - icon_size) / 2,
+                            icon_size as u32,
+                            ink,
+                        );
+                        right -= MODULE_GAP;
+                    }
+                }
+                "volume" => {
+                    let capsule_width = volume_icon_size + capsule_padding * 2;
+                    right -= capsule_width;
+                    if styled {
+                        chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                    }
+                    icons::draw_icon(
+                        frame,
+                        if metrics.volume.muted {
+                            icons::VOLUME_MUTED
+                        } else {
+                            icons::VOLUME
+                        },
+                        right + capsule_padding,
+                        pill_y + (pill_h as i32 - volume_icon_size) / 2,
+                        volume_icon_size as u32,
+                        primary,
+                    );
+                    hits.push((
+                        crate::bar::HIT_BAR_VOLUME_TOGGLE,
+                        right - if styled { 0 } else { 4 },
+                        pill_y,
+                        (capsule_width + if styled { 0 } else { 8 }) as u32,
+                        pill_h,
+                    ));
+                    right -= MODULE_GAP;
+                }
+                "network" => {
+                    let capsule_width = icon_size + capsule_padding * 2;
+                    right -= capsule_width;
+                    if styled {
+                        chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                    }
+                    let ink = match metrics.connectivity.network {
+                        crate::bar::connectivity::NetworkState::Online => primary,
+                        crate::bar::connectivity::NetworkState::Limited => [120, 185, 245, 255],
+                        _ => secondary,
+                    };
+                    icons::draw_icon(
+                        frame,
+                        icons::WIFI,
+                        right + capsule_padding,
+                        pill_y + (pill_h as i32 - icon_size) / 2,
+                        icon_size as u32,
+                        ink,
+                    );
+                    hits.push((
+                        crate::bar::shell::ShellAction::Network.hit_id(),
+                        right,
+                        pill_y,
+                        capsule_width as u32,
+                        pill_h,
+                    ));
+                    right -= MODULE_GAP;
+                }
+                "memory" | "cpu" => {
+                    let (icon, value) = if module == "memory" {
+                        (icons::MEMORY, metrics.memory_pct)
                     } else {
-                        icons::BATTERY
-                    },
-                    content_x + VALUE_W as i32 + ICON_GAP,
-                    pill_y + (pill_h as i32 - icon_size) / 2,
-                    icon_size as u32,
-                    ink,
-                );
-                right -= MODULE_GAP;
-            }
-        }
-        if self.bar_module("right", "volume") {
-            let capsule_width = volume_icon_size + capsule_padding * 2;
-            right -= capsule_width;
-            if macchiato {
-                paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
-            }
-            icons::draw_icon(
-                frame,
-                if metrics.volume.muted {
-                    icons::VOLUME_MUTED
-                } else {
-                    icons::VOLUME
-                },
-                right + capsule_padding,
-                pill_y + (pill_h as i32 - volume_icon_size) / 2,
-                volume_icon_size as u32,
-                primary,
-            );
-            hits.push((
-                crate::bar::HIT_BAR_VOLUME_TOGGLE,
-                right - if macchiato { 0 } else { 4 },
-                pill_y,
-                (capsule_width + if macchiato { 0 } else { 8 }) as u32,
-                pill_h,
-            ));
-            right -= MODULE_GAP;
-        }
-        if self.bar_module("right", "network") {
-            let capsule_width = icon_size + capsule_padding * 2;
-            right -= capsule_width;
-            if macchiato {
-                paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
-            }
-            let ink = match metrics.connectivity.network {
-                crate::bar::connectivity::NetworkState::Online => primary,
-                crate::bar::connectivity::NetworkState::Limited => [120, 185, 245, 255],
-                _ => secondary,
-            };
-            icons::draw_icon(
-                frame,
-                icons::WIFI,
-                right + capsule_padding,
-                pill_y + (pill_h as i32 - icon_size) / 2,
-                icon_size as u32,
-                ink,
-            );
-            hits.push((
-                crate::bar::shell::ShellAction::Network.hit_id(),
-                right,
-                pill_y,
-                capsule_width as u32,
-                pill_h,
-            ));
-            right -= MODULE_GAP;
-        }
-        for (module, icon, value) in [
-            ("memory", icons::MEMORY, metrics.memory_pct),
-            ("cpu", icons::CPU, metrics.cpu_pct),
-        ] {
-            if self.bar_module("right", module) {
-                let capsule_width = METRIC_W + (icon_size - ICON) + capsule_padding * 2;
-                right -= capsule_width;
-                if macchiato {
-                    paint_macchiato_chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                        (icons::CPU, metrics.cpu_pct)
+                    };
+                    let capsule_width = METRIC_W + (icon_size - ICON) + capsule_padding * 2;
+                    right -= capsule_width;
+                    if styled {
+                        chip(frame, right, pill_y, capsule_width as u32, pill_h);
+                    }
+                    let content_x = right + capsule_padding;
+                    icons::draw_icon(
+                        frame,
+                        icon,
+                        content_x,
+                        pill_y + (pill_h as i32 - icon_size) / 2,
+                        icon_size as u32,
+                        secondary,
+                    );
+                    draw_text_in_rect(
+                        frame,
+                        &format!("{value}%"),
+                        (content_x + icon_size + ICON_GAP, pill_y, VALUE_W, pill_h),
+                        13,
+                        true,
+                        primary,
+                        true,
+                    );
+                    right -= MODULE_GAP;
                 }
-                let content_x = right + capsule_padding;
-                icons::draw_icon(
-                    frame,
-                    icon,
-                    content_x,
-                    pill_y + (pill_h as i32 - icon_size) / 2,
-                    icon_size as u32,
-                    secondary,
-                );
-                draw_text_in_rect(
-                    frame,
-                    &format!("{value}%"),
-                    (content_x + icon_size + ICON_GAP, pill_y, VALUE_W, pill_h),
-                    13,
-                    true,
-                    primary,
-                    true,
-                );
-                right -= MODULE_GAP;
+                _ => {}
             }
         }
-        hits
+        (hits, capsules)
     }
 
     /// Bar zone 4 (center): the resting island pill, or the expanded card
@@ -542,7 +568,9 @@ impl Controller {
                     && !self.island_card_open()
                     && self.alerts.is_empty()
                     && self.volume_feedback_deadline.is_some_and(|at| now_ms < at);
-                let face_sz = if volume_feedback {
+                let bar_media =
+                    self.media_available() && state == VisualState::Idle && !volume_feedback;
+                let face_sz = if volume_feedback || bar_media {
                     0
                 } else if self.island.has_widget("face") {
                     let face_sz = (pill_h - 4).min(22);
@@ -573,6 +601,12 @@ impl Controller {
                     self.paint_bar_volume_feedback(
                         compact_frame,
                         (pill_cx, local_pill_y, pill_w, pill_h),
+                    );
+                } else if bar_media {
+                    self.paint_bar_media(
+                        compact_frame,
+                        (pill_cx, local_pill_y, pill_w, pill_h),
+                        now_ms,
                     );
                 } else {
                     let (label, bold, status) = self.bar_center_label(state);
@@ -684,9 +718,6 @@ impl Controller {
             self.icon_hits.retain_mut(|hit| {
                 hit.1 += content_x;
                 hit.2 += card.island_y;
-                if !crate::app::activity::SessionActivity::is_hit(hit.0) {
-                    return card.progress >= 0.98;
-                }
                 let x0 = hit.1.max(card.island_x);
                 let y0 = hit.2.max(card.island_y);
                 let x1 = (hit.1 + hit.3 as i32).min(card.island_x + card.island_w as i32);

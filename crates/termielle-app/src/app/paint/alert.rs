@@ -24,10 +24,25 @@ fn alert_copy(alert: &AlertBanner, show_name: bool) -> (&str, &str, &str) {
             (source, headline, "")
         }
         AlertKind::System => {
-            let (source, body) = alert
-                .subtitle
-                .split_once(": ")
-                .unwrap_or((alert.subtitle.as_str(), ""));
+            let (source, body) =
+                if !alert.source.trim().is_empty() && alert.source != alert.kind.label() {
+                    let source = alert.source.as_str();
+                    let body = if alert.subtitle == source {
+                        ""
+                    } else {
+                        alert
+                            .subtitle
+                            .strip_prefix(source)
+                            .and_then(|body| body.strip_prefix(": "))
+                            .unwrap_or(&alert.subtitle)
+                    };
+                    (source, body)
+                } else {
+                    alert
+                        .subtitle
+                        .split_once(": ")
+                        .unwrap_or((alert.subtitle.as_str(), ""))
+                };
             let source = if source.trim().is_empty() {
                 "Notification"
             } else {
@@ -55,13 +70,31 @@ impl Controller {
         let Some(alert) = self.alerts.front() else {
             return false;
         };
-        self.icon_hits
-            .push((HIT_ALERT_DISMISS, 0, 0, width, height));
-
         let (source, headline, detail) = alert_copy(alert, island.show_name);
         let accent = alert.accent;
+        let palette = crate::theme::Palette::for_island(island);
+        let close_x = width as i32 - 44;
+        draw_rounded_rect(
+            frame,
+            close_x,
+            9,
+            28,
+            28,
+            14,
+            palette.surface,
+            palette.border,
+        );
+        draw_text_in_rect(
+            frame,
+            "×",
+            (close_x, 9, 28, 28),
+            16,
+            false,
+            palette.primary,
+            true,
+        );
         let avatar_x = 16;
-        let avatar_y = 27;
+        let avatar_y = 42;
         draw_rounded_rect(
             frame,
             avatar_x,
@@ -69,8 +102,8 @@ impl Controller {
             40,
             40,
             12,
-            [accent[0], accent[1], accent[2], 78],
-            [accent[0], accent[1], accent[2], 115],
+            [accent[0], accent[1], accent[2], 42],
+            [accent[0], accent[1], accent[2], 65],
         );
         if alert.kind == AlertKind::Agent && island.has_widget("face") {
             blit_rounded(
@@ -93,51 +126,108 @@ impl Controller {
                 frame,
                 &initial,
                 (avatar_x, avatar_y, 40, 40),
-                18,
+                19,
                 true,
-                self.ink(),
+                palette.primary,
                 true,
             );
         }
-
         let text_x = 68;
         let text_w = width.saturating_sub(text_x as u32 + 18);
-        let (source_y, headline_y) = if detail.is_empty() {
-            (28, 47)
-        } else {
-            (17, 36)
-        };
-        let source_label = if alert.kind == AlertKind::Agent {
-            let mut characters = source.chars();
-            let first = characters.next().unwrap_or('T');
-            first.to_uppercase().collect::<String>() + characters.as_str()
-        } else {
-            source.to_owned()
-        };
         draw_text(
             frame,
-            &source_label,
+            source,
             text_x,
-            source_y,
-            text_w,
-            11,
+            19,
+            text_w.saturating_sub(30),
+            10,
             true,
-            accent,
+            palette.secondary,
         );
-        draw_text(
-            frame,
-            headline,
-            text_x,
-            headline_y,
-            text_w,
-            16,
-            true,
-            self.ink(),
-        );
-        if !detail.is_empty() {
-            draw_text(frame, detail, text_x, 58, text_w, 12, false, self.ink_dim());
+        for (index, line) in
+            crate::animation::text_layout::lines(headline, text_w, 16, true, frame.scale, 2)
+                .iter()
+                .enumerate()
+        {
+            draw_text(
+                frame,
+                line,
+                text_x,
+                42 + index as i32 * 21,
+                text_w,
+                16,
+                true,
+                palette.primary,
+            );
         }
-
+        for (index, line) in
+            crate::animation::text_layout::lines(detail, text_w, 12, false, frame.scale, 2)
+                .iter()
+                .enumerate()
+        {
+            draw_text(
+                frame,
+                line,
+                text_x,
+                87 + index as i32 * 15,
+                text_w,
+                12,
+                false,
+                palette.secondary,
+            );
+        }
+        let footer_y = height.saturating_sub(32) as i32;
+        if island.is_bar() {
+            let button_w = text_w.min(126);
+            draw_rounded_rect(
+                frame,
+                text_x,
+                footer_y,
+                button_w,
+                24,
+                8,
+                palette.surface,
+                palette.border,
+            );
+            draw_text_in_rect(
+                frame,
+                "View history",
+                (text_x, footer_y, button_w, 24),
+                10,
+                true,
+                palette.primary,
+                true,
+            );
+            self.icon_hits.push((
+                super::super::types::HIT_CARD_NOTIFICATIONS,
+                text_x,
+                footer_y,
+                button_w,
+                24,
+            ));
+        } else {
+            draw_text(
+                frame,
+                "Click to dismiss",
+                text_x,
+                footer_y + 6,
+                text_w,
+                10,
+                false,
+                palette.secondary,
+            );
+        }
+        if self.alerts.len() > 1 {
+            draw_text_in_rect(
+                frame,
+                &format!("+{} queued", self.alerts.len() - 1),
+                (width as i32 - 100, footer_y, 82, 24),
+                10,
+                false,
+                palette.secondary,
+                true,
+            );
+        }
         let remaining = match (alert.duration_ms, alert.expires_at_ms) {
             (0, _) | (_, None) => 0.0,
             (duration, Some(expires_at)) => {
@@ -145,10 +235,21 @@ impl Controller {
             }
         }
         .clamp(0.0, 1.0);
-        let track_w = width.saturating_sub(text_x as u32 + 18);
-        let track_y = height as i32 - 8;
-        fill_rect_pub(frame, text_x, track_y, track_w, 1, [255, 255, 255, 18]);
-        let fill_w = (track_w as f32 * remaining).round() as u32;
+        let track_y = height as i32 - 5;
+        fill_rect_pub(
+            frame,
+            text_x,
+            track_y,
+            text_w,
+            1,
+            [
+                palette.primary[0],
+                palette.primary[1],
+                palette.primary[2],
+                18,
+            ],
+        );
+        let fill_w = (text_w as f32 * remaining).round() as u32;
         if fill_w > 0 {
             fill_rect_pub(
                 frame,
@@ -156,9 +257,11 @@ impl Controller {
                 track_y,
                 fill_w,
                 1,
-                [accent[0], accent[1], accent[2], 120],
+                [accent[0], accent[1], accent[2], 140],
             );
         }
+        self.icon_hits
+            .push((HIT_ALERT_DISMISS, 0, 0, width, height));
         true
     }
 }
@@ -169,6 +272,7 @@ mod tests {
 
     fn banner(kind: AlertKind, title: &str, subtitle: &str) -> AlertBanner {
         AlertBanner {
+            source: kind.label().into(),
             title: title.into(),
             subtitle: subtitle.into(),
             accent: [0; 4],
@@ -195,6 +299,21 @@ mod tests {
         assert_eq!(
             alert_copy(&unnamed, false),
             ("Agent", "Needs your input", "")
+        );
+    }
+
+    #[test]
+    fn explicit_source_is_not_mistaken_for_a_colon_in_the_body() {
+        let mut alert = banner(AlertKind::System, "Review ready", "CI: All tests pass");
+        alert.source = "Messages".into();
+        assert_eq!(
+            alert_copy(&alert, false),
+            ("Messages", "Review ready", "CI: All tests pass")
+        );
+        alert.subtitle = "Messages: CI: All tests pass".into();
+        assert_eq!(
+            alert_copy(&alert, false),
+            ("Messages", "Review ready", "CI: All tests pass")
         );
     }
 

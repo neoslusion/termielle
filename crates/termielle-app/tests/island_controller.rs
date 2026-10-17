@@ -278,6 +278,7 @@ fn set_task_update_repaints_only_when_visible() {
             app: "player".into(),
             playing: true,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -485,7 +486,7 @@ fn island_notification_alert_expands_and_expires() {
 
     // Island auto-expands in both dimensions to show the notification alert
     assert!(c.current_frame().width >= 320);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
 
     // After 3500ms, alert expires and if state goes idle, collapses back
     c.on_timer(13600);
@@ -651,6 +652,9 @@ fn alert_countdown_stops_once_the_banner_is_gone() {
         "a visible banner schedules its countdown"
     );
 
+    for tick in (10_032..=10_192).step_by(16) {
+        c.on_timer(tick);
+    }
     assert_eq!(c.handle_click(10, 10, 10_200), ClickOutcome::AlertDismiss);
     // Leave the input-pulse state, then let the dismiss morph and the ready
     // hold run out, so the countdown is the only thing left that could keep
@@ -728,6 +732,7 @@ fn island_compact_media_sizing() {
             app: "Spotify".into(),
             playing: true,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -808,6 +813,7 @@ fn split_island_two_blobs_when_agent_and_media_both_live() {
             app: "Player".into(),
             playing: true,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -855,6 +861,7 @@ fn paused_media_stays_visible_and_can_resume() {
             app: "Player".into(),
             playing: true,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -868,6 +875,7 @@ fn paused_media_stays_visible_and_can_resume() {
             app: "Player".into(),
             playing: false,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -908,6 +916,7 @@ fn media_arriving_during_compact_morph_retargets_the_active_spring() {
             app: "Player".into(),
             playing: true,
             thumbnail: None,
+            timeline: None,
         }),
         tasks: Vec::new(),
         backdrop: None,
@@ -932,7 +941,7 @@ fn duplicate_critical_events_do_not_requeue_an_alert() {
         let mut c =
             Controller::new_with_island(5000, 60000, catalog(), true, None, island_140_320());
         c.handle_event(event("s1", kind, 10000), 10000);
-        assert_eq!(c.current_frame().height, 96);
+        assert_eq!(c.current_frame().height, 148);
         assert_eq!(
             c.handle_click(10, 10, 10100),
             termielle_app::app::ClickOutcome::AlertDismiss
@@ -1197,7 +1206,7 @@ fn critical_agent_alert_yields_back_to_a_deferred_system_toast() {
     );
     assert_eq!(
         c.current_frame().height,
-        96,
+        148,
         "the preempted system toast must resume in front"
     );
 }
@@ -1223,7 +1232,7 @@ fn alert_freshness_boundary_still_banners() {
     c.handle_event(event("s1", EventKind::NeedsInput, 10000), 70000);
     c.on_timer(70200);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
 }
 
 #[test]
@@ -1234,7 +1243,7 @@ fn alert_queue_plays_second_banner_after_first_expires() {
     c.handle_event(event("s2", EventKind::NeedsInput, 10400), 10400);
     c.on_timer(10600);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
     let first = c.current_frame().pixels_pbgra.clone();
 
     // Past the first banner's 3.5 s life the second takes over instead of
@@ -1242,7 +1251,7 @@ fn alert_queue_plays_second_banner_after_first_expires() {
     c.on_timer(13600);
     c.on_timer(13700);
     assert_eq!(c.current_frame().width, 320);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
     assert_ne!(
         c.current_frame().pixels_pbgra,
         first,
@@ -1267,11 +1276,11 @@ fn queued_alert_timeout_starts_when_it_reaches_the_front() {
     // The first banner owns the screen until 13.5 s. The second then receives
     // its own full 3.5 s lifetime rather than silently aging out in queue.
     c.on_timer(13600);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
     c.on_timer(16400);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
     c.on_timer(16900);
-    assert_eq!(c.current_frame().height, 96);
+    assert_eq!(c.current_frame().height, 148);
     c.on_timer(17500);
     assert_eq!(c.current_frame().height, 36);
 }
@@ -1484,7 +1493,7 @@ fn bar_layout_sizing_and_interaction() {
     let (exp_w, exp_h) = c.target_size(termielle_core::VisualState::Idle);
     assert_eq!(exp_w, 1920);
     assert_eq!(
-        exp_h, 206,
+        exp_h, 266,
         "Today popup includes a transparent six-pixel breathing gap"
     );
 

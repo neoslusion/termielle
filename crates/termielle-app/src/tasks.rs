@@ -7,6 +7,7 @@
 //! Island — not a window switcher.
 
 use crate::win32_ptr::{class_long_ptr as GetClassLongPtrW, window_long_ptr as GetWindowLongPtrW};
+pub mod transport;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Edge length of a decoded media artwork thumbnail, in pixels (high-resolution).
-pub const ICON_PX: u32 = 64;
+pub const ICON_PX: u32 = 160;
 
 /// Edge length of a decoded window task icon, in pixels. Larger than any
 /// display size (tiles show at <= 24 logical px), so dashboard icons stay
@@ -78,40 +79,67 @@ pub struct MediaInfo {
     /// Decoded artwork thumbnail (premultiplied BGRA), when the source
     /// exposes one. None on decode failure or absent artwork.
     pub thumbnail: Option<ThumbBitmap>,
+    pub timeline: Option<MediaTimeline>,
 }
 
-/// Toggles play/pause on the system's active media session via the
-/// standard multimedia key. Works for any SMTC source (YouTube in a
-/// browser, Spotify, media players) without touching that app directly.
-pub fn toggle_media_playback() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MEDIA_PLAY_PAUSE, keybd_event,
-    };
-    unsafe {
-        keybd_event(VK_MEDIA_PLAY_PAUSE.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_MEDIA_PLAY_PAUSE.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MediaTimeline {
+    pub position_ms: u64,
+    pub duration_ms: u64,
+}
+
+impl MediaTimeline {
+    fn from_ticks(start: i64, end: i64, position: i64) -> Option<Self> {
+        let duration = end.checked_sub(start)?;
+        if duration < 10_000 {
+            return None;
+        }
+        let offset = position.saturating_sub(start).clamp(0, duration);
+        Some(Self {
+            position_ms: (offset / 10_000) as u64,
+            duration_ms: (duration / 10_000) as u64,
+        })
     }
 }
 
-/// Skips to the next track on the system's active media session.
-pub fn media_next_track() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MEDIA_NEXT_TRACK, keybd_event,
-    };
-    unsafe {
-        keybd_event(VK_MEDIA_NEXT_TRACK.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_MEDIA_NEXT_TRACK.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-    }
-}
+#[cfg(test)]
+mod timeline_tests {
+    use super::MediaTimeline;
 
-/// Skips to the previous track on the system's active media session.
-pub fn media_prev_track() {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MEDIA_PREV_TRACK, keybd_event,
-    };
-    unsafe {
-        keybd_event(VK_MEDIA_PREV_TRACK.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_MEDIA_PREV_TRACK.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    #[test]
+    fn media_timestamps_are_relative_and_clamped() {
+        assert_eq!(
+            MediaTimeline::from_ticks(50_000, 150_000, 90_000),
+            Some(MediaTimeline {
+                position_ms: 4,
+                duration_ms: 10
+            })
+        );
+        assert_eq!(
+            MediaTimeline::from_ticks(50_000, 150_000, i64::MIN)
+                .unwrap()
+                .position_ms,
+            0
+        );
+        assert_eq!(
+            MediaTimeline::from_ticks(50_000, 150_000, i64::MAX)
+                .unwrap()
+                .position_ms,
+            10
+        );
+        assert_eq!(
+            MediaTimeline::from_ticks(i64::MIN, i64::MIN + 20_000, i64::MAX)
+                .unwrap()
+                .position_ms,
+            2
+        );
+    }
+
+    #[test]
+    fn invalid_or_unknown_media_duration_has_no_progress() {
+        for (start, end) in [(0, 0), (10, 0), (0, 9_999), (i64::MIN, i64::MAX)] {
+            assert!(MediaTimeline::from_ticks(start, end, 0).is_none());
+        }
     }
 }
 
@@ -183,6 +211,7 @@ pub struct WorkerConfig {
     pub enabled: AtomicBool,
     /// When true, SMTC media metadata and artwork are refreshed.
     pub poll_media: AtomicBool,
+    pub refresh_media: AtomicBool,
     /// When true, window metadata is enumerated for switching/session links.
     pub poll_tasks: AtomicBool,
     /// Only the app rail/task switcher needs expensive window artwork.
@@ -194,6 +223,7 @@ impl WorkerConfig {
         Self {
             enabled: AtomicBool::new(enabled),
             poll_media: AtomicBool::new(poll_media),
+            refresh_media: AtomicBool::new(false),
             poll_tasks: AtomicBool::new(poll_tasks),
             poll_task_icons: AtomicBool::new(poll_task_icons),
         }
@@ -333,8 +363,9 @@ pub fn spawn_worker(
                 // Expensive polls stay on their own cadences and only publish
                 // when their observable snapshot changed.
                 let should_poll_media = config.poll_media.load(Ordering::Relaxed);
-                let media_due =
-                    should_poll_media && now_ms.saturating_sub(last_media_ms) >= MEDIA_REFRESH_MS;
+                let media_due = should_poll_media
+                    && (config.refresh_media.swap(false, Ordering::Relaxed)
+                        || now_ms.saturating_sub(last_media_ms) >= MEDIA_REFRESH_MS);
                 let mut media_changed = false;
                 if media_due {
                     last_media_ms = now_ms;
@@ -437,6 +468,13 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
         |op| op.GetResults(),
     )?;
     let thumbnail = decode_media_thumbnail(&props).unwrap_or(None);
+    let timeline = session.GetTimelineProperties().ok().and_then(|timeline| {
+        MediaTimeline::from_ticks(
+            timeline.StartTime().ok()?.Duration,
+            timeline.EndTime().ok()?.Duration,
+            timeline.Position().ok()?.Duration,
+        )
+    });
     Ok(Some(MediaInfo {
         title: props.Title()?.to_string(),
         artist: props.Artist()?.to_string(),
@@ -446,6 +484,7 @@ fn current_media_inner() -> windows::core::Result<Option<MediaInfo>> {
             .unwrap_or_default(),
         playing: status == Playback::Playing,
         thumbnail,
+        timeline,
     }))
 }
 

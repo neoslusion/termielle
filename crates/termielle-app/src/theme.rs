@@ -9,6 +9,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use termielle_core::{GlassConfig, IslandConfig};
 
+mod palette;
+pub(crate) use palette::Palette;
+
 /// A theme file on disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -75,6 +78,13 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
             "transparent" => ([30, 30, 30, 70], 0, 20, 24, 18),
             "midnight" => ([12, 18, 32, 205], 28, 28, 50, 80),
             "catppuccin-macchiato" => ([58, 39, 36, 224], 12, 34, 52, 48),
+            "macos-dark" => (
+                [38, 38, 40, if transparency { 220 } else { 255 }],
+                18,
+                26,
+                34,
+                if transparency { 48 } else { 0 },
+            ),
             _ => (
                 [30, 22, 18, if transparency { 190 } else { 255 }],
                 12,
@@ -173,8 +183,15 @@ pub fn resolve_theme(config: &mut IslandConfig) {
 /// Liquid Dark, Light, Midnight, or Transparent actually changes the bar.
 /// Direct config edits still retain their explicit glass values.
 pub fn select_theme(config: &mut IslandConfig, name: &str) {
+    let backdrop = config.glass.backdrop;
+    let blur_radius = config.glass.blur_radius;
     config.theme = name.to_owned();
     config.glass = GlassConfig::default();
+    config.glass.use_theme_material = true;
+    config.glass.backdrop = backdrop;
+    if backdrop != termielle_core::BackdropMode::Theme {
+        config.glass.blur_radius = blur_radius;
+    }
     resolve_theme(config);
 }
 
@@ -189,7 +206,8 @@ fn resolve_theme_with_roots(config: &mut IslandConfig, roots: &[PathBuf]) {
         user.border_alpha != default.border_alpha,
         user.highlight_alpha != default.highlight_alpha,
         user.shadow_alpha != default.shadow_alpha,
-    ];
+    ]
+    .map(|explicit| explicit && !user.use_theme_material);
 
     // First apply builtin preset for theme name so missing fields get defaults
     apply_theme(config, &config.theme.clone());
@@ -241,6 +259,17 @@ fn resolve_theme_with_roots(config: &mut IslandConfig, roots: &[PathBuf]) {
     if overrides[4] {
         config.glass.shadow_alpha = user.shadow_alpha;
     }
+    match user.backdrop {
+        termielle_core::BackdropMode::Theme => {}
+        termielle_core::BackdropMode::Frosted => {
+            config.glass.blur_radius = if user.blur_radius > 0 {
+                user.blur_radius
+            } else {
+                config.glass.blur_radius.max(default.blur_radius)
+            };
+        }
+        termielle_core::BackdropMode::RecordingSafe => config.glass.blur_radius = 0,
+    }
 
     config.glass.clamp();
     config.clamp();
@@ -267,6 +296,21 @@ mod tests {
         assert_eq!(config.glass.tint, [58, 39, 36, 224]);
     }
     #[test]
+    fn macos_selection_resets_previous_material_and_resolves_without_a_file() {
+        let mut config = IslandConfig {
+            theme: "transparent".into(),
+            ..Default::default()
+        };
+        apply_theme(&mut config, "transparent");
+        select_theme(&mut config, "macos-dark");
+        assert_eq!(config.theme, "macos-dark");
+        assert_eq!(config.glass.tint[..3], [38, 38, 40]);
+        assert_eq!(config.glass.blur_radius, 18);
+        let selected = config.clone();
+        resolve_theme_with_roots(&mut config, &[]);
+        assert_eq!(config.glass, selected.glass);
+    }
+    #[test]
     fn tray_selection_clears_stale_explicit_glass() {
         let mut c = IslandConfig {
             theme: "transparent".into(),
@@ -281,6 +325,31 @@ mod tests {
         assert_eq!(c.theme, "midnight");
         assert_eq!(c.glass.tint, [12, 18, 32, 205]);
         assert_eq!(c.glass.blur_radius, 28);
+    }
+
+    #[test]
+    fn selected_auto_refreshes_derived_material_but_preserves_explicit_backdrop_mode() {
+        let mut config = IslandConfig::default();
+        select_theme(&mut config, "auto");
+        let expected = config.glass.clone();
+        config.glass.tint = [81, 92, 103, 144];
+        config.glass.border_alpha = 71;
+        config.glass.highlight_alpha = 92;
+        config.glass.shadow_alpha = 81;
+        config.glass.blur_radius = 30;
+        resolve_theme_with_roots(&mut config, &[]);
+        assert_eq!(config.glass, expected);
+        config.glass.backdrop = termielle_core::BackdropMode::RecordingSafe;
+        config.glass.blur_radius = 0;
+        config.glass.tint = [243, 243, 243, 230];
+        resolve_theme_with_roots(&mut config, &[]);
+        assert_eq!(config.glass.tint, expected.tint);
+        assert_eq!(config.glass.blur_radius, 0);
+        config.glass.backdrop = termielle_core::BackdropMode::Frosted;
+        config.glass.blur_radius = 12;
+        resolve_theme_with_roots(&mut config, &[]);
+        assert_eq!(config.glass.tint, expected.tint);
+        assert_eq!(config.glass.blur_radius, 12);
     }
 
     #[test]

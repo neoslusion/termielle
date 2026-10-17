@@ -12,7 +12,7 @@ pub use config::{
 };
 pub use event_log::{DEFAULT_EVENT_LOG_MAX_BYTES, EventLog, EventLogError};
 pub use island::{
-    BarConfig, BarPosition, GlassConfig, IslandConfig, IslandGeometry, IslandLayout,
+    BackdropMode, BarConfig, BarPosition, GlassConfig, IslandConfig, IslandGeometry, IslandLayout,
     MonitorSelection, SpringParams, bar_anchored_position, island_anchored_position, spring_params,
 };
 pub use protocol::{

@@ -1,4 +1,9 @@
-use super::{catalog, model::Model, paint};
+use super::{
+    catalog, files,
+    model::{Model, Target},
+    paint,
+};
+use crate::animation::transition::Transition;
 use crate::win32_ptr::{
     set_window_long_ptr as SetWindowLongPtrW, window_long_ptr as GetWindowLongPtrW,
 };
@@ -32,25 +37,28 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     EN_CHANGE, ES_AUTOHSCROLL, GWLP_USERDATA, GetForegroundWindow, GetParent, GetWindowTextLengthW,
-    GetWindowTextW, IDC_ARROW, LoadCursorW, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowPos,
-    SetWindowTextW, ShowWindow, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLOREDIT, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_IME_ENDCOMPOSITION,
+    GetWindowTextW, IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassW,
+    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowTextW,
+    ShowWindow, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_IME_ENDCOMPOSITION,
     WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
-    WS_VISIBLE,
+    WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
 const UPDATE_MSG: u32 = WM_APP + 101;
 const OPEN_MSG: u32 = WM_APP + 102;
 const HOTKEY_ID: i32 = 101;
+const MOTION_TIMER: usize = 103;
 static CLASS: OnceLock<Result<u16, u32>> = OnceLock::new();
 
 enum Update {
     Catalog(windows::core::Result<Vec<super::model::App>>),
     Icons(Vec<(Vec<u8>, Option<Arc<crate::animation::FrameBuffer>>)>),
     Launched(u64, windows::core::Result<()>),
+    Documents(files::Reply),
 }
 
 enum Command {
@@ -86,6 +94,7 @@ struct State {
     generation: Cell<u64>,
     previous_window: Cell<HWND>,
     glass: RefCell<GlassConfig>,
+    palette: Cell<crate::theme::Palette>,
     model: RefCell<Model>,
     receiver: RefCell<mpsc::Receiver<Update>>,
     notifier: Notifier,
@@ -93,9 +102,104 @@ struct State {
     pending_icons: Arc<Mutex<Vec<Vec<u8>>>>,
     icons_done: RefCell<HashSet<Vec<u8>>>,
     last_refresh: Cell<Instant>,
+    file_search: mpsc::Sender<files::Command>,
+    file_generation: Cell<u64>,
+    clock: Instant,
+    reduced_motion: Cell<bool>,
+    reveal: Cell<Transition>,
+    selection: Cell<Transition>,
+    motion_timer: Cell<bool>,
+    restore_after_exit: Cell<bool>,
+    origin: Cell<(i32, i32)>,
 }
 
 impl State {
+    fn now_ms(&self) -> u64 {
+        self.clock.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    fn sync_timer(&self) {
+        let now = self.now_ms();
+        let active = self.reveal.get().active(now)
+            || (self.visible.get() && self.selection.get().active(now));
+        if active && !self.motion_timer.get() {
+            let timer = unsafe { SetTimer(Some(self.hwnd.get()), MOTION_TIMER, 16, None) };
+            self.motion_timer.set(timer != 0);
+            if timer == 0 {
+                let mut reveal = self.reveal.get();
+                reveal.snap(reveal.target);
+                self.reveal.set(reveal);
+                let mut selection = self.selection.get();
+                selection.snap(selection.target);
+                self.selection.set(selection);
+            }
+        } else if !active && self.motion_timer.replace(false) {
+            let _ = unsafe { KillTimer(Some(self.hwnd.get()), MOTION_TIMER) };
+        }
+    }
+
+    fn apply_reveal(&self, now_ms: u64) {
+        let amount = self.reveal.get().value(now_ms).clamp(0.0, 1.0);
+        let (x, y) = self.origin.get();
+        let offset = ((1.0 - amount) * 8.0 * self.scale.get()).round() as i32;
+        let _ = unsafe {
+            SetLayeredWindowAttributes(
+                self.hwnd.get(),
+                COLORREF(0),
+                (amount * 255.0).round() as u8,
+                LWA_ALPHA,
+            )
+        };
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd.get(),
+                None,
+                x,
+                y + offset,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+    }
+
+    fn sync_selection(&self, animate: bool, force: bool) {
+        let target = self.model.borrow().selected as f32 * paint::ROW_HEIGHT as f32;
+        let mut selection = self.selection.get();
+        if animate && !self.reduced_motion.get() {
+            selection.retarget(target, self.now_ms(), 110);
+        } else if force || selection.target != target {
+            selection.snap(target);
+        }
+        self.selection.set(selection);
+        self.sync_timer();
+    }
+
+    fn tick(&self, now_ms: u64) {
+        if !self.visible.get()
+            && self.reveal.get().target == 0.0
+            && !self.reveal.get().active(now_ms)
+        {
+            self.finish_hide(self.restore_after_exit.replace(false));
+            return;
+        }
+        let repaint_selection = !self.selection.get().is_constant();
+        let mut reveal = self.reveal.get();
+        if !reveal.active(now_ms) {
+            reveal.snap(reveal.target);
+            self.reveal.set(reveal);
+        }
+        let mut selection = self.selection.get();
+        if !selection.active(now_ms) {
+            selection.snap(selection.target);
+            self.selection.set(selection);
+        }
+        self.apply_reveal(now_ms);
+        if repaint_selection {
+            let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), None, false) };
+        }
+        self.sync_timer();
+    }
     fn request_icons(&self) {
         if !self.visible.get() {
             return;
@@ -107,14 +211,15 @@ impl State {
                 model
                     .results
                     .iter()
-                    .any(|index| model.apps[*index].target == *target)
+                    .any(|index| model.apps[*index].shell_target() == Some(target.as_slice()))
             });
             model
                 .results
                 .iter()
                 .map(|index| &model.apps[*index])
-                .filter(|app| !done.contains(&app.target))
-                .map(|app| app.target.clone())
+                .filter_map(|app| app.shell_target())
+                .filter(|target| !done.contains(*target))
+                .map(|target| target.to_vec())
                 .collect::<Vec<_>>()
         };
         let needed = !targets.is_empty();
@@ -141,13 +246,49 @@ impl State {
         let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), None, false) };
     }
 
+    fn request_documents(&self) {
+        let generation = self.file_generation.get().wrapping_add(1);
+        self.file_generation.set(generation);
+        let _ = self.file_search.send(files::Command::Search(
+            generation,
+            self.model.borrow().query.clone(),
+        ));
+    }
+
     fn hide(&self, restore_focus: bool) {
-        if !self.visible.replace(false) {
+        if !self.visible.replace(false) && !self.reveal.get().active(self.now_ms()) {
             return;
         }
         self.pending_icons.lock().unwrap().clear();
+        self.file_generation
+            .set(self.file_generation.get().wrapping_add(1));
+        if restore_focus && !self.reduced_motion.get() {
+            self.restore_after_exit.set(true);
+            let mut reveal = self.reveal.get();
+            reveal.retarget(0.0, self.now_ms(), 100);
+            self.reveal.set(reveal);
+            self.sync_timer();
+            if !self.motion_timer.get() {
+                self.finish_hide(restore_focus);
+            }
+            return;
+        }
+        self.finish_hide(restore_focus);
+    }
+
+    fn finish_hide(&self, restore_focus: bool) {
+        self.visible.set(false);
+        self.restore_after_exit.set(false);
+        let mut reveal = self.reveal.get();
+        reveal.snap(0.0);
+        self.reveal.set(reveal);
+        let mut selection = self.selection.get();
+        selection.snap(selection.target);
+        self.selection.set(selection);
+        self.sync_timer();
+        let foreground = unsafe { GetForegroundWindow() } == self.hwnd.get();
         let _ = unsafe { ShowWindow(self.hwnd.get(), SW_HIDE) };
-        if restore_focus {
+        if restore_focus && foreground {
             let previous = self.previous_window.get();
             if !previous.is_invalid() {
                 let _ = unsafe { SetForegroundWindow(previous) };
@@ -156,7 +297,18 @@ impl State {
     }
 
     fn show(&self) {
-        self.previous_window.set(unsafe { GetForegroundWindow() });
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground != self.hwnd.get() {
+            self.previous_window.set(foreground);
+        }
+        self.restore_after_exit.set(false);
+        let mut reveal = self.reveal.get();
+        if self.reduced_motion.get() {
+            reveal.snap(1.0);
+        } else {
+            reveal.retarget(1.0, self.now_ms(), 160);
+        }
+        self.reveal.set(reveal);
         self.generation.set(self.generation.get().wrapping_add(1));
         {
             let mut model = self.model.borrow_mut();
@@ -175,6 +327,10 @@ impl State {
             let height =
                 (paint::height(&self.model.borrow()) as f32 * self.scale.get()).round() as i32;
             let work = info.rcWork;
+            self.origin.set((
+                work.left + (work.right - work.left - width) / 2,
+                work.top + (work.bottom - work.top - height).max(0) / 4,
+            ));
             let _ = unsafe {
                 SetWindowPos(
                     self.hwnd.get(),
@@ -187,6 +343,8 @@ impl State {
                 )
             };
         }
+        self.sync_selection(false, true);
+        self.apply_reveal(self.now_ms());
         self.visible.set(true);
         let _ = unsafe { ShowWindow(self.hwnd.get(), SW_SHOW) };
         let _ = unsafe { SetForegroundWindow(self.hwnd.get()) };
@@ -196,10 +354,15 @@ impl State {
             let _ = self.refresh.send(Command::Refresh);
         }
         self.request_icons();
+        self.request_documents();
         self.redraw();
+        self.sync_timer();
     }
 
     fn open_selected(&self) {
+        if !self.visible.get() {
+            return;
+        }
         let target = {
             let mut model = self.model.borrow_mut();
             if model.launching {
@@ -215,9 +378,15 @@ impl State {
         };
         let notifier = self.notifier.clone();
         let generation = self.generation.get();
+        let file_search = self.file_search.clone();
         std::thread::spawn(move || {
             let result = crate::apartment::Apartment::new(RO_INIT_SINGLETHREADED)
                 .and_then(|_apartment| catalog::launch(&target));
+            if result.is_ok() {
+                if let Target::Document(path) = target {
+                    let _ = file_search.send(files::Command::Opened(path));
+                }
+            }
             notifier.send(Update::Launched(generation, result));
         });
         self.redraw();
@@ -238,12 +407,9 @@ impl State {
                     let mut model = self.model.borrow_mut();
                     let mut done = self.icons_done.borrow_mut();
                     for (target, icon) in icons {
-                        if let Some(index) = model
-                            .results
-                            .iter()
-                            .copied()
-                            .find(|index| model.apps[*index].target == target)
-                        {
+                        if let Some(index) = model.results.iter().copied().find(|index| {
+                            model.apps[*index].shell_target() == Some(target.as_slice())
+                        }) {
                             model.apps[index].icon = icon;
                             done.insert(target);
                         }
@@ -260,14 +426,22 @@ impl State {
                         Ok(()) => self.hide(false),
                         Err(error) => {
                             self.model.borrow_mut().error =
-                                Some(format!("Could not open app ({:08X})", error.code().0))
+                                Some(format!("Could not open item ({:08X})", error.code().0))
                         }
                     }
                 }
                 Update::Launched(_, _) => {}
+                Update::Documents(reply) => {
+                    if self.visible.get() && reply.generation == self.file_generation.get() {
+                        self.model
+                            .borrow_mut()
+                            .set_documents(reply.entries, reply.status);
+                    }
+                }
             }
         }
         self.request_icons();
+        self.sync_selection(false, false);
         self.redraw();
     }
 
@@ -319,8 +493,7 @@ impl State {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
         };
-        let dark: u32 =
-            u32::from(crate::animation::notch::ink_pair(&self.glass.borrow()).0[0] > 128);
+        let dark: u32 = u32::from(self.palette.get().primary[0] > 128);
         let _ = unsafe {
             DwmSetWindowAttribute(
                 self.hwnd.get(),
@@ -332,11 +505,13 @@ impl State {
     }
 
     fn paint(&self) {
-        let frame = paint::render(
+        let frame = paint::render_with_selection(
             &self.model.borrow(),
             &self.glass.borrow(),
             self.scale.get(),
             self.hotkey.get(),
+            self.selection.get().value(self.now_ms()),
+            self.palette.get(),
         );
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -376,6 +551,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
+        let _ = unsafe { KillTimer(Some(self.hwnd.get()), MOTION_TIMER) };
         if !self.font.get().is_invalid() {
             let _ = unsafe { DeleteObject(self.font.get().into()) };
         }
@@ -390,8 +566,10 @@ pub struct LauncherWindow {
 }
 
 impl LauncherWindow {
-    pub fn create(island: &IslandConfig) -> windows::core::Result<Self> {
-        Self::create_window(island, true)
+    pub fn create(island: &IslandConfig, reduced_motion: bool) -> windows::core::Result<Self> {
+        let launcher = Self::create_window(island, true)?;
+        launcher.state.reduced_motion.set(reduced_motion);
+        Ok(launcher)
     }
 
     fn create_window(island: &IslandConfig, register_hotkey: bool) -> windows::core::Result<Self> {
@@ -419,6 +597,7 @@ impl LauncherWindow {
         }
         let (sender, receiver) = mpsc::channel();
         let (refresh, refresh_receiver) = mpsc::channel();
+        let (file_search, file_receiver) = mpsc::channel();
         let state = Box::new(State {
             hwnd: Cell::new(HWND::default()),
             edit: Cell::new(HWND::default()),
@@ -431,6 +610,7 @@ impl LauncherWindow {
             generation: Cell::new(0),
             previous_window: Cell::new(HWND::default()),
             glass: RefCell::new(island.glass.clone()),
+            palette: Cell::new(crate::theme::Palette::for_island(island)),
             model: RefCell::new(Model::default()),
             receiver: RefCell::new(receiver),
             notifier: Notifier { hwnd: 0, sender },
@@ -438,10 +618,19 @@ impl LauncherWindow {
             pending_icons: Arc::new(Mutex::new(Vec::new())),
             icons_done: RefCell::new(HashSet::new()),
             last_refresh: Cell::new(Instant::now()),
+            file_search,
+            file_generation: Cell::new(0),
+            clock: Instant::now(),
+            reduced_motion: Cell::new(false),
+            reveal: Cell::new(Transition::default()),
+            selection: Cell::new(Transition::default()),
+            motion_timer: Cell::new(false),
+            restore_after_exit: Cell::new(false),
+            origin: Cell::new((0, 0)),
         });
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
                 w!("termielle_launcher"),
                 w!("Termielle Search"),
                 WS_POPUP | WS_CLIPCHILDREN,
@@ -481,7 +670,7 @@ impl LauncherWindow {
                 edit,
                 EM_SETCUEBANNER,
                 Some(WPARAM(1)),
-                Some(LPARAM(w!("Search apps…").as_ptr() as isize)),
+                Some(LPARAM(w!("Search apps and documents…").as_ptr() as isize)),
             );
         }
         launcher
@@ -550,6 +739,14 @@ impl LauncherWindow {
                 }
             }
         });
+        if register_hotkey {
+            let notifier = launcher.state.notifier.clone();
+            std::thread::spawn(move || {
+                files::run(file_receiver, |reply| {
+                    notifier.send(Update::Documents(reply))
+                })
+            });
+        }
         Ok(launcher)
     }
 
@@ -557,8 +754,22 @@ impl LauncherWindow {
         self.state.show();
     }
 
-    pub fn configure(&self, island: &IslandConfig) {
-        if *self.state.glass.borrow() != island.glass {
+    pub fn configure(&self, island: &IslandConfig, reduced_motion: bool) {
+        if self.state.reduced_motion.replace(reduced_motion) != reduced_motion && reduced_motion {
+            let mut reveal = self.state.reveal.get();
+            reveal.snap(reveal.target);
+            self.state.reveal.set(reveal);
+            self.state.sync_selection(false, true);
+            if !self.state.visible.get() {
+                self.state.finish_hide(false);
+            } else {
+                self.state.apply_reveal(self.state.now_ms());
+                self.state.redraw();
+            }
+        }
+        let palette = crate::theme::Palette::for_island(island);
+        if *self.state.glass.borrow() != island.glass || self.state.palette.get() != palette {
+            self.state.palette.set(palette);
             *self.state.glass.borrow_mut() = island.glass.clone();
             self.state.restyle();
             self.state.redraw();
@@ -616,6 +827,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_CLOSE => state.hide(true),
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => state.paint(),
+        WM_TIMER if wparam.0 == MOTION_TIMER => state.tick(state.now_ms()),
         WM_COMMAND if (wparam.0 >> 16) as u32 == EN_CHANGE => {
             let mut text =
                 vec![0; unsafe { GetWindowTextLengthW(state.edit.get()) }.max(0) as usize + 1];
@@ -625,12 +837,14 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
                 .borrow_mut()
                 .set_query(String::from_utf16_lossy(&text[..length]));
             state.request_icons();
+            state.request_documents();
+            state.sync_selection(false, true);
             state.redraw();
         }
         WM_CTLCOLOREDIT => {
             let dc = HDC(wparam.0 as _);
             let glass = state.glass.borrow();
-            let primary = crate::animation::notch::ink_pair(&glass).0;
+            let primary = state.palette.get().primary;
             unsafe {
                 SetBkColor(dc, colorref(glass.tint));
                 SetTextColor(dc, colorref(primary));
@@ -641,6 +855,11 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             state.scale.set((wparam.0 & 0xffff) as f32 / 96.0);
             state.restyle();
             let rect = unsafe { &*(lparam.0 as *const RECT) };
+            let offset = ((1.0 - state.reveal.get().value(state.now_ms()))
+                * 8.0
+                * state.scale.get())
+            .round() as i32;
+            state.origin.set((rect.left, rect.top - offset));
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -706,6 +925,7 @@ unsafe fn dispatch_edit(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM
                         .model
                         .borrow_mut()
                         .move_selection(if key == VK_UP.0 { -1 } else { 1 });
+                    state.sync_selection(true, false);
                     state.redraw();
                     return LRESULT(0);
                 }
@@ -738,6 +958,111 @@ unsafe fn dispatch_edit(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM
 mod tests {
     use super::*;
     use crate::launcher::model::App;
+
+    #[test]
+    fn theme_palette_updates_even_when_glass_overrides_are_identical() {
+        let mut island = IslandConfig::default();
+        let launcher = LauncherWindow::create_window(&island, false).unwrap();
+        let original = launcher.state.palette.get();
+        island.theme = "macos-dark".into();
+        launcher.configure(&island, false);
+        assert_eq!(*launcher.state.glass.borrow(), island.glass);
+        assert_ne!(launcher.state.palette.get(), original);
+        assert_eq!(launcher.state.palette.get().accent, [255, 132, 10, 255]);
+        island.theme = "light".into();
+        launcher.configure(&island, false);
+        assert_eq!(launcher.state.palette.get(), original);
+    }
+
+    #[test]
+    fn selection_glides_but_typing_snaps_and_parks_the_timer() {
+        let launcher = LauncherWindow::create_window(&IslandConfig::default(), false).unwrap();
+        let state = &launcher.state;
+        state.visible.set(true);
+        let mut reveal = state.reveal.get();
+        reveal.snap(1.0);
+        state.reveal.set(reveal);
+        state.model.borrow_mut().set_apps(vec![
+            App::application("Alpha".into(), vec![0, 0]),
+            App::application("Beta".into(), vec![1, 0, 0]),
+        ]);
+        unsafe {
+            SendMessageW(
+                state.edit.get(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_DOWN.0 as usize)),
+                Some(LPARAM(0)),
+            )
+        };
+        assert_eq!(state.model.borrow().selected_app().unwrap().name, "Beta");
+        assert_eq!(state.selection.get().target, paint::ROW_HEIGHT as f32);
+        assert!(state.selection.get().active(state.now_ms()));
+        assert!(state.motion_timer.get());
+        unsafe { SetWindowTextW(state.edit.get(), w!("be")) }.unwrap();
+        assert_eq!(state.model.borrow().selected_app().unwrap().name, "Beta");
+        assert_eq!(state.selection.get().value(state.now_ms()), 0.0);
+        assert!(!state.motion_timer.get());
+        state.hide(false);
+    }
+
+    #[test]
+    fn reveal_settles_and_reduced_motion_cancels_all_launcher_timers() {
+        let island = IslandConfig::default();
+        let launcher = LauncherWindow::create_window(&island, false).unwrap();
+        let state = &launcher.state;
+        state.visible.set(true);
+        let started = state.now_ms();
+        let mut reveal = state.reveal.get();
+        reveal.retarget(1.0, started, 160);
+        state.reveal.set(reveal);
+        state.sync_timer();
+        assert!(state.motion_timer.get());
+        state.tick(started + 200);
+        assert_eq!(state.reveal.get().value(started + 200), 1.0);
+        assert!(!state.motion_timer.get());
+        state.hide(true);
+        assert!(!state.visible.get());
+        assert!(state.motion_timer.get());
+        launcher.configure(&island, true);
+        assert!(!state.motion_timer.get());
+        assert_eq!(state.reveal.get().value(state.now_ms()), 0.0);
+    }
+
+    #[test]
+    fn document_updates_ignore_stale_queries_and_never_request_shell_icons() {
+        let launcher = LauncherWindow::create_window(&IslandConfig::default(), false).unwrap();
+        let state = &launcher.state;
+        state.visible.set(true);
+        state.file_generation.set(2);
+        state.model.borrow_mut().set_query("report".into());
+        let reply = |generation| {
+            Update::Documents(files::Reply {
+                generation,
+                status: "1 document".into(),
+                entries: vec![App {
+                    name: "Report.pdf".into(),
+                    key: "c:\\docs\\report.pdf".into(),
+                    target: Target::Document(std::path::PathBuf::from("C:/Docs/Report.pdf")),
+                    icon: None,
+                    file_rank: Some(10),
+                }],
+            })
+        };
+        state.notifier.sender.send(reply(1)).unwrap();
+        state.drain_updates();
+        assert!(state.model.borrow().results.is_empty());
+        state.notifier.sender.send(reply(2)).unwrap();
+        state.drain_updates();
+        assert_eq!(
+            state.model.borrow().selected_app().unwrap().name,
+            "Report.pdf"
+        );
+        assert!(state.pending_icons.lock().unwrap().is_empty());
+        state.hide(false);
+        state.notifier.sender.send(reply(2)).unwrap();
+        state.drain_updates();
+        assert!(!state.visible.get());
+    }
 
     fn pump_until_overlay_timer(overlay: &mut crate::window::OverlayWindow) {
         unsafe {
@@ -814,12 +1139,7 @@ mod tests {
         state.model.borrow_mut().set_apps(
             ["Alpha", "Beta"]
                 .into_iter()
-                .map(|name| App {
-                    name: name.into(),
-                    key: name.to_lowercase(),
-                    target: vec![0, 0],
-                    icon: None,
-                })
+                .map(|name| App::application(name.into(), vec![0, 0]))
                 .collect(),
         );
         unsafe { SetWindowTextW(state.edit.get(), w!("be")) }.unwrap();

@@ -1,13 +1,40 @@
 use crate::animation::FrameBuffer;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(super) const MAX_RESULTS: usize = 6;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Target {
+    Application(Vec<u8>),
+    Document(PathBuf),
+}
+
 pub(super) struct App {
     pub name: String,
     pub key: String,
-    pub target: Vec<u8>,
+    pub target: Target,
     pub icon: Option<Arc<FrameBuffer>>,
+    pub file_rank: Option<usize>,
+}
+
+impl App {
+    pub fn application(name: String, target: Vec<u8>) -> Self {
+        Self {
+            key: name.to_lowercase(),
+            name,
+            target: Target::Application(target),
+            icon: None,
+            file_rank: None,
+        }
+    }
+
+    pub fn shell_target(&self) -> Option<&[u8]> {
+        match &self.target {
+            Target::Application(target) => Some(target),
+            Target::Document(_) => None,
+        }
+    }
 }
 
 pub(super) struct Model {
@@ -18,6 +45,7 @@ pub(super) struct Model {
     pub indexing: bool,
     pub launching: bool,
     pub error: Option<String>,
+    pub file_status: String,
 }
 
 impl Default for Model {
@@ -30,21 +58,63 @@ impl Default for Model {
             indexing: true,
             launching: false,
             error: None,
+            file_status: "Files index on first open".into(),
         }
     }
 }
 
 impl Model {
     pub fn set_apps(&mut self, apps: Vec<App>) {
+        let selected = self.selected_app().map(|app| app.target.clone());
+        let files: Vec<_> = self
+            .apps
+            .drain(..)
+            .filter(|app| app.file_rank.is_some())
+            .collect();
         self.apps = apps;
+        self.apps.extend(files);
         self.indexing = false;
         self.search();
+        if let Some(position) = self
+            .results
+            .iter()
+            .position(|index| Some(&self.apps[*index].target) == selected.as_ref())
+        {
+            self.selected = position;
+        }
     }
 
     pub fn set_query(&mut self, query: String) {
+        let normalized = query.to_lowercase().replace('/', "\\");
+        let tokens: Vec<_> = normalized.split_whitespace().collect();
+        self.apps.retain_mut(|app| {
+            if app.file_rank.is_none() {
+                return true;
+            }
+            let Some(score) = document_score(&app.key, &tokens) else {
+                return false;
+            };
+            app.file_rank = Some(score);
+            true
+        });
         self.query = query;
         self.error = None;
         self.search();
+    }
+
+    pub fn set_documents(&mut self, files: Vec<App>, status: String) {
+        let selected = self.selected_app().map(|app| app.target.clone());
+        self.apps.retain(|app| app.file_rank.is_none());
+        self.apps.extend(files);
+        self.file_status = status;
+        self.search();
+        if let Some(position) = self
+            .results
+            .iter()
+            .position(|index| Some(&self.apps[*index].target) == selected.as_ref())
+        {
+            self.selected = position;
+        }
     }
 
     fn search(&mut self) {
@@ -55,17 +125,19 @@ impl Model {
             .iter()
             .enumerate()
             .filter_map(|(index, app)| {
-                let score = tokens.iter().try_fold(0usize, |total, token| {
-                    match_score(&app.key, token).map(|score| total + score)
+                let score = app.file_rank.or_else(|| {
+                    tokens.iter().try_fold(0usize, |total, token| {
+                        match_score(&app.key, token).map(|score| total + score)
+                    })
                 })?;
-                Some((score, &app.key, index))
+                Some((score, app.file_rank.is_some(), &app.key, index))
             })
             .collect();
         matches.sort_unstable();
         self.results = matches
             .into_iter()
             .take(MAX_RESULTS)
-            .map(|(_, _, index)| index)
+            .map(|(_, _, _, index)| index)
             .collect();
         self.selected = 0;
         for (index, app) in self.apps.iter_mut().enumerate() {
@@ -89,7 +161,19 @@ impl Model {
     }
 }
 
-fn match_score(name: &str, query: &str) -> Option<usize> {
+pub(super) fn document_score(key: &str, tokens: &[&str]) -> Option<usize> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let name = key.rsplit('\\').next().unwrap_or(key);
+    tokens.iter().try_fold(0usize, |total, token| {
+        match_score(name, token)
+            .or_else(|| key.contains(token).then_some(400))
+            .map(|score| total.saturating_add(score))
+    })
+}
+
+pub(super) fn match_score(name: &str, query: &str) -> Option<usize> {
     if name == query {
         return Some(0);
     }
@@ -137,6 +221,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn documents_merge_with_apps_and_query_changes_remove_old_file_matches() {
+        let mut model = Model::default();
+        model.set_apps(apps(&["Report", "Code"]));
+        model.set_query("report".into());
+        let file = || App {
+            name: "Report.pdf".into(),
+            key: "c:\\docs\\report.pdf".into(),
+            target: Target::Document(PathBuf::from("C:/Docs/Report.pdf")),
+            icon: None,
+            file_rank: Some(10),
+        };
+        model.set_documents(vec![file()], "1 document".into());
+        assert_eq!(model.results.len(), 2);
+        assert_eq!(model.selected_app().unwrap().name, "Report");
+        model.move_selection(1);
+        model.set_documents(vec![file()], "1 document".into());
+        assert_eq!(model.selected_app().unwrap().name, "Report.pdf");
+        model.set_apps(apps(&["Report", "Code", "Other"]));
+        assert!(model.apps.iter().any(|app| app.name == "Report.pdf"));
+        assert_eq!(model.selected_app().unwrap().name, "Report.pdf");
+        model.set_query("report.p".into());
+        assert_eq!(model.selected_app().unwrap().name, "Report.pdf");
+        model.set_query("code".into());
+        assert_eq!(model.selected_app().unwrap().name, "Code");
+        assert!(model.apps.iter().all(|app| app.shell_target().is_some()));
+    }
+
+    #[test]
     fn query_changes_release_artwork_for_hidden_results() {
         let mut model = Model::default();
         model.set_apps(apps(&["Alpha", "Beta", "Gamma"]));
@@ -161,12 +273,7 @@ mod tests {
     fn apps(names: &[&str]) -> Vec<App> {
         names
             .iter()
-            .map(|name| App {
-                name: (*name).into(),
-                key: name.to_lowercase(),
-                target: vec![0, 0],
-                icon: None,
-            })
+            .map(|name| App::application((*name).into(), vec![0, 0]))
             .collect()
     }
 
@@ -250,12 +357,7 @@ mod tests {
         let mut model = Model::default();
         model.set_apps(
             (0..5_000)
-                .map(|index| App {
-                    name: format!("Application {index}"),
-                    key: format!("application {index}"),
-                    target: vec![0, 0],
-                    icon: None,
-                })
+                .map(|index| App::application(format!("Application {index}"), vec![0, 0]))
                 .collect(),
         );
         let started = std::time::Instant::now();

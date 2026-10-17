@@ -151,6 +151,13 @@ pub(crate) const DEVICE_DESKTOP: Icon = Icon(&[
 
 pub(crate) const SEARCH: Icon = Icon(&["M3 10a7 7 0 1 0 14 0a7 7 0 0 0 -14 0", "M21 21l-6 -6"]);
 
+pub(crate) const FILE_TEXT: Icon = Icon(&[
+    "M14 2h-8a2 2 0 0 0 -2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-12z",
+    "M14 2v6h6",
+    "M8 13h8",
+    "M8 17h6",
+]);
+
 pub(crate) const PLAYER_PLAY: Icon = Icon(&["M7 4v16l13 -8z"]);
 pub(crate) const PLAYER_PAUSE: Icon = Icon(&[
     "M6 5m0 1a1 1 0 0 1 1 -1h2a1 1 0 0 1 1 1v12a1 1 0 0 1 -1 1h-2a1 1 0 0 1 -1 -1z",

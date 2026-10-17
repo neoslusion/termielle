@@ -21,7 +21,7 @@ pub(crate) const BAR_REFRESH_MS: u64 = 2_000;
 /// this tick while it is on screen, so the remaining life drains at display
 /// rate instead of riding the bar's two-second metrics refresh.
 pub(crate) const ALERT_COUNTDOWN_TICK_MS: u64 = 16;
-pub(crate) const ALERT_HEIGHT: u32 = 96;
+pub(crate) const ALERT_HEIGHT: u32 = 148;
 
 /// Transient alert banner displayed in the Dynamic Island on notifications.
 /// Cache key for the frosted-glass layer: geometry, material, blob layout,
@@ -51,6 +51,7 @@ pub const HIT_ALERT_DISMISS: isize = -4;
 pub const HIT_CARD_PANEL: isize = -500;
 pub const HIT_CARD_NOTIFICATIONS: isize = -520;
 pub const HIT_NOTIFICATIONS_CLEAR: isize = -521;
+pub const HIT_NOTCH_CLOSE: isize = -530;
 /// The panel's volume slider accepts a click for an absolute level and
 /// shares this hit target with wheel adjustment.
 pub const HIT_PANEL_VOLUME_TRACK: isize = -503;
@@ -97,6 +98,7 @@ pub enum ClickOutcome {
     None,
 }
 pub struct AlertBanner {
+    pub source: String,
     pub title: String,
     pub subtitle: String,
     pub accent: [u8; 4],

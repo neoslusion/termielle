@@ -15,6 +15,7 @@ pub(crate) struct BarZoneCache {
     pub(crate) key: (u32, u32, f32, u32, u32),
     pub(crate) frame: Rc<FrameBuffer>,
     pub(crate) hits: Vec<BarHit>,
+    pub(crate) capsules: Vec<super::hover::Capsule>,
     /// Centre x of this zone's Control Center entry, when it drew one. The
     /// card reads it back instead of recomputing the right-zone layout, so the
     /// panel hangs from the icon the frame actually painted rather than from

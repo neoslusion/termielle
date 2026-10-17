@@ -425,3 +425,26 @@ was installed at user request on 2026-10-04, preserving config and native taskba
 a user screenshot/full visual review is still needed if
 "background problem" refers to another appearance defect. See
 [notch background](notch-background.md) for the concurrent-recording tradeoff.
+
+## 14. Clear All failed again during notification arrivals
+
+**Reported.** Clear All stopped working again, alongside a request to consider
+the Caelestia Shell approach.
+
+**Reproduced.** The footer followed the row count. A second notification arriving
+between press and release moved Clear All by 104 logical pixels, causing the
+release to miss. The earlier morph-opacity fix did not address this layout race.
+
+**Repair.** A bounded notification list and independent, stable footer keep the
+action in place. Older retained rows scroll; the header reports the visible
+range. Hover feedback uses panel-local coordinates. Clear All still clears all
+Termielle history/unread state, not Windows notifications or active banners.
+
+**Verification.** The arrival-during-press regression fails before and passes
+after the layout repair. An isolated native-window test also drives real
+mouse-down/up messages through the app's message pump, with an incoming
+notification during the press, for top/bottom bars and 100%/150% scaling. No
+global input is injected. Scroll bounds and hover feedback have focused checks.
+This reproduces one concrete cause; actual desktop pointer acceptance remains
+necessary. See [notification drawer](notification-drawer.md) for scope and the
+Caelestia reference.

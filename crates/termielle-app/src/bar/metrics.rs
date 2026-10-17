@@ -59,12 +59,14 @@ pub enum Command {
     RefreshVolume,
     /// Wake the next foreground snapshot after an explicit app switch.
     RefreshForeground,
+    Media(crate::tasks::transport::Request),
 }
 
 pub struct Service {
     sender: Arc<mpsc::Sender<Command>>,
     latest: Arc<Mutex<Option<Snapshot>>>,
     config: IslandConfig,
+    media_result: Arc<Mutex<Option<crate::tasks::transport::Completion>>>,
 }
 
 impl Service {
@@ -74,6 +76,8 @@ impl Service {
         let volume_sender = Arc::downgrade(&sender);
         let latest = Arc::new(Mutex::new(None));
         let mailbox = latest.clone();
+        let media_result = Arc::new(Mutex::new(None));
+        let media_mailbox = media_result.clone();
         let initial = config.clone();
         std::thread::spawn(move || {
             let _apartment = match crate::apartment::Apartment::new(
@@ -196,6 +200,17 @@ impl Service {
                                 eprintln!("workspace switch failed: {error:?}");
                             }
                         }
+                        Command::Media(request) => {
+                            let error = crate::tasks::transport::execute(&request)
+                                .err()
+                                .map(|error| error.to_string());
+                            *media_mailbox.lock().unwrap() =
+                                Some(crate::tasks::transport::Completion {
+                                    app: request.app,
+                                    error,
+                                });
+                            let _ = wake.post();
+                        }
                         Command::VolumeWheel(_) => unreachable!(),
                     }
                 }
@@ -206,6 +221,7 @@ impl Service {
             sender,
             latest,
             config,
+            media_result,
         }
     }
 
@@ -222,6 +238,10 @@ impl Service {
 
     pub fn take_snapshot(&self) -> Option<Snapshot> {
         self.latest.lock().ok()?.take()
+    }
+
+    pub fn take_media_result(&self) -> Option<crate::tasks::transport::Completion> {
+        self.media_result.lock().ok()?.take()
     }
 }
 

@@ -1103,84 +1103,89 @@ pub fn draw_progress_bar(
     }
 }
 
-/// Draws previous track glyph (|<<).
-/// Transport glyphs use the frame's authoring scale for both center and
-/// offsets, matching their surrounding button geometry at every DPI.
+fn draw_transport_triangle(
+    frame: &mut FrameBuffer,
+    center: (f32, f32),
+    size: (f32, f32),
+    rightwards: bool,
+    color: [u8; 4],
+) {
+    if color[3] == 0 {
+        return;
+    }
+    let center_x = center.0 * frame.scale;
+    let center_y = center.1 * frame.scale;
+    let half_width = size.0 * frame.scale / 2.0;
+    let half_height = size.1 * frame.scale / 2.0;
+    let width = half_width * 2.0;
+    let edge_length = width.hypot(half_height);
+    let left = ((center_x - half_width).floor() as i32).max(0);
+    let right = ((center_x + half_width).ceil() as i32).min(frame.width as i32);
+    let top = ((center_y - half_height).floor() as i32).max(0);
+    let bottom = ((center_y + half_height).ceil() as i32).min(frame.height as i32);
+    for row in top..bottom {
+        let vertical = (row as f32 + 0.5 - center_y).abs();
+        for column in left..right {
+            let horizontal = (column as f32 + 0.5 - center_x) * if rightwards { 1.0 } else { -1.0 };
+            let diagonal =
+                ((half_width - horizontal) * half_height - vertical * width) / edge_length;
+            let coverage = (horizontal + half_width).min(diagonal);
+            let alpha = ((coverage + 0.5).clamp(0.0, 1.0) * f32::from(color[3])).round() as u32;
+            blend_pixel(
+                frame,
+                column as u32,
+                row as u32,
+                [
+                    (u32::from(color[0]) * alpha / 255) as u8,
+                    (u32::from(color[1]) * alpha / 255) as u8,
+                    (u32::from(color[2]) * alpha / 255) as u8,
+                    alpha as u8,
+                ],
+            );
+        }
+    }
+}
+
 pub fn draw_glyph_prev(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
-    let s = frame.scale;
-    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
-    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
-    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
-    for dy in -5..=5 {
-        blend_pixel(frame, gx(-6) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(-5) as u32, gy(dy) as u32, color);
-    }
-    for dx in 0..=4 {
-        let max_y = dx + 1;
-        for dy in -max_y..=max_y {
-            blend_pixel(frame, gx(-4 + dx) as u32, gy(dy) as u32, color);
-        }
-    }
-    for dx in 0..=4 {
-        let max_y = dx + 1;
-        for dy in -max_y..=max_y {
-            blend_pixel(frame, gx(1 + dx) as u32, gy(dy) as u32, color);
-        }
+    draw_rounded_rect(frame, cx - 8, cy - 7, 2, 14, 1, color, [0; 4]);
+    for offset in [-1.0, 5.0] {
+        draw_transport_triangle(
+            frame,
+            (cx as f32 + offset, cy as f32),
+            (6.0, 14.0),
+            false,
+            color,
+        );
     }
 }
 
-/// Draws play triangle glyph (>).
 pub fn draw_glyph_play(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
-    let s = frame.scale;
-    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
-    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
-    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
-    for dx in 0..=8 {
-        let half_h = ((8 - dx) * 6) / 8;
-        for dy in -half_h..=half_h {
-            blend_pixel(frame, gx(-4 + dx) as u32, gy(dy) as u32, color);
-        }
-    }
+    draw_transport_triangle(
+        frame,
+        (cx as f32 + 1.0, cy as f32),
+        (12.0, 16.0),
+        true,
+        color,
+    );
 }
 
-/// Draws pause bars glyph (||).
 pub fn draw_glyph_pause(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
-    let s = frame.scale;
-    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
-    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
-    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
-    for dy in -6..=6 {
-        for dx in -4..=-2 {
-            blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
-        }
-        for dx in 2..=4 {
-            blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
-        }
+    for offset in [-6, 2] {
+        draw_rounded_rect(frame, cx + offset, cy - 8, 4, 16, 1, color, [0; 4]);
     }
 }
 
-/// Draws next-track glyph (>>|).
 pub fn draw_glyph_next(frame: &mut FrameBuffer, cx: i32, cy: i32, color: [u8; 4]) {
-    let s = frame.scale;
-    let (base_x, base_y) = (sx(frame, cx), sx(frame, cy));
-    let gx = |dx: i32| base_x + (dx as f32 * s).round() as i32;
-    let gy = |dy: i32| base_y + (dy as f32 * s).round() as i32;
-    for dx in 0..=4 {
-        let max_y = 5 - dx;
-        for dy in -max_y..=max_y {
-            blend_pixel(frame, gx(-5 + dx) as u32, gy(dy) as u32, color);
-        }
+    for offset in [-5.0, 1.0] {
+        draw_transport_triangle(
+            frame,
+            (cx as f32 + offset, cy as f32),
+            (6.0, 14.0),
+            true,
+            color,
+        );
     }
-    for dx in 0..=4 {
-        let max_y = 5 - dx;
-        for dy in -max_y..=max_y {
-            blend_pixel(frame, gx(dx) as u32, gy(dy) as u32, color);
-        }
-    }
-    for dy in -5..=5 {
-        blend_pixel(frame, gx(5) as u32, gy(dy) as u32, color);
-        blend_pixel(frame, gx(6) as u32, gy(dy) as u32, color);
-    }
+    draw_rounded_rect(frame, cx + 6, cy - 7, 2, 14, 1, color, [0; 4]);
 }
 
 fn draw_island_glyph(
@@ -1398,6 +1403,82 @@ fn draw_circle(frame: &mut FrameBuffer, cx: i32, cy: i32, radius: u32, color: [u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transport_frame(scale: f32) -> FrameBuffer {
+        let side = (48.0 * scale).round() as u32;
+        FrameBuffer {
+            width: side,
+            height: side,
+            pixels_pbgra: vec![0; (side * side * 4) as usize],
+            delay_ms: 0,
+            loop_index: 0,
+            scale,
+        }
+    }
+
+    #[test]
+    fn transport_glyphs_fill_every_device_row_at_fractional_and_integer_scales() {
+        for scale in [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            for draw in [
+                draw_glyph_play,
+                draw_glyph_pause,
+                draw_glyph_prev,
+                draw_glyph_next,
+            ] {
+                let mut frame = transport_frame(scale);
+                draw(&mut frame, 24, 24, [255; 4]);
+                for row in (20.0 * scale).ceil() as u32..(28.0 * scale).floor() as u32 {
+                    assert!(
+                        (0..frame.width).any(|column| frame.alpha_at(column, row) == 255),
+                        "glyph has a missing device row at scale {scale}, row {row}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pause_bar_interiors_have_no_scaling_holes() {
+        for scale in [1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let mut frame = transport_frame(scale);
+            draw_glyph_pause(&mut frame, 24, 24, [255; 4]);
+            for column in [(21.0 * scale).round() as u32, (27.0 * scale).round() as u32] {
+                for row in (20.0 * scale).ceil() as u32..(28.0 * scale).floor() as u32 {
+                    assert_eq!(
+                        frame.alpha_at(column, row),
+                        255,
+                        "pause bar has a scaling hole at {scale}: ({column}, {row})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transport_edges_are_antialiased_and_premultiplied() {
+        for draw in [
+            draw_glyph_play,
+            draw_glyph_pause,
+            draw_glyph_prev,
+            draw_glyph_next,
+        ] {
+            let mut frame = transport_frame(1.5);
+            draw(&mut frame, 24, 24, [90, 180, 240, 128]);
+            assert!(
+                frame
+                    .pixels_pbgra
+                    .chunks_exact(4)
+                    .all(|pixel| pixel[3] <= 128
+                        && pixel[..3].iter().all(|channel| *channel <= pixel[3]))
+            );
+            assert!(
+                frame
+                    .pixels_pbgra
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] > 0 && pixel[3] < 128)
+            );
+        }
+    }
 
     #[test]
     fn crossfade_keeps_unchanged_premultiplied_pixels_constant() {

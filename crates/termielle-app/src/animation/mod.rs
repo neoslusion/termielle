@@ -10,7 +10,9 @@ mod gif;
 pub(crate) mod icons;
 pub mod notch;
 mod text_cache;
+pub(crate) mod text_layout;
 pub(crate) mod text_metrics;
+pub(crate) mod transition;
 
 pub use fallback::fallback_frame;
 pub(crate) mod spring;

@@ -37,9 +37,33 @@ fn paint_tile(
     icon: icons::Icon,
     primary: [u8; 4],
     secondary: [u8; 4],
+    palette: crate::theme::Palette,
+    active: bool,
 ) {
-    notch::draw_rounded_rect(frame, x, y, width, TILE_H, 12, [255, 255, 255, 20], [0; 4]);
-    notch::draw_rounded_rect(frame, x + 8, y + 9, 34, 34, 17, [255, 255, 255, 25], [0; 4]);
+    notch::draw_rounded_rect(
+        frame,
+        x,
+        y,
+        width,
+        TILE_H,
+        12,
+        palette.surface,
+        palette.border,
+    );
+    notch::draw_rounded_rect(
+        frame,
+        x + 8,
+        y + 9,
+        34,
+        34,
+        17,
+        if active {
+            palette.accent
+        } else {
+            palette.raised
+        },
+        [0; 4],
+    );
     icons::draw_icon(frame, icon, x + 14, y + 15, 22, primary);
     let text_x = x + 48;
     let text_w = width.saturating_sub(54);
@@ -63,7 +87,8 @@ impl Controller {
         _island: &IslandConfig,
         ctx: &CardPaintCtx,
     ) {
-        let (primary, secondary) = notch::ink_pair(&self.island.glass);
+        let palette = crate::theme::Palette::for_island(&self.island);
+        let (primary, secondary) = (palette.primary, palette.secondary);
         let dim = self.ink_dim();
         notch::draw_text(
             frame,
@@ -118,8 +143,18 @@ impl Controller {
                 100,
             ),
         ] {
+            let active = self.island.theme == "macos-dark"
+                && match action {
+                    ShellAction::Network => {
+                        connectivity.network == crate::bar::connectivity::NetworkState::Online
+                    }
+                    ShellAction::Bluetooth => {
+                        connectivity.bluetooth == crate::bar::connectivity::BluetoothState::On
+                    }
+                    _ => false,
+                };
             paint_tile(
-                frame, x, y, tile_width, label, subtitle, icon, primary, secondary,
+                frame, x, y, tile_width, label, subtitle, icon, primary, secondary, palette, active,
             );
             self.icon_hits
                 .push((action.hit_id(), x, y, tile_width, TILE_H));
@@ -132,8 +167,8 @@ impl Controller {
             inner_width,
             74,
             12,
-            [255, 255, 255, 20],
-            [0; 4],
+            palette.surface,
+            palette.border,
         );
         let (level, muted) = self.panel_volume();
         let speaker_x = PANEL_PAD + 11;
@@ -213,8 +248,8 @@ impl Controller {
             inner_width,
             64,
             12,
-            [255, 255, 255, 20],
-            [0; 4],
+            palette.surface,
+            palette.border,
         );
         notch::draw_rounded_rect(
             frame,
@@ -223,7 +258,7 @@ impl Controller {
             46,
             46,
             9,
-            [255, 255, 255, 25],
+            palette.raised,
             [0; 4],
         );
         icons::draw_icon(
@@ -274,7 +309,7 @@ impl Controller {
                 30,
                 30,
                 15,
-                [255, 255, 255, 32],
+                palette.raised,
                 [0; 4],
             );
             icons::draw_icon(

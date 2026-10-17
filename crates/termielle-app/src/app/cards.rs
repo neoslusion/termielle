@@ -4,6 +4,7 @@
 //! frosted-glass cache lives in `glass`.
 
 pub(crate) mod activity;
+pub(crate) mod chrome;
 pub(crate) mod dashboard;
 pub(crate) mod glass;
 pub(crate) mod media;

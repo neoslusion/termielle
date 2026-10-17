@@ -5,12 +5,14 @@ Fork of Termielle's overlay into a top-center notch or floating island with **cu
 For completed desktop refinements, agreed decisions, validation history, and
 local redeployment, see the [development handoff](development-handoff.md).
 Root-cause investigations live in [reported behaviours](reported-behaviours.md).
+The [notch polish](notch-polish.md) describes the artwork-led media card, readable
+notification banners, Today shortcuts, interaction checks, and suggested additions.
 
 ## Features (current)
 
 - **macOS- and iOS-inspired presentation lifecycle**:
   - **Idle stays quiet**: Without agent activity, media, or a notification, hovering leaves the pill collapsed. Clicking the bar pill opens a compact Today card with the date, latest notification, Search, and Notifications; standalone Island keeps its system dashboard. With `auto_hide`, the standalone island can rest as a top-edge sensor strip.
-  - **Live Activities Ride in Compact** — an active agent session (`Thinking`, `Working`, `Ready`, ...) keeps the **Compact pill** up, hugging its live content, until the turn ends. Needs-input and failure get concise **notification alert banners** (96px) that spring back after 3.5s. An alert grows from the resting pill rather than leaving a second pill behind.
+  - **Live Activities Ride in Compact** — an active agent session (`Thinking`, `Working`, `Ready`, ...) keeps the **Compact pill** up, hugging its live content, until the turn ends. Needs-input and failure get readable **notification alert banners** (148px) that spring back after 3.5s. An alert grows from the resting pill rather than leaving a second pill behind.
   - **Hover for live content**: Hover reveals available agent, media, or notification content with organic spring physics; an empty pill does not pop out or show an Idle card.
   - **Click to Extend**: Clicking the pill extends it vertically and horizontally into the **Expanded tall card**; session lists size to at most four rows per page. Clicking it again collapses it back to the pill or hidden. Tapping the media blob toggles playback.
   - **Press Swell**: Holding the pointer down swells the pill ~3% and it settles back on release — the Dynamic Island under the fingertip.
@@ -144,23 +146,39 @@ The tray menu's **Menu Bar Items** submenu pins or hides Network, Volume,
 Battery, CPU, and Memory. The clock and Control Center stay on the strip so
 their popovers remain reachable.
 
-### App launcher
+### App and document launcher
 
-**Alt+Space** opens Termielle's Spotlight-style app launcher. The **Search**
+The [motion polish](motion-polish.md) adds a short launcher entrance, a gliding
+keyboard-selection background, and right-side Macchiato capsule hover. Motion
+stops at rest and respects reduced motion; result text and click targets remain
+stable and typing never waits for an animation.
+
+**Alt+Space** opens Termielle's Spotlight-style app and document launcher. The **Search**
 shortcut in Today and the rail's Apps button open the same window;
-neither invokes Windows Search. Type an app name, use **Up/Down** to select,
+neither invokes Windows Search. Type an app or document name, use **Up/Down** to select,
 then **Enter** to launch. Clicking a result also launches it. **Esc**, clicking
 outside, or pressing Alt+Space again dismisses it. Ctrl+A selects the query.
 
 Desktop and Store apps come from Windows' registered AppsFolder catalog,
 indexed on a background worker at startup and refreshed on opening after a
 minute. Filtering is entirely in-memory, with exact/prefix matches before fuzzy
-abbreviations; no file indexing, web search, query logging, or arbitrary command
-execution. Native text input supports normal editing and IME composition.
+abbreviations. Documents use a separate background filename/path index covering
+readable local fixed drives, excluding system, application-data, hidden/link,
+and generated dependency/build paths. It starts on first opening Search, restores
+its local cache, and shows indexing progress. No document contents, web search,
+query logging, cloud uploads, or arbitrary command execution are involved.
+Native text input supports normal editing and IME composition.
 Only visible results request icons, asynchronously; icon extraction never
 holds up app discovery, typing, or launching. A 32-entry worker cache shares
 bitmaps with the visible results instead of copying them; hidden results release
 their artwork, and catalog refresh clears the cache.
+
+Document matches accept fuzzy names, folder hints, and extensions: `acme dsgn pdf`
+can find `Acme/Design Proposal.pdf`. Successful opens through Termielle give
+matching files a bounded frequency/recency boost, inspired by zoxide. Results
+show their parent directory and open in the associated Windows application.
+See [document search](document-search.md) for supported types, indexing limits,
+refresh behaviour, and local-cache privacy.
 
 The launcher is a separate focusable window, not another notch card. It follows
 the bar's colours and current monitor DPI without changing the island or Control
@@ -233,6 +251,9 @@ Use the tray or the rail's Bar settings menu to switch layouts, themes,
 widget visibility, and hover behavior.
 The menu marks the active layout, theme, position, and widget state. Classic,
 Notch, and Island remain available as explicit alternate layouts.
+See the [settings audit](settings-audit.md) for control coverage, fixes, and
+manual acceptance limits. Preferences disables controls that do not apply to the
+selected layout or enabled widgets.
 
 Termielle does not invoke or configure Waybar. “Waybar-style” describes the
 left/center/right visual language of the native Windows bar only.
@@ -327,7 +348,8 @@ unknown configuration fields).
 - **Left apps rail**: stable pinned/running groups; click to launch, focus or
   choose a window. More reaches hidden groups; right-click opens app actions.
   See [app navigation](app-navigation.md).
-  Replace `"apps"` with `"workspaces"` in `bar.modules_left` to use virtual desktops instead.
+  Add `"workspaces"` to `bar.modules_left` for virtual desktops alongside Apps;
+  left/right item lists are rendered in their configured left-to-right order.
 - **Standalone Island/Notch**: hover reveals live content when enabled; empty
   hover stays collapsed, and clicking opens the dashboard.
 - **Alerts**: fresh agent input/failure events and Windows toasts appear as
@@ -349,9 +371,11 @@ backdrop captures run on a background worker. Disabled widgets are not polled,
 unchanged snapshots are not republished, and CPU sampling is capped at 2.5 Hz.
 The GUI thread only composites cached frames.
 
-Presentations size to their content. Standalone cards use 154/175/180/210 px
-according to media/task presence; the agent-only native bar popup is 112 px
-including its 36 px strip instead of reserving empty media space. Frames are
+Presentations size to their content. Expanded media uses 244 logical px,
+notification banners use 148, and the bar's Today card uses 224. Standalone
+non-media dashboards retain their existing sizing; session lists size to their
+visible rows instead of reserving empty media space. The native bar adds its
+strip and a six-pixel popup gap. Frames are
 authored at device pixels and presented 1:1 (`render_scale` = monitor DPI × user
 zoom, unless `scale_with_dpi: false`). `AnimationClock` waits for the target
 monitor's vertical blank and falls back to 16 ms when DXGI is unavailable.
@@ -394,11 +418,12 @@ Preset files ship in `themes/`:
 - `liquid-dark` — `[30,22,18,190]` (BGRA), border 24, highlight 42, shadow 48 (cool neutral dark default)
 - `midnight` — navy `[12,18,32,200]`, stronger shadow
 - `catppuccin-macchiato` — dark plum glass with a grouped apps rail, focused-window context, and padded mauve status capsules with 18px vector glyphs in Bar layout; inspired by SketchyBar showcase layouts. A workspace rail remains optional.
+- `macos-dark` — macOS-inspired neutral charcoal glass across the full menu bar, softly bordered status capsules with 18px vector glyphs, blue app indicators and launcher selection, and matching Today, Control Center, and notification surfaces. Connectivity badges turn blue only for confirmed Online/On status. Windows Settings handoffs, taskbar visibility, and independent notch/panel interaction stay unchanged. The launcher retains its opaque native text-edit surface for reliable IME/caret rendering; it does not emulate Apple's compositor. Select **Theme → macOS Dark** from the tray, or `macos-dark` in Preferences.
 - `light` — `[245,245,245,160]` for dark wallpapers
 - `transparent` — `[30,30,30,70]`, blur 0
 - `auto` — follows Windows light/dark
 
-**Explicit `glass` fields in `config.json` win over any theme preset** — a user-set `tint` survives a theme switch (fields differing from the glass default are treated as overrides).
+**Hand-edited `glass` fields win when `use_theme_material` is false** (the default for existing profiles; fields differing from glass defaults are treated as overrides). Selecting a theme through the tray or Preferences sets `use_theme_material: true`, replacing stale material with the preset on every resolution. Explicit `backdrop: "frosted"` or `"recording_safe"` choices survive theme changes. The `macos-dark` built-in becomes opaque when Windows transparency effects are disabled; its shipped JSON leaves opacity and shadow to that built-in policy.
 
 ```json
 { "name":"liquid-dark", "tint":[30,22,18,190], "blur_radius":12, "border_alpha":24, "highlight_alpha":42, "shadow_alpha":48, "corner_radius":18 }

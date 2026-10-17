@@ -71,7 +71,9 @@ impl Controller {
         } else {
             label
         };
-        let leading = if self.island.has_widget("face") {
+        let leading = if self.media_available() && self.state == VisualState::Idle {
+            pill_h.saturating_sub(4).min(24) + 28
+        } else if self.island.has_widget("face") {
             4 + pill_h.saturating_sub(4).min(22) + 6
         } else {
             10

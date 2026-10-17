@@ -24,7 +24,10 @@ Termielle does not run Waybar, parse Waybar JSON/CSS, or use GTK/Wayland.
 
 The current desktop refinements add a Macchiato menu bar, independent Control
 Center and activity-pill cards, recent notifications, volume feedback, and an
-**Alt+Space app launcher** that does not invoke Windows Search. See the
+**Alt+Space app and document launcher** that does not invoke Windows Search.
+Document lookup uses fuzzy filenames and folder hints, with a local bounded
+index and recently/frequently opened-file ranking—not document-content or AI
+search. See the [document search guide](docs/document-search.md) and the
 [development handoff](docs/development-handoff.md) for delivered features,
 decisions, validation, and local redeployment; the
 [island and bar guide](docs/island.md) covers detailed configuration and usage.

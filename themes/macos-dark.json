@@ -1,0 +1,9 @@
+{
+  "name": "macos-dark",
+  "display_name": "macOS Dark",
+  "blur_radius": 18,
+  "border_alpha": 26,
+  "highlight_alpha": 34,
+  "corner_radius": 18,
+  "description": "macOS-inspired neutral dark glass, soft borders, and blue selection accents."
+}

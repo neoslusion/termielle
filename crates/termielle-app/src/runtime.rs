@@ -1526,7 +1526,7 @@ fn poll_hover(
         // also covers DPI/zoom changes without an anchor flip.
         actions.present_frame = true;
     }
-    if controller.set_hover_point(window.cursor_client_pos()) {
+    if controller.set_hover_point_at(window.cursor_client_pos(), now) {
         actions.present_frame = true;
     }
     // A bar window is mostly transparent and its hit map covers every opaque
@@ -1729,7 +1729,10 @@ fn run_gui(
     let launcher = if crate::hosted::review_hidden() {
         None
     } else {
-        match termielle_app::launcher::LauncherWindow::create(&config.island) {
+        match termielle_app::launcher::LauncherWindow::create(
+            &config.island,
+            controller.reduced_motion,
+        ) {
             Ok(launcher) => Some(launcher),
             Err(error) => {
                 eprintln!("launcher creation failed: {error}");
@@ -1835,7 +1838,7 @@ fn run_gui(
         }
         bar_service.configure(controller.island_config());
         if let Some(launcher) = &launcher {
-            launcher.configure(controller.island_config());
+            launcher.configure(controller.island_config(), controller.reduced_motion);
         }
         if now_ms() >= next_taskbar_reassert {
             next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);
@@ -1852,6 +1855,33 @@ fn run_gui(
                     ack.as_mut(),
                     Some(backdrop_request),
                 );
+            }
+        }
+        if let Some(completion) = bar_service.take_media_result() {
+            thumb_cfg
+                .refresh_media
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            if controller.media_app() == Some(completion.app.as_str()) {
+                if let Some(error) = completion.error {
+                    controller.trigger_alert_from(
+                        termielle_app::app::AlertKind::System,
+                        "Media",
+                        "Couldn't control playback",
+                        error,
+                        termielle_app::theme::Palette::for_island(controller.island_config())
+                            .accent,
+                        3_500,
+                        now_ms(),
+                        "media-control-error",
+                    );
+                    present_current(
+                        window,
+                        controller,
+                        log,
+                        ack.as_mut(),
+                        Some(backdrop_request),
+                    );
+                }
             }
         }
         // Park visual animation while fullscreen-hidden. Model events still
@@ -2081,12 +2111,21 @@ fn run_gui(
                 }
             }
             WindowEvent::ScrollAt(x, y, delta) => {
-                // The panel's volume row answers the wheel exactly like the
-                // bar's speaker, through the same worker command.
-                if delta != 0 && (controller.volume_at(x, y) || controller.panel_volume_at(x, y)) {
-                    bar_service.send(termielle_app::bar::metrics::Command::VolumeWheel(delta));
+                if let Some(changed) = controller.scroll_notifications(x, y, delta, now_ms()) {
+                    ControllerActions {
+                        present_frame: changed,
+                        ..Default::default()
+                    }
+                } else {
+                    // The panel's volume row answers the wheel exactly like the
+                    // bar's speaker, through the same worker command.
+                    if delta != 0
+                        && (controller.volume_at(x, y) || controller.panel_volume_at(x, y))
+                    {
+                        bar_service.send(termielle_app::bar::metrics::Command::VolumeWheel(delta));
+                    }
+                    ControllerActions::default()
                 }
-                ControllerActions::default()
             }
             WindowEvent::NavigationDismiss => ControllerActions {
                 present_frame: controller.close_navigation(now_ms()),
@@ -2109,22 +2148,26 @@ fn run_gui(
                 WindowEvent::NavigationKey(key) => controller.handle_navigation_key(key, now_ms()),
                 _ => unreachable!(),
             } {
-                termielle_app::app::ClickOutcome::MediaToggle => {
-                    termielle_app::tasks::toggle_media_playback();
-                    ControllerActions {
-                        present_frame: true,
-                        ..Default::default()
+                outcome @ (termielle_app::app::ClickOutcome::MediaToggle
+                | termielle_app::app::ClickOutcome::MediaPrev
+                | termielle_app::app::ClickOutcome::MediaNext) => {
+                    if let Some(app) = controller.media_app() {
+                        let command = match outcome {
+                            termielle_app::app::ClickOutcome::MediaPrev => {
+                                termielle_app::tasks::transport::Command::Previous
+                            }
+                            termielle_app::app::ClickOutcome::MediaNext => {
+                                termielle_app::tasks::transport::Command::Next
+                            }
+                            _ => termielle_app::tasks::transport::Command::Toggle,
+                        };
+                        bar_service.send(termielle_app::bar::metrics::Command::Media(
+                            termielle_app::tasks::transport::Request {
+                                app: app.to_string(),
+                                command,
+                            },
+                        ));
                     }
-                }
-                termielle_app::app::ClickOutcome::MediaPrev => {
-                    termielle_app::tasks::media_prev_track();
-                    ControllerActions {
-                        present_frame: true,
-                        ..Default::default()
-                    }
-                }
-                termielle_app::app::ClickOutcome::MediaNext => {
-                    termielle_app::tasks::media_next_track();
                     ControllerActions {
                         present_frame: true,
                         ..Default::default()
@@ -2423,11 +2466,11 @@ fn drain_preferences(
                     model::prepare_apply(&baseline, &config.island, *draft).and_then(|view| {
                         let mut next = config.clone();
                         next.island = view;
+                        theme::resolve_theme(&mut next.island);
                         save_preferences(&next, config_path).map_err(|_| {
                             "Couldn't save this profile. Your previous settings were kept."
                                 .to_owned()
                         })?;
-                        theme::resolve_theme(&mut next.island);
                         config.island = next.island;
                         apply_runtime_preferences(
                             config.island.clone(),
@@ -2446,6 +2489,7 @@ fn drain_preferences(
                 Ok(false) => {}
                 Err(error) => preferences.acknowledge(&config.island, Err(error), false),
             },
+            Request::Shell(action) => termielle_app::bar::shell::activate(action),
             Request::Revert => {
                 apply_runtime_preferences(config.island.clone(), window, controller, worker);
                 *preview = false;
@@ -2816,6 +2860,148 @@ mod settings_tests {
         let directory = tempfile::tempdir().unwrap();
         assert!(save_preferences(&AppConfig::default(), Some(directory.path())).is_err());
         assert!(directory.path().is_dir());
+    }
+
+    #[test]
+    fn preferences_queue_preview_apply_restart_revert_and_failed_save_keep_one_profile_owner() {
+        std::thread::spawn(|| {
+            use windows::Win32::{
+                Foundation::{LPARAM, WPARAM},
+                UI::WindowsAndMessaging::{
+                    CB_SETCURSEL, CBN_SELCHANGE, GetDlgItem, PostMessageW, SendMessageW, WM_CLOSE,
+                    WM_COMMAND, WM_TIMER,
+                },
+            };
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("settings.json");
+            let mut config = AppConfig::default();
+            config.island.layout = termielle_core::IslandLayout::Island;
+            theme::select_theme(&mut config.island, "macos-dark");
+            save_preferences(&config, Some(&path)).unwrap();
+            let original = std::fs::read(&path).unwrap();
+            let mut window = OverlayWindow::create(&config, true).unwrap();
+            let mut preferences = termielle_app::preferences::PreferencesWindow::create(
+                window.hwnd(),
+                window.wake_handle(),
+                &config.island,
+            )
+            .unwrap();
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                false,
+                None,
+                config.island.clone(),
+            );
+            let worker = Arc::new(termielle_app::tasks::WorkerConfig::new(
+                true, false, false, false,
+            ));
+            let mut preview = false;
+            let select_theme = |index| {
+                let combo = unsafe { GetDlgItem(Some(preferences.hwnd()), 105) }.unwrap();
+                unsafe {
+                    SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), None);
+                    SendMessageW(
+                        preferences.hwnd(),
+                        WM_COMMAND,
+                        Some(WPARAM(105 | ((CBN_SELCHANGE as usize) << 16))),
+                        Some(LPARAM(combo.0 as isize)),
+                    );
+                }
+            };
+            select_theme(4);
+            unsafe {
+                PostMessageW(Some(preferences.hwnd()), WM_COMMAND, WPARAM(130), LPARAM(0)).unwrap();
+                PostMessageW(Some(window.hwnd()), WM_TIMER, WPARAM(1), LPARAM(0)).unwrap();
+            }
+            let mut pumped = false;
+            for _ in 0..100 {
+                if window.next_event().unwrap() == Some(WindowEvent::Timer) {
+                    pumped = true;
+                    break;
+                }
+            }
+            assert!(pumped);
+            assert!(drain_preferences(
+                &mut preferences,
+                &mut preview,
+                &mut config,
+                Some(&path),
+                &mut window,
+                &mut controller,
+                &worker
+            ));
+            assert!(preview);
+            assert_eq!(controller.island_config().theme, "light");
+            assert_eq!(config.island.theme, "macos-dark");
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            unsafe { SendMessageW(preferences.hwnd(), WM_COMMAND, Some(WPARAM(131)), None) };
+            assert!(drain_preferences(
+                &mut preferences,
+                &mut preview,
+                &mut config,
+                Some(&path),
+                &mut window,
+                &mut controller,
+                &worker
+            ));
+            assert!(!preview);
+            let mut loaded = load_config(&path).unwrap();
+            assert_eq!(loaded.island, config.island);
+            theme::resolve_theme(&mut loaded.island);
+            assert_eq!(loaded.island, config.island);
+            let committed = std::fs::read(&path).unwrap();
+            let combo = unsafe { GetDlgItem(Some(preferences.hwnd()), 105) }.unwrap();
+            unsafe {
+                SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(5)), None);
+                SendMessageW(
+                    preferences.hwnd(),
+                    WM_COMMAND,
+                    Some(WPARAM(105 | ((CBN_SELCHANGE as usize) << 16))),
+                    Some(LPARAM(combo.0 as isize)),
+                );
+                SendMessageW(preferences.hwnd(), WM_COMMAND, Some(WPARAM(130)), None);
+            }
+            drain_preferences(
+                &mut preferences,
+                &mut preview,
+                &mut config,
+                Some(&path),
+                &mut window,
+                &mut controller,
+                &worker,
+            );
+            assert_eq!(controller.island_config().theme, "midnight");
+            unsafe { SendMessageW(preferences.hwnd(), WM_COMMAND, Some(WPARAM(131)), None) };
+            assert!(!drain_preferences(
+                &mut preferences,
+                &mut preview,
+                &mut config,
+                Some(directory.path()),
+                &mut window,
+                &mut controller,
+                &worker
+            ));
+            assert!(preview);
+            assert_eq!(config.island.theme, "light");
+            assert_eq!(std::fs::read(&path).unwrap(), committed);
+            unsafe { SendMessageW(preferences.hwnd(), WM_CLOSE, None, None) };
+            assert!(drain_preferences(
+                &mut preferences,
+                &mut preview,
+                &mut config,
+                Some(&path),
+                &mut window,
+                &mut controller,
+                &worker
+            ));
+            assert!(!preview);
+            assert_eq!(controller.island_config(), &config.island);
+            assert_eq!(std::fs::read(&path).unwrap(), committed);
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]

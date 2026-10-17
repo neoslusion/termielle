@@ -32,8 +32,8 @@ pub enum BarPosition {
 /// spans the full monitor width; `false` insets the bar by `margin` on the
 /// free sides for a floating look (the window stays full-width, the margin
 /// stays transparent and click-through). `corner_radius` rounds the bar
-/// blob (0 keeps the cheap flat fill). `modules_*` filter which modules
-/// render in each zone — order within a zone is fixed, unknown names are
+/// blob (0 keeps the cheap flat fill). `modules_*` select and order modules
+/// from left to right within each zone — unknown names are
 /// ignored, and an emptied zone collapses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -97,6 +97,15 @@ pub enum MonitorSelection {
 
 // ---- Glass ----------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackdropMode {
+    #[default]
+    Theme,
+    Frosted,
+    RecordingSafe,
+}
+
 /// Custom layered glass material — baked into the DIB, not DWM acrylic.
 ///
 /// All values are 0-255 bytes so the renderer can copy them directly into
@@ -112,6 +121,8 @@ pub struct GlassConfig {
     /// live wallpaper behind the pill is captured (layered windows excluded)
     /// and box-blurred underneath the tint. 0 disables it (flat tint).
     pub blur_radius: u32,
+    pub backdrop: BackdropMode,
+    pub use_theme_material: bool,
     /// Border stroke alpha (0-255). 38 ~ 0.15.
     pub border_alpha: u8,
     /// Top-edge inner highlight alpha (0-255). 70 ~ 0.28.
@@ -129,6 +140,8 @@ impl Default for GlassConfig {
         Self {
             tint: [30, 22, 18, 190],
             blur_radius: 12,
+            backdrop: BackdropMode::Theme,
+            use_theme_material: false,
             border_alpha: 24,
             highlight_alpha: 42,
             shadow_alpha: 48,

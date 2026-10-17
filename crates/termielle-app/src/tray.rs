@@ -56,6 +56,7 @@ pub const TRAY_THEME_LIGHT: u32 = 112;
 pub const TRAY_THEME_TRANSPARENT: u32 = 113;
 pub const TRAY_THEME_AUTO: u32 = 114;
 pub const TRAY_THEME_CATPPUCCIN_MACCHIATO: u32 = 115;
+pub const TRAY_THEME_MACOS_DARK: u32 = 116;
 
 /// Y-offset presets for standalone Island/Notch layouts.
 pub const TRAY_YOFFSET_0: u32 = 120;
@@ -289,6 +290,11 @@ pub fn show_menu(hwnd: HWND, state: &MenuState) -> u32 {
         return 0;
     };
     for (id, label, active) in [
+        (
+            TRAY_THEME_MACOS_DARK,
+            "Theme: macOS Dark",
+            state.theme == "macos-dark",
+        ),
         (
             TRAY_THEME_LIQUID_DARK,
             "Theme: Liquid Dark",

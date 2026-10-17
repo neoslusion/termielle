@@ -127,6 +127,7 @@ pub struct Controller {
     pub(crate) alerts: VecDeque<AlertBanner>,
     pub(crate) recent_notifications: VecDeque<RecentNotification>,
     pub(crate) unread_notifications: usize,
+    pub(crate) notification_scroll: usize,
     /// Last controller-clock time, for renders without their own timestamp.
     pub(crate) clock_ms: u64,
     /// When the current visual state began, for one-shot state effects.
@@ -141,6 +142,7 @@ pub struct Controller {
     /// Next bar periodic refresh deadline; None when not in bar mode.
     pub(crate) bar_deadline: Option<u64>,
     pub(crate) volume_feedback_deadline: Option<u64>,
+    pub(crate) bar_hover: super::bar::hover::CapsuleHover,
     /// Cached bar metrics to prevent heavy COM/Registry/CPU queries on every render.
     /// Most recently rendered transparent content layer for same-geometry
     /// crossfades.
@@ -246,11 +248,13 @@ impl Controller {
             alerts: VecDeque::new(),
             recent_notifications: VecDeque::new(),
             unread_notifications: 0,
+            notification_scroll: 0,
             dpi_scale: 1.0,
             user_scale: 1.0,
             bar_width: 1920,
             bar_deadline,
             volume_feedback_deadline: None,
+            bar_hover: super::bar::hover::CapsuleHover::default(),
             content_layer: None,
             content_transition: None,
             interaction_deadline: None,
@@ -286,6 +290,14 @@ impl Controller {
         self.clock_ms = now_ms;
         let from = self.current_logical_size();
         let media_was_playing = self.media_playing();
+        let timeline_changed = self
+            .media
+            .as_ref()
+            .and_then(|media| media.timeline.as_ref())
+            != update
+                .media
+                .as_ref()
+                .and_then(|media| media.timeline.as_ref());
         let media_changed = self
             .media
             .as_ref()
@@ -327,7 +339,11 @@ impl Controller {
             self.hover_expanded = false;
         }
         if !self.island.is_enabled()
-            || (!media_changed && !tasks_changed && !windows_changed && !hover_closed)
+            || (!media_changed
+                && !tasks_changed
+                && !windows_changed
+                && !hover_closed
+                && !(timeline_changed && self.dashboard_expanded()))
         {
             return false;
         }
@@ -359,6 +375,13 @@ impl Controller {
         }
         self.current = self.render_island(self.state, from.0, from.1, now_ms);
         true
+    }
+
+    pub fn media_app(&self) -> Option<&str> {
+        self.media
+            .as_ref()
+            .map(|media| media.app.as_str())
+            .filter(|app| !app.trim().is_empty())
     }
 
     /// Queues a transient alert. Repeated deliveries with the same stable key
@@ -415,6 +438,7 @@ impl Controller {
         {
             let is_front = index == 0;
             let alert = &mut self.alerts[index];
+            alert.source = source.to_string();
             alert.title = title;
             alert.subtitle = subtitle;
             alert.accent = accent;
@@ -430,6 +454,7 @@ impl Controller {
         }
 
         let alert = AlertBanner {
+            source: source.to_string(),
             title,
             subtitle,
             accent,
@@ -518,10 +543,15 @@ impl Controller {
 
     /// Update island config live (e.g. theme switch).
     pub fn set_island_config(&mut self, island: IslandConfig, now_ms: u64) {
+        let face_changed = self.island.face_animated != island.face_animated
+            || self.island.has_widget("face") != island.has_widget("face");
         let was_enabled = self.island.is_enabled();
         let is_enabled = island.is_enabled();
         let mode_changed = self.island.layout != island.layout;
         self.island = island;
+        if face_changed {
+            self.refresh_face(self.state);
+        }
         self.sync_navigation();
         if mode_changed || (!self.bar_module("left", "apps") && !self.island.bar.replace_taskbar) {
             self.navigation.dismiss();
@@ -529,6 +559,7 @@ impl Controller {
         self.glass_caches.clear();
         self.bar_left_cache = None;
         self.bar_right_cache = None;
+        self.bar_hover = super::bar::hover::CapsuleHover::default();
         self.hover_expanded = false;
         self.hover_deadline = None;
         self.hover_suppressed = false;
@@ -846,6 +877,15 @@ impl Controller {
             self.motion_deadline = None;
         }
 
+        if self.bar_hover.deadline.is_some_and(|at| now_ms >= at) {
+            self.bar_hover.schedule(now_ms, self.motion_interval_ms);
+            self.bar_right_cache = None;
+            let (width, height) = self.current_logical_size();
+            self.current =
+                self.render_bar_with_damage(self.state, width, height, now_ms, BarDamage::RIGHT);
+            actions.present_frame = true;
+        }
+
         // Bar mode periodic update for clock and passive system metrics.
         if self.island.is_bar() {
             if self.bar_deadline.is_some_and(|d| now_ms >= d) {
@@ -942,6 +982,9 @@ impl Controller {
         };
         if let Some(activity_at) = self.activity.deadline {
             deadline = Some(deadline.map_or(activity_at, |at| at.min(activity_at)));
+        }
+        if let Some(hover_at) = self.bar_hover.deadline {
+            deadline = Some(deadline.map_or(hover_at, |at| at.min(hover_at)));
         }
         if let Some(launch_at) = self.navigation.pending_deadline() {
             deadline = Some(deadline.map_or(launch_at, |at| at.min(launch_at)));
@@ -1434,6 +1477,36 @@ mod tests {
     }
 
     #[test]
+    fn enabling_face_animation_reopens_the_decoder_without_a_state_change() {
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(vec![assets]),
+            false,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Island,
+                face_animated: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(controller.face_frames.len(), 1);
+        assert!(controller.face_decoder.is_none());
+        let mut config = controller.island.clone();
+        config.face_animated = true;
+        controller.set_island_config(config.clone(), 1_000);
+        assert!(controller.face_decoder.is_some());
+        assert!(controller.face_deadline.is_some());
+        controller.advance_face(1_100);
+        assert!(controller.face_frames.len() > 1);
+        config.face_animated = false;
+        controller.set_island_config(config, 1_200);
+        assert!(controller.face_decoder.is_none());
+        assert!(controller.face_deadline.is_none());
+    }
+
+    #[test]
     fn completed_idle_bar_face_settles_on_visible_art_and_releases_loop_frames() {
         let mut controller = quiet_island();
         controller.island.layout = IslandLayout::Bar;
@@ -1640,11 +1713,14 @@ mod tests {
     }
 
     #[test]
-    fn idle_bar_today_card_has_shortcuts_without_changing_live_card_size() {
+    fn idle_bar_today_and_media_cards_fit_their_content() {
         let mut controller = bar_with_hover(true);
-        assert_eq!(controller.bar_island_height(), 175);
+        assert_eq!(
+            controller.bar_island_height(),
+            crate::app::cards::media::MEDIA_HEIGHT
+        );
         controller.set_task_update_at(WorkerUpdate::default(), 1_000);
-        assert_eq!(controller.bar_island_height(), 164);
+        assert_eq!(controller.bar_island_height(), 224);
 
         let (pill_x, pill_y, pill_width, pill_height) = controller.bar_pill_rect(1536);
         assert!(matches!(
@@ -1694,6 +1770,178 @@ mod tests {
         ));
         assert!(controller.is_notification_center_open());
         assert!(controller.is_manually_expanded());
+    }
+
+    #[test]
+    fn timeline_updates_only_repaint_the_expanded_card_without_a_content_swap() {
+        let mut controller = bar_with_hover(false);
+        let mut update = WorkerUpdate {
+            media: Some(crate::tasks::MediaInfo {
+                title: "Test song".into(),
+                playing: false,
+                timeline: Some(crate::tasks::MediaTimeline {
+                    position_ms: 1_000,
+                    duration_ms: 180_000,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        controller.set_task_update_at(update.clone(), 1_000);
+        update
+            .media
+            .as_mut()
+            .unwrap()
+            .timeline
+            .as_mut()
+            .unwrap()
+            .position_ms = 2_000;
+        assert!(!controller.set_task_update_at(update.clone(), 2_000));
+        controller.toggle_expand(3_000);
+        controller.on_timer(3_100);
+        let before = controller.current_frame().clone();
+        update
+            .media
+            .as_mut()
+            .unwrap()
+            .timeline
+            .as_mut()
+            .unwrap()
+            .position_ms = 80_000;
+        assert!(controller.set_task_update_at(update, 4_000));
+        assert_eq!(before.width, controller.current_frame().width);
+        assert_eq!(before.height, controller.current_frame().height);
+        assert_ne!(before.pixels_pbgra, controller.current_frame().pixels_pbgra);
+        assert!(controller.content_transition.is_none());
+    }
+
+    #[test]
+    fn notification_clear_target_stays_put_when_a_toast_arrives_during_a_press() {
+        let mut controller = bar_with_hover(false);
+        controller.set_task_update_at(WorkerUpdate::default(), 900);
+        controller.trigger_alert(
+            super::super::types::AlertKind::System,
+            "First message",
+            "Messages: First",
+            [255; 4],
+            6_000,
+            1_000,
+            "stable-clear:one",
+        );
+        controller.panel_open = true;
+        controller.panel_kind = super::super::types::RightPanel::Notifications;
+        controller.morph_to_target(1_100);
+        let before = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == super::super::types::HIT_NOTIFICATIONS_CLEAR)
+            .copied()
+            .unwrap();
+        let point = (
+            before.1 + before.3 as i32 / 2,
+            before.2 + before.4 as i32 / 2,
+        );
+        controller.navigation_pointer_down(point.0, point.1, 1_200);
+        controller.trigger_alert(
+            super::super::types::AlertKind::System,
+            "Second message",
+            "Messages: Second",
+            [255; 4],
+            6_000,
+            1_210,
+            "stable-clear:two",
+        );
+        let after = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == super::super::types::HIT_NOTIFICATIONS_CLEAR)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "incoming notifications must not move a clear action under the pointer"
+        );
+        let outcome = controller
+            .finish_navigation_pointer(point.0, point.1, 1_250)
+            .unwrap_or_else(|| controller.handle_click(point.0, point.1, 1_250));
+        assert_eq!(
+            outcome,
+            super::super::types::ClickOutcome::NotificationsCleared
+        );
+        assert_eq!(controller.recent_notification_count(), 0);
+    }
+
+    #[test]
+    fn media_buttons_survive_the_full_pointer_press_release_path() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for reduced_motion in [false, true] {
+                let mut controller = bar_with_hover(false);
+                controller.reduced_motion = reduced_motion;
+                controller.set_dpi_scale(scale);
+                controller.toggle_expand(1_000);
+                for time in (1_000..=2_000).step_by(16) {
+                    controller.on_timer(time);
+                }
+                for (hit, expected) in [
+                    (
+                        crate::app::types::HIT_MEDIA_PLAY_PAUSE,
+                        crate::app::types::ClickOutcome::MediaToggle,
+                    ),
+                    (
+                        crate::app::types::HIT_MEDIA_PREV,
+                        crate::app::types::ClickOutcome::MediaPrev,
+                    ),
+                    (
+                        crate::app::types::HIT_MEDIA_NEXT,
+                        crate::app::types::ClickOutcome::MediaNext,
+                    ),
+                ] {
+                    let (_, x, y, width, height) = controller
+                        .click_regions()
+                        .iter()
+                        .find(|region| region.0 == hit)
+                        .copied()
+                        .unwrap();
+                    let point = (
+                        ((x as f32 + width as f32 / 2.0) * scale).round() as i32,
+                        ((y as f32 + height as f32 / 2.0) * scale).round() as i32,
+                    );
+                    controller.navigation_pointer_down(point.0, point.1, 2_010);
+                    controller.set_pressed(true, 2_010);
+                    controller.on_timer(2_026);
+                    controller.set_pressed(false, 2_050);
+                    let outcome = controller
+                        .finish_navigation_pointer(point.0, point.1, 2_050)
+                        .unwrap_or_else(|| controller.handle_click(point.0, point.1, 2_050));
+                    assert_eq!(
+                        outcome, expected,
+                        "media click at scale {scale}, reduced motion {reduced_motion}"
+                    );
+                    assert!(controller.is_manually_expanded());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn media_card_close_leaves_control_center_open() {
+        let mut controller = bar_with_hover(false);
+        controller.toggle_expand(1_000);
+        controller.open_control_panel(1_100);
+        controller.on_timer(1_200);
+        let (_, x, y, width, height) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == crate::app::types::HIT_NOTCH_CLOSE)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            controller.handle_click(x + width as i32 / 2, y + height as i32 / 2, 1_300),
+            crate::app::types::ClickOutcome::Collapsed
+        );
+        assert!(!controller.is_manually_expanded());
+        assert!(controller.is_panel_open());
+        assert!(!controller.is_notification_center_open());
     }
 
     #[test]

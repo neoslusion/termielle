@@ -10,6 +10,7 @@ pub enum Request {
     },
     Revert,
     TurnOff,
+    Shell(crate::bar::shell::ShellAction),
 }
 
 pub fn validate(mut draft: IslandConfig, baseline: &IslandConfig) -> Result<IslandConfig, String> {

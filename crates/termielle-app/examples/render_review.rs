@@ -1,6 +1,6 @@
 //! Export an isolated controller render for visual review; no desktop hooks or config writes.
 use termielle_app::app::Controller;
-use termielle_app::tasks::{MediaInfo, TaskIcon, WorkerUpdate};
+use termielle_app::tasks::{MediaInfo, MediaTimeline, TaskIcon, ThumbBitmap, WorkerUpdate};
 use termielle_core::{AssetCatalog, EventKind, EventMessage, IslandConfig, IslandLayout, Source};
 
 fn main() -> std::io::Result<()> {
@@ -29,6 +29,9 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|arg| arg == "--light") {
         termielle_app::theme::apply_theme(&mut config, "light");
     }
+    if std::env::args().any(|arg| arg == "--macos") {
+        termielle_app::theme::apply_theme(&mut config, "macos-dark");
+    }
     if std::env::args().any(|arg| arg == "--macchiato") {
         config.theme = "catppuccin-macchiato".into();
         termielle_app::theme::apply_theme(&mut config, "catppuccin-macchiato");
@@ -45,6 +48,11 @@ fn main() -> std::io::Result<()> {
         None,
         config,
     );
+    if let Some(scale) =
+        std::env::args().find_map(|arg| arg.strip_prefix("--scale=").map(str::to_owned))
+    {
+        controller.set_dpi_scale(scale.parse().expect("scale must be a number"));
+    }
     if state == "notification" {
         controller.trigger_alert(
             termielle_app::app::AlertKind::System,
@@ -61,7 +69,30 @@ fn main() -> std::io::Result<()> {
                 title: "A quieter afternoon".into(),
                 artist: "Review artist".into(),
                 app: "Music".into(),
-                playing: true,
+                playing: !std::env::args().any(|arg| arg == "--paused"),
+                timeline: Some(MediaTimeline {
+                    position_ms: 83_000,
+                    duration_ms: 241_000,
+                }),
+                thumbnail: (!std::env::args().any(|arg| arg == "--no-art")).then(|| {
+                    let mut pixels = Vec::with_capacity(160 * 160 * 4);
+                    for y in 0..160u32 {
+                        for x in 0..160u32 {
+                            let disc = (x as i32 - 80).pow(2) + (y as i32 - 80).pow(2);
+                            let pixel = if (900..3600).contains(&disc) {
+                                [52, 48, 38, 255]
+                            } else {
+                                [190, (70 + y / 2) as u8, (60 + x / 2) as u8, 255]
+                            };
+                            pixels.extend_from_slice(&pixel);
+                        }
+                    }
+                    ThumbBitmap {
+                        width: 160,
+                        height: 160,
+                        pixels_pbgra: pixels,
+                    }
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -199,6 +230,11 @@ fn main() -> std::io::Result<()> {
         controller.open_control_panel(10000);
     }
     if std::env::args().any(|arg| arg == "--notifications") {
+        let count = if std::env::args().any(|arg| arg == "--notifications-full") {
+            4
+        } else {
+            2
+        };
         for (index, source, title, body) in [
             (1, "Messages", "A new message", "Dinner tonight at seven?"),
             (
@@ -207,7 +243,22 @@ fn main() -> std::io::Result<()> {
                 "Agent finished",
                 "The build completed successfully.",
             ),
-        ] {
+            (
+                3,
+                "Builds",
+                "Review is ready",
+                "The latest build is available for review.",
+            ),
+            (
+                4,
+                "Messages",
+                "A longer notification headline that needs another line",
+                "The action stays in place while the list changes.",
+            ),
+        ]
+        .into_iter()
+        .take(count)
+        {
             controller.trigger_alert_from(
                 termielle_app::app::AlertKind::System,
                 source,
@@ -236,6 +287,22 @@ fn main() -> std::io::Result<()> {
             controller.on_timer(10000 + time);
         }
         controller.on_timer(10000 + elapsed);
+    }
+    if std::env::args().any(|arg| arg == "--scroll-notifications") {
+        if let Some(clear) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == termielle_app::app::HIT_NOTIFICATIONS_CLEAR)
+            .copied()
+        {
+            let scale = controller.render_scale();
+            controller.scroll_notifications(
+                ((clear.1 as f32 + clear.3 as f32 / 2.0) * scale).round() as i32,
+                ((clear.2 as f32 + clear.4 as f32 / 2.0) * scale).round() as i32,
+                -120,
+                10_000 + elapsed.unwrap_or(0),
+            );
+        }
     }
     let frame = controller.current_frame();
     let stride = (frame.width * 3 + 3) & !3;

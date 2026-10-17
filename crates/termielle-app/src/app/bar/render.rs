@@ -182,7 +182,7 @@ impl Controller {
         // the row's glass. Deciding this here rather than letting it fall out
         // of layer compositing keeps the clear band the documented default
         // instead of an accident of draw order.
-        let strip_is_surface = margin > 0 || bar_r > 0;
+        let strip_is_surface = margin > 0 || bar_r > 0 || self.island.theme == "macos-dark";
         let row = strip_is_surface.then(|| {
             let row_blob = [crate::animation::notch::BlobRect {
                 x: bar_x,
@@ -350,6 +350,7 @@ impl Controller {
         }
         let (panel_x, panel_y, _, _) = self.bar_panel_rect(width, exp_h, bar_y, panel_w);
         let tint = self.island.glass.tint;
+        let palette = crate::theme::Palette::for_island(&self.island);
         crate::animation::notch::draw_rounded_rect(
             frame,
             panel_x,
@@ -358,7 +359,7 @@ impl Controller {
             visible_h,
             20.min(visible_h / 2),
             tint,
-            [0; 4],
+            palette.border,
         );
 
         let mut content = self.blank_frame(panel_w, panel_h);
@@ -367,12 +368,15 @@ impl Controller {
             width: panel_w,
             height: panel_h,
             cy: (panel_h / 2) as i32,
-            accent: crate::system::accent_color_bgra(),
+            accent: crate::theme::Palette::for_island(&self.island).accent,
             now: now_ms,
             eq_now: now_ms,
             pad: 18,
         };
         let island = self.island.clone();
+        let saved_hover = self.hover_point;
+        self.hover_point =
+            saved_hover.map(|(hover_x, hover_y)| (hover_x - panel_x, hover_y - panel_y));
         match self.panel_kind {
             crate::app::types::RightPanel::Controls => {
                 self.paint_control_panel(&mut content, &island, &context)
@@ -381,6 +385,7 @@ impl Controller {
                 self.paint_notification_panel(&mut content, &context)
             }
         }
+        self.hover_point = saved_hover;
         let progress = (visible_h as f32 / panel_h as f32).clamp(0.0, 1.0);
         let alpha =
             (255.0 * crate::animation::notch::smoothstep(0.65, 0.98, progress)).round() as u8;
@@ -415,6 +420,7 @@ impl Controller {
             key: zone.key,
             frame: Rc::new(frame),
             hits,
+            capsules: Vec::new(),
             control_center_x: None,
             clock_x: None,
         }
@@ -426,7 +432,7 @@ impl Controller {
         let mut control_center_x = None;
         let mut clock_x = None;
         let mut frame = self.blank_frame(zone.width, zone.bar_h);
-        let hits = self.paint_bar_right(
+        let (hits, capsules) = self.paint_bar_right(
             &mut frame,
             &zone.metrics,
             zone.width,
@@ -445,6 +451,7 @@ impl Controller {
             key: zone.key,
             frame: Rc::new(frame),
             hits,
+            capsules,
             control_center_x,
             clock_x,
         }
@@ -458,6 +465,92 @@ mod tests {
     use crate::bar::workspaces::WorkspaceSnapshot;
     use crate::tasks::{TaskIcon, WorkerUpdate};
     use termielle_core::{AssetCatalog, IslandConfig, IslandLayout};
+
+    #[test]
+    fn capsule_hover_animates_only_backgrounds_keeps_hits_and_parks_for_top_bottom_and_dpi() {
+        for theme in ["catppuccin-macchiato", "macos-dark"] {
+            for position in [
+                termielle_core::BarPosition::Top,
+                termielle_core::BarPosition::Bottom,
+            ] {
+                for scale in [1.0, 1.5] {
+                    let mut island = IslandConfig {
+                        layout: IslandLayout::Bar,
+                        face_animated: false,
+                        ..IslandConfig::default()
+                    };
+                    island.bar.position = position;
+                    island.theme = theme.into();
+                    crate::theme::apply_theme(&mut island, theme);
+                    let mut controller = Controller::new_with_island(
+                        5_000,
+                        60_000,
+                        AssetCatalog::new(Vec::new()),
+                        false,
+                        None,
+                        island,
+                    );
+                    controller.set_dpi_scale(scale);
+                    controller.set_bar_width(1920);
+                    controller.set_bar_metrics(Snapshot::empty(), 1000);
+                    controller.panel_open = true;
+                    let height = controller.island.bar.height
+                        + BAR_POPUP_GAP
+                        + crate::app::cards::panel::panel_height();
+                    controller.current =
+                        controller.render_bar(VisualState::Idle, 1920, height, 1000);
+                    let capsule = controller.bar_right_cache.as_ref().unwrap().capsules[0];
+                    let left = controller.bar_left_cache.as_ref().unwrap().frame.clone();
+                    let before = controller.bar_right_cache.as_ref().unwrap().frame.clone();
+                    let hits = controller.click_regions().to_vec();
+                    let bar_y = if position == termielle_core::BarPosition::Bottom {
+                        height - controller.island.bar.height
+                    } else {
+                        0
+                    };
+                    let physical = (
+                        ((capsule.0 + capsule.2 as i32 / 2) as f32 * scale).round() as i32,
+                        ((capsule.1 + bar_y as i32 + capsule.3 as i32 / 2) as f32 * scale).round()
+                            as i32,
+                    );
+                    assert!(controller.set_hover_point_at(Some(physical), 1000));
+                    assert!(controller.bar_hover.deadline.is_some());
+                    assert!(controller.on_timer(1060).present_frame);
+                    assert_ne!(
+                        before.pixels_pbgra,
+                        controller
+                            .bar_right_cache
+                            .as_ref()
+                            .unwrap()
+                            .frame
+                            .pixels_pbgra
+                    );
+                    assert!(Rc::ptr_eq(
+                        &left,
+                        &controller.bar_left_cache.as_ref().unwrap().frame
+                    ));
+                    assert_eq!(controller.click_regions(), hits);
+                    assert!(controller.panel_open);
+                    assert_eq!(controller.hover_deadline, None);
+                    controller.on_timer(1200);
+                    assert_eq!(controller.bar_hover.deadline, None);
+                    assert!(!controller.set_hover_point_at(Some(physical), 1250));
+                    assert!(controller.set_hover_point_at(None, 1260));
+                    controller.on_timer(1400);
+                    assert_eq!(controller.bar_hover.deadline, None);
+                    assert_eq!(
+                        before.pixels_pbgra,
+                        controller
+                            .bar_right_cache
+                            .as_ref()
+                            .unwrap()
+                            .frame
+                            .pixels_pbgra
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn visible_notification_clear_button_works_before_the_panel_finishes_resizing() {
@@ -514,6 +607,110 @@ mod tests {
                     .any(|(id, ..)| *id == crate::app::types::HIT_NOTIFICATIONS_CLEAR)
             );
         }
+    }
+
+    #[test]
+    fn visible_media_controls_work_before_the_notch_finishes_resizing() {
+        for position in [
+            termielle_core::BarPosition::Top,
+            termielle_core::BarPosition::Bottom,
+        ] {
+            let mut island = IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: false,
+                ..IslandConfig::default()
+            };
+            island.bar.position = position;
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                false,
+                None,
+                island,
+            );
+            controller.set_task_update_at(
+                crate::tasks::WorkerUpdate {
+                    media: Some(crate::tasks::MediaInfo {
+                        title: "Test track".into(),
+                        playing: true,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                1_000,
+            );
+            controller.manually_expanded = true;
+            let height = controller.island.bar.height
+                + BAR_POPUP_GAP
+                + crate::app::cards::media::MEDIA_HEIGHT
+                - 12;
+            controller.current =
+                controller.render_bar(VisualState::Idle, controller.bar_width, height, 1_100);
+            let (_, x, y, width, button_height) = controller
+                .click_regions()
+                .iter()
+                .find(|hit| hit.0 == crate::app::types::HIT_MEDIA_PLAY_PAUSE)
+                .copied()
+                .expect("visible play button is clickable before 98% morph completion");
+            assert_eq!(
+                controller.handle_click(x + width as i32 / 2, y + button_height as i32 / 2, 1_110),
+                crate::app::types::ClickOutcome::MediaToggle
+            );
+        }
+    }
+
+    #[test]
+    fn notification_history_action_is_not_swallowed_by_banner_dismissal() {
+        let island = IslandConfig {
+            layout: IslandLayout::Bar,
+            face_animated: false,
+            ..IslandConfig::default()
+        };
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            true,
+            None,
+            island,
+        );
+        controller.trigger_alert(
+            crate::app::types::AlertKind::System,
+            "Message",
+            "Messages: A readable preview",
+            [255; 4],
+            6_000,
+            1_000,
+            "history-action",
+        );
+        let (_, x, y, width, height) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| {
+                hit.0 == crate::app::types::HIT_CARD_NOTIFICATIONS
+                    && hit.2 >= controller.island.bar.height as i32
+            })
+            .copied()
+            .unwrap();
+        assert_eq!(
+            controller.handle_click(x + width as i32 / 2, y + height as i32 / 2, 1_100),
+            crate::app::types::ClickOutcome::PanelToggled
+        );
+        assert!(controller.is_notification_center_open());
+        assert_eq!(controller.alerts.len(), 1);
+        let (_, x, y, width, _) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == crate::app::types::HIT_ALERT_DISMISS)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            controller.handle_click(x + width as i32 - 30, y + 20, 1_200),
+            crate::app::types::ClickOutcome::AlertDismiss
+        );
+        assert!(controller.alerts.is_empty());
+        assert!(controller.is_notification_center_open());
     }
 
     #[test]
@@ -697,6 +894,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn configured_modules_render_in_order_and_apps_do_not_hide_workspaces() {
+        for theme in ["macos-dark", "catppuccin-macchiato", "light"] {
+            let mut controller = bar_controller(0, 0);
+            let mut island = controller.island.clone();
+            crate::theme::select_theme(&mut island, theme);
+            island.bar.modules_left = vec!["workspaces".into(), "apps".into(), "window".into()];
+            island.bar.modules_right =
+                vec!["clock".into(), "volume".into(), "control_center".into()];
+            controller.set_island_config(island.clone(), 60_000);
+            controller.render_bar(VisualState::Idle, 1536, 36, 60_000);
+            let hits = controller.click_regions();
+            let workspace = hits
+                .iter()
+                .find(|hit| hit.0 == crate::bar::HIT_BAR_WORKSPACE_BASE - 1)
+                .expect("workspaces remain visible beside Apps");
+            let app = hits
+                .iter()
+                .find(|hit| super::super::super::navigation::Navigation::is_rail_hit(hit.0))
+                .unwrap();
+            assert!(workspace.1 < app.1);
+            let x_for = |id| hits.iter().find(|hit| hit.0 == id).unwrap().1;
+            assert!(
+                x_for(crate::app::types::HIT_CARD_NOTIFICATIONS)
+                    < x_for(crate::bar::HIT_BAR_VOLUME_TOGGLE)
+            );
+            assert!(
+                x_for(crate::bar::HIT_BAR_VOLUME_TOGGLE) < x_for(crate::app::types::HIT_CARD_PANEL)
+            );
+            island.bar.modules_left.swap(0, 1);
+            island.bar.modules_right.reverse();
+            controller.set_island_config(island, 60_100);
+            controller.render_bar(VisualState::Idle, 1536, 36, 60_100);
+            let hits = controller.click_regions();
+            let workspace = hits
+                .iter()
+                .find(|hit| hit.0 == crate::bar::HIT_BAR_WORKSPACE_BASE - 1)
+                .unwrap();
+            let app = hits
+                .iter()
+                .find(|hit| super::super::super::navigation::Navigation::is_rail_hit(hit.0))
+                .unwrap();
+            assert!(app.1 < workspace.1);
+            let x_for = |id| hits.iter().find(|hit| hit.0 == id).unwrap().1;
+            assert!(
+                x_for(crate::app::types::HIT_CARD_PANEL) < x_for(crate::bar::HIT_BAR_VOLUME_TOGGLE)
+            );
+            assert!(
+                x_for(crate::bar::HIT_BAR_VOLUME_TOGGLE)
+                    < x_for(crate::app::types::HIT_CARD_NOTIFICATIONS)
+            );
+        }
+    }
+
+    #[test]
+    fn macos_menu_bar_carries_glass_and_survives_partial_updates_and_theme_switches() {
+        let width = 1536;
+        let mut controller = bar_controller(0, 0);
+        let mut island = controller.island.clone();
+        crate::theme::select_theme(&mut island, "macos-dark");
+        controller.set_island_config(island, 60_000);
+        controller.current = controller.render_bar(VisualState::Idle, width, 36, 60_000);
+        let (_, _, _, pill_y, pill_h, _) = controller.bar_row();
+        let offset = (((pill_y as u32 + pill_h / 2) * width + 4) * 4 + 3) as usize;
+        assert!(controller.current.pixels_pbgra[offset] > 0);
+        let hits = controller.click_regions().to_vec();
+        let before = controller.current.clone();
+        let partial = controller.render_bar_with_damage(
+            VisualState::Idle,
+            width,
+            36,
+            60_000,
+            BarDamage::RIGHT,
+        );
+        assert_eq!(partial.pixels_pbgra, before.pixels_pbgra);
+        assert_eq!(controller.click_regions(), hits);
+        let mut island = controller.island.clone();
+        crate::theme::select_theme(&mut island, "transparent");
+        controller.set_island_config(island, 60_100);
+        let frame = controller.render_bar(VisualState::Idle, width, 36, 60_100);
+        assert_eq!(frame.pixels_pbgra[offset], 0);
+        assert!(
+            controller
+                .bar_right_cache
+                .as_ref()
+                .unwrap()
+                .capsules
+                .is_empty()
+        );
     }
 
     #[test]

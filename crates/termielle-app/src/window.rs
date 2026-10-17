@@ -860,6 +860,13 @@ unsafe extern "system" fn window_proc(
                                     .send(WindowEvent::ThemeChanged("catppuccin-macchiato".into()))
                             };
                         }
+                        tray::TRAY_THEME_MACOS_DARK => {
+                            let _ = unsafe {
+                                (*state)
+                                    .events
+                                    .send(WindowEvent::ThemeChanged("macos-dark".into()))
+                            };
+                        }
                         tray::TRAY_THEME_LIGHT => {
                             let _ = unsafe {
                                 (*state)

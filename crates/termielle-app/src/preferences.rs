@@ -14,7 +14,11 @@ use windows::{
             DEFAULT_QUALITY, DeleteObject, FF_DONTCARE, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
         },
         System::LibraryLoader::GetModuleHandleW,
-        UI::{HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::SetFocus, WindowsAndMessaging::*},
+        UI::{
+            HiDpi::GetDpiForWindow,
+            Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            WindowsAndMessaging::*,
+        },
     },
     core::{PCWSTR, w},
 };
@@ -65,6 +69,8 @@ struct State {
     themes: Vec<String>,
     heights: Vec<u32>,
     monitors: Vec<termielle_core::MonitorSelection>,
+    backdrop_choice: Option<bool>,
+    theme_choice: bool,
 }
 impl State {
     fn emit(&self, request: Request) {
@@ -88,6 +94,9 @@ impl State {
         unsafe { SendMessageW(self.controls[&id], BM_GETCHECK, None, None) }.0 == 1
     }
     fn read(&mut self) -> Result<IslandConfig, String> {
+        let pins = self.draft.bar.pinned_apps.clone();
+        self.draft = self.baseline.clone();
+        self.draft.bar.pinned_apps = pins;
         self.draft.layout = [
             IslandLayout::Bar,
             IslandLayout::Notch,
@@ -100,7 +109,10 @@ impl State {
             BarPosition::Bottom
         };
         self.draft.bar.height = self.heights[self.selected(HEIGHT).min(self.heights.len() - 1)];
-        self.draft.theme = self.themes[self.selected(THEME).min(self.themes.len() - 1)].clone();
+        let theme = self.themes[self.selected(THEME).min(self.themes.len() - 1)].clone();
+        if self.theme_choice || theme != self.draft.theme {
+            crate::theme::select_theme(&mut self.draft, &theme);
+        }
         self.draft.expand_on_hover = self.check(HOVER);
         self.draft.face_animated = self.check(FACE);
         self.draft.show_name = self.check(SHOW_NAME);
@@ -109,15 +121,19 @@ impl State {
         self.draft.hide_on_fullscreen = self.check(FULLSCREEN);
         let feel = self.selected(ANIMATION);
         model::set_animation_feel(&mut self.draft, feel);
-        self.draft.glass.blur_radius = if self.selected(BLUR) == 1 {
-            0
-        } else {
-            if self.baseline.glass.blur_radius > 0 {
-                self.baseline.glass.blur_radius
+        let recording_safe = self.selected(BLUR) == 1;
+        if self.backdrop_choice.is_some() || recording_safe != (self.draft.glass.blur_radius == 0) {
+            self.draft.glass.backdrop = if recording_safe {
+                termielle_core::BackdropMode::RecordingSafe
             } else {
-                12
-            }
-        };
+                termielle_core::BackdropMode::Frosted
+            };
+            self.draft.glass.blur_radius = if recording_safe {
+                0
+            } else {
+                self.draft.glass.blur_radius.max(12)
+            };
+        }
         self.draft.bar.modules_left = self
             .text(LEFT)
             .split(',')
@@ -137,8 +153,57 @@ impl State {
     fn status(&self, text: &str) {
         set_text(self.controls[&STATUS], text);
     }
+    fn update_availability(&self) {
+        let layout = [
+            IslandLayout::Bar,
+            IslandLayout::Notch,
+            IslandLayout::Island,
+            IslandLayout::Classic,
+        ][self.selected(LAYOUT).min(3)];
+        for (ids, enabled) in [
+            (
+                &[EDGE, HEIGHT, LEFT, RIGHT, PINS, UP, DOWN, REMOVE][..],
+                layout == IslandLayout::Bar,
+            ),
+            (
+                &[THEME, BLUR, SHOW_NAME, HOVER, DISPLAY, ANIMATION][..],
+                layout != IslandLayout::Classic,
+            ),
+            (
+                &[FULLSCREEN][..],
+                matches!(layout, IslandLayout::Notch | IslandLayout::Island),
+            ),
+            (
+                &[FACE][..],
+                layout != IslandLayout::Classic && self.baseline.has_widget("face"),
+            ),
+        ] {
+            for id in ids {
+                let _ = unsafe { EnableWindow(self.controls[id], enabled) };
+            }
+        }
+        self.update_pin_actions();
+    }
+    fn update_pin_actions(&self) {
+        let index = unsafe { SendMessageW(self.controls[&PINS], LB_GETCURSEL, None, None) }.0;
+        let selected = index >= 0
+            && (index as usize) < self.draft.bar.pinned_apps.len()
+            && self.selected(LAYOUT) == 0;
+        for (id, enabled) in [
+            (UP, selected && index > 0),
+            (
+                DOWN,
+                selected && (index as usize + 1) < self.draft.bar.pinned_apps.len(),
+            ),
+            (REMOVE, selected),
+        ] {
+            let _ = unsafe { EnableWindow(self.controls[&id], enabled) };
+        }
+    }
     fn fill(&mut self) {
         self.draft = self.baseline.clone();
+        self.backdrop_choice = None;
+        self.theme_choice = false;
         choose(
             self.controls[&LAYOUT],
             match self.draft.layout {
@@ -173,6 +238,7 @@ impl State {
         );
         self.themes = [
             "auto",
+            "macos-dark",
             "catppuccin-macchiato",
             "liquid-dark",
             "light",
@@ -257,6 +323,7 @@ impl State {
             model::animation_feel(&self.draft),
         );
         self.fill_pins(None);
+        self.update_availability();
         self.status(if crate::hosted::is_hosted() {
             "Windhawk edition — Preview is temporary; Apply saves the shared profile."
         } else {
@@ -280,6 +347,7 @@ impl State {
         if let Some(index) = selection {
             unsafe { SendMessageW(list, LB_SETCURSEL, Some(WPARAM(index)), None) };
         }
+        self.update_pin_actions();
     }
     fn layout(&mut self, hwnd: HWND) {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
@@ -420,6 +488,33 @@ unsafe extern "system" fn proc(
                         state.layout(hwnd);
                         return Some(LRESULT(0));
                     }
+                    if id == THEME && code == CBN_SELCHANGE as u16 {
+                        state.theme_choice = true;
+                        let name = &state.themes[state.selected(THEME).min(state.themes.len() - 1)];
+                        let mut material = state.baseline.clone();
+                        crate::theme::select_theme(&mut material, name);
+                        choose(
+                            state.controls[&BLUR],
+                            usize::from(
+                                state
+                                    .backdrop_choice
+                                    .unwrap_or(material.glass.blur_radius == 0),
+                            ),
+                        );
+                        return Some(LRESULT(0));
+                    }
+                    if id == BLUR && code == CBN_SELCHANGE as u16 {
+                        state.backdrop_choice = Some(state.selected(BLUR) == 1);
+                        return Some(LRESULT(0));
+                    }
+                    if id == LAYOUT && code == CBN_SELCHANGE as u16 {
+                        state.update_availability();
+                        return Some(LRESULT(0));
+                    }
+                    if id == PINS && code == LBN_SELCHANGE as u16 {
+                        state.update_pin_actions();
+                        return Some(LRESULT(0));
+                    }
                     if code != 0 {
                         return None;
                     }
@@ -464,14 +559,14 @@ unsafe extern "system" fn proc(
                         }
                         TURN_OFF => state.emit(Request::TurnOff),
                         SOUND | NETWORK | POWER | DATE | TASKVIEW => {
-                            use crate::bar::shell::{self, ShellAction};
-                            shell::activate(match id {
+                            use crate::bar::shell::ShellAction;
+                            state.emit(Request::Shell(match id {
                                 SOUND => ShellAction::Sound,
                                 NETWORK => ShellAction::Network,
                                 POWER => ShellAction::Power,
                                 DATE => ShellAction::Clock,
                                 _ => ShellAction::TaskView,
-                            });
+                            }));
                         }
                         _ => return None,
                     }
@@ -530,6 +625,8 @@ impl PreferencesWindow {
             themes: Vec::new(),
             heights: Vec::new(),
             monitors: Vec::new(),
+            backdrop_choice: None,
+            theme_choice: false,
         });
         let dpi = unsafe { GetDpiForWindow(owner) }.max(96) as f32 / 96.0;
         let hwnd = unsafe {
@@ -633,10 +730,10 @@ impl PreferencesWindow {
         )?;
         window.child(
             "BUTTON",
-            "Animate the character",
+            "Animate character (requires Face widget)",
             FACE,
             Some(0),
-            (18, 312, 300, 26),
+            (18, 312, 530, 26),
             WINDOW_STYLE(BS_AUTOCHECKBOX as u32) | WS_TABSTOP,
         )?;
         window.child(

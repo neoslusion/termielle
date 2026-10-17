@@ -1,6 +1,7 @@
-use super::model::App;
+use super::model::{App, Target};
 use crate::animation::FrameBuffer;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStrExt;
 use windows::Win32::Foundation::SIZE;
 use windows::Win32::Graphics::Gdi::{DeleteObject, GetDC, ReleaseDC};
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -11,7 +12,7 @@ use windows::Win32::UI::Shell::{
     SHGetKnownFolderItem, SIGDN_NORMALDISPLAY, SIIGBF_ICONONLY, ShellExecuteExW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{Interface, w};
+use windows::core::{Interface, PCWSTR, w};
 
 pub(super) fn enumerate() -> windows::core::Result<Vec<App>> {
     unsafe {
@@ -49,12 +50,7 @@ fn read_app(item: &IShellItem) -> windows::core::Result<App> {
         let target =
             std::slice::from_raw_parts(id.cast::<u8>(), ILGetSize(Some(id)) as usize).to_vec();
         CoTaskMemFree(Some(id.cast()));
-        Ok(App {
-            key: name.to_lowercase(),
-            name,
-            target,
-            icon: None,
-        })
+        Ok(App::application(name, target))
     }
 }
 
@@ -96,21 +92,47 @@ pub(super) fn read_icon(target: &[u8]) -> Option<FrameBuffer> {
     result
 }
 
-pub(super) fn launch(target: &[u8]) -> windows::core::Result<()> {
+pub(super) fn launch(target: &Target) -> windows::core::Result<()> {
+    let file;
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_IDLIST | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
         lpVerb: w!("open"),
-        lpIDList: target.as_ptr().cast_mut().cast(),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
+    match target {
+        Target::Application(target) => info.lpIDList = target.as_ptr().cast_mut().cast(),
+        Target::Document(path) => {
+            if !super::files::available(path) {
+                return Err(windows::core::Error::from_hresult(
+                    windows::core::HRESULT::from_win32(2),
+                ));
+            }
+            file = path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            info.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+            info.lpFile = PCWSTR(file.as_ptr());
+        }
+    }
     unsafe { ShellExecuteExW(&mut info) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_open_rejects_missing_documents_and_executable_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("do-not-open.exe");
+        std::fs::write(&executable, b"not executable").unwrap();
+        assert!(launch(&Target::Document(executable)).is_err());
+        assert!(launch(&Target::Document(directory.path().join("missing.pdf"))).is_err());
+    }
 
     #[test]
     #[ignore = "Opens Calculator for local launch verification"]
@@ -134,9 +156,12 @@ mod tests {
         let started = std::time::Instant::now();
         let apps = enumerate().unwrap();
         assert!(!apps.is_empty());
-        assert!(apps.iter().all(|app| !app.name.trim().is_empty()
-            && app.target.len() >= 2
-            && app.target.ends_with(&[0, 0])));
+        assert!(apps.iter().all(|app| {
+            !app.name.trim().is_empty()
+                && app
+                    .shell_target()
+                    .is_some_and(|target| target.len() >= 2 && target.ends_with(&[0, 0]))
+        }));
         println!(
             "Indexed {} app names in {:?}",
             apps.len(),

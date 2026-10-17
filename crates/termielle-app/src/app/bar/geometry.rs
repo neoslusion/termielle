@@ -40,10 +40,9 @@ impl Controller {
         let tasks =
             self.island.has_widget("tasks") && self.island.show_tasks && !self.tasks.is_empty();
         match (self.media_available(), tasks) {
-            (true, true) => 210,
-            (true, false) => 175,
+            (true, _) => crate::app::cards::media::MEDIA_HEIGHT,
             (false, true) => 180,
-            (false, false) if self.state == termielle_core::VisualState::Idle => 164,
+            (false, false) if self.state == termielle_core::VisualState::Idle => 224,
             (false, false) => 76,
         }
     }

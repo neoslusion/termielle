@@ -55,7 +55,9 @@ impl Controller {
     ) -> (Vec<BarHit>, i32) {
         let mut hits = Vec::new();
         self.navigation.rail_actions.borrow_mut().clear();
-        let (primary, secondary) = notch::ink_pair(&self.island.glass);
+        let palette = crate::theme::Palette::for_island(&self.island);
+        let (primary, secondary) = (palette.primary, palette.secondary);
+        let macos = self.island.theme == "macos-dark";
         let room = (limit - x).max(0) as u32;
         if room < 32 {
             return (hits, x);
@@ -109,7 +111,11 @@ impl Controller {
                 {
                     [primary[0], primary[1], primary[2], 95]
                 } else if active {
-                    [primary[0], primary[1], primary[2], 60]
+                    if macos {
+                        [palette.accent[0], palette.accent[1], palette.accent[2], 65]
+                    } else {
+                        [primary[0], primary[1], primary[2], 60]
+                    }
                 } else if hover {
                     [primary[0], primary[1], primary[2], 30]
                 } else {
@@ -157,7 +163,13 @@ impl Controller {
                     mark_w,
                     2,
                     1,
-                    if active { primary } else { secondary },
+                    if active && macos {
+                        palette.accent
+                    } else if active {
+                        primary
+                    } else {
+                        secondary
+                    },
                     [0; 4],
                 );
             }
@@ -213,7 +225,9 @@ impl Controller {
         action: Option<Action>,
         hits: &mut Vec<BarHit>,
     ) {
-        let (primary, secondary) = notch::ink_pair(&self.island.glass);
+        let palette = crate::theme::Palette::for_island(&self.island);
+        let (primary, secondary) = (palette.primary, palette.secondary);
+        let macos = self.island.theme == "macos-dark";
         let selected = action
             .as_ref()
             .is_some_and(|a| self.navigation.selected.as_ref() == Some(a));
@@ -225,7 +239,11 @@ impl Controller {
             rect.3,
             6,
             if selected {
-                [primary[0], primary[1], primary[2], 55]
+                if macos {
+                    palette.selection
+                } else {
+                    [primary[0], primary[1], primary[2], 55]
+                }
             } else {
                 [primary[0], primary[1], primary[2], 20]
             },
@@ -270,7 +288,7 @@ impl Controller {
         let mut tint = self.island.glass.tint;
         tint[3] = 245;
         notch::draw_rounded_rect(&mut content, 0, 0, w, full_h, 12, tint, [255, 255, 255, 30]);
-        let (primary, secondary) = notch::ink_pair(&self.island.glass);
+        let (primary, secondary) = crate::theme::Palette::ink_pair(&self.island);
         self.navigation.popup_actions.clear();
         let mut hits = Vec::new();
         let group = match &popup.mode {

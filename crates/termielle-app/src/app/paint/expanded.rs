@@ -19,7 +19,7 @@ impl Controller {
         now_ms: u64,
     ) {
         let cy = (height / 2) as i32;
-        let accent = crate::system::accent_color_bgra();
+        let accent = crate::theme::Palette::for_island(island).accent;
         let now = now_ms;
         // A paused equalizer holds its pose instead of performing playback.
         let eq_now = if self.media_playing() { now } else { 0 };

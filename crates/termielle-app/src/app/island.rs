@@ -82,9 +82,6 @@ impl Controller {
             dy = ((1.0 - fit).max(0.0) * 4.0).round() as i32;
         }
         self.icon_hits.retain_mut(|hit| {
-            if !super::activity::SessionActivity::is_hit(hit.0) {
-                return true;
-            }
             hit.1 += dx;
             hit.2 += dy;
             let right = (hit.1 + hit.3 as i32).min(width as i32);
@@ -292,10 +289,8 @@ impl Controller {
                 let tasks_active = self.island.has_widget("tasks")
                     && self.island.show_tasks
                     && !self.tasks.is_empty();
-                let exp_h = if self.media_available() && tasks_active {
-                    210u32
-                } else if self.media_available() {
-                    175u32
+                let exp_h = if self.media_available() {
+                    super::cards::media::MEDIA_HEIGHT
                 } else if tasks_active {
                     180u32
                 } else {
@@ -605,12 +600,12 @@ impl Controller {
     /// Theme-aware ink for neutral copy; see
     /// [`crate::animation::notch::ink_pair`].
     pub(crate) fn ink(&self) -> [u8; 4] {
-        crate::animation::notch::ink_pair(&self.island.glass).0
+        crate::theme::Palette::ink_pair(&self.island).0
     }
 
     /// Dim companion ink for secondary copy.
     pub(crate) fn ink_dim(&self) -> [u8; 4] {
-        crate::animation::notch::ink_pair(&self.island.glass).1
+        crate::theme::Palette::ink_pair(&self.island).1
     }
 
     /// Routes a click at physical client (`x`, `y`): coordinates are mapped
@@ -707,6 +702,10 @@ impl Controller {
             }
             match id {
                 HIT_MEDIA_PLAY_PAUSE => return ClickOutcome::MediaToggle,
+                super::types::HIT_NOTCH_CLOSE => {
+                    self.close_notch(now_ms);
+                    return ClickOutcome::Collapsed;
+                }
                 HIT_ALERT_DISMISS => {
                     let previous_geometry = self.current_logical_size();
                     self.alerts.pop_front();
@@ -734,6 +733,7 @@ impl Controller {
                     } else {
                         self.panel_open = true;
                         self.panel_kind = crate::app::types::RightPanel::Notifications;
+                        self.notification_scroll = 0;
                         self.panel_morphing = false;
                         self.unread_notifications = 0;
                         self.bar_right_cache = None;
@@ -744,6 +744,7 @@ impl Controller {
                 }
                 crate::app::types::HIT_NOTIFICATIONS_CLEAR => {
                     self.recent_notifications.clear();
+                    self.notification_scroll = 0;
                     self.unread_notifications = 0;
                     self.bar_right_cache = None;
                     self.morph_to_target(now_ms);
@@ -813,10 +814,12 @@ impl Controller {
     /// comparing against `icon_hits`. Triggers a repaint only when the
     /// highlighted icon changed.
     pub fn set_hover_point(&mut self, point: Option<(i32, i32)>) -> bool {
+        self.set_hover_point_at(point, self.clock_ms)
+    }
+
+    pub fn set_hover_point_at(&mut self, point: Option<(i32, i32)>, now_ms: u64) -> bool {
+        self.clock_ms = now_ms;
         let point = point.map(|(x, y)| (self.to_logical(x), self.to_logical(y)));
-        if self.hover_point == point {
-            return false;
-        }
         // Repaint only when the point moved across an icon hit-rect boundary.
         let on_icon = |pt: &Option<(i32, i32)>| {
             pt.and_then(|(px, py)| {
@@ -825,7 +828,36 @@ impl Controller {
                 })
             })
         };
-        let changed = on_icon(&self.hover_point) != on_icon(&point);
+        let mut changed = on_icon(&self.hover_point) != on_icon(&point);
+        if self.island.is_bar() {
+            let (_, height) = self.current_logical_size();
+            let bar_y = if self.island.bar.position == termielle_core::BarPosition::Bottom {
+                height.saturating_sub(self.island.bar.height) as i32
+            } else {
+                0
+            };
+            let capsule = point.and_then(|(px, py)| {
+                self.bar_right_cache.as_ref().and_then(|cache| {
+                    cache
+                        .capsules
+                        .iter()
+                        .copied()
+                        .find(|(x, y, width, height)| {
+                            px >= *x
+                                && px < *x + *width as i32
+                                && py - bar_y >= *y
+                                && py - bar_y < *y + *height as i32
+                        })
+                })
+            });
+            if self
+                .bar_hover
+                .set_target(capsule, now_ms, self.reduced_motion)
+            {
+                self.bar_right_cache = None;
+                changed = true;
+            }
+        }
         self.hover_point = point;
         if changed && self.island.is_enabled() {
             let (width, height) = self.current_logical_size();
