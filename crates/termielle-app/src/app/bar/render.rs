@@ -562,6 +562,110 @@ mod tests {
     }
 
     #[test]
+    fn pressing_a_status_chip_changes_only_its_fill_at_once_and_releases_back_to_rest() {
+        for theme in ["catppuccin-macchiato", "macos-dark"] {
+            let mut island = IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: false,
+                ..IslandConfig::default()
+            };
+            island.theme = theme.into();
+            crate::theme::apply_theme(&mut island, theme);
+            let mut controller = Controller::new_with_island(
+                5_000,
+                60_000,
+                AssetCatalog::new(Vec::new()),
+                false,
+                None,
+                island,
+            );
+            controller.set_bar_width(1920);
+            controller.set_bar_metrics(Snapshot::empty(), 1000);
+            let height = controller.island.bar.height;
+            controller.current = controller.render_bar_frame(VisualState::Idle, 1920, height, 1000);
+            let capsule = controller.bar_right_cache.as_ref().unwrap().capsules[0];
+            let hits = controller.click_regions().to_vec();
+            let point = (
+                capsule.0 + capsule.2 as i32 / 2,
+                capsule.1 + capsule.3 as i32 / 2,
+            );
+            controller.set_hover_point_at(Some(point), 1000);
+            controller.on_timer(1200);
+            let hovered = controller.bar_right_cache.as_ref().unwrap().frame.clone();
+
+            assert!(controller.set_pressed(true, 1300));
+            let pressed = controller.bar_right_cache.as_ref().unwrap().frame.clone();
+            assert_ne!(hovered.pixels_pbgra, pressed.pixels_pbgra);
+            assert_eq!(controller.click_regions(), hits);
+
+            assert!(controller.set_pressed(false, 1400));
+            controller.on_timer(1700);
+            assert_eq!(controller.bar_hover.deadline, None);
+            assert_eq!(
+                hovered.pixels_pbgra,
+                controller
+                    .bar_right_cache
+                    .as_ref()
+                    .unwrap()
+                    .frame
+                    .pixels_pbgra
+            );
+            assert!(!controller.set_pressed(false, 1800));
+        }
+    }
+
+    #[test]
+    fn releasing_away_from_a_pressed_chip_cancels_the_click_but_releasing_on_it_commits() {
+        use crate::app::types::{ClickOutcome, HIT_CARD_PANEL};
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            face_animated: false,
+            ..IslandConfig::default()
+        };
+        island.theme = "catppuccin-macchiato".into();
+        crate::theme::apply_theme(&mut island, "catppuccin-macchiato");
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            island,
+        );
+        controller.set_bar_width(1920);
+        controller.set_bar_metrics(Snapshot::empty(), 1000);
+        let height = controller.island.bar.height;
+        controller.current = controller.render_bar_frame(VisualState::Idle, 1920, height, 1000);
+        let (_, x, y, width, button_height) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == HIT_CARD_PANEL)
+            .copied()
+            .expect("Control Center chip");
+        let on_chip = (x + width as i32 / 2, y + button_height as i32 / 2);
+        let away = (on_chip.0 - 400, on_chip.1);
+
+        controller.set_hover_point_at(Some(on_chip), 1100);
+        assert!(controller.set_pressed(true, 1100));
+        assert!(controller.press_origin.is_some());
+        assert!(controller.set_pressed(false, 1200));
+        assert_eq!(
+            controller.handle_click(away.0, away.1, 1200),
+            ClickOutcome::None
+        );
+        assert!(!controller.panel_open);
+
+        controller.set_hover_point_at(Some(on_chip), 1300);
+        assert!(controller.set_pressed(true, 1300));
+        assert!(controller.set_pressed(false, 1400));
+        assert_eq!(
+            controller.handle_click(on_chip.0, on_chip.1, 1400),
+            ClickOutcome::PanelToggled
+        );
+        assert!(controller.press_origin.is_none());
+    }
+
+    #[test]
     fn visible_notification_clear_button_works_before_the_panel_finishes_resizing() {
         for position in [
             termielle_core::BarPosition::Top,

@@ -110,6 +110,12 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
             tint = blend_toward_accent(tint, crate::system::accent_color_bgra(), ACCENT_MIX_VIVID);
         }
     }
+    let (tint, border_alpha) = accessible_material(
+        tint,
+        border_alpha,
+        transparency,
+        crate::system::high_contrast_enabled(),
+    );
     config.glass.tint = tint;
     config.glass.blur_radius = blur;
     config.glass.border_alpha = border_alpha;
@@ -117,6 +123,31 @@ pub fn apply_theme(config: &mut IslandConfig, name: &str) {
     config.glass.shadow_alpha = shadow_alpha;
     config.glass.clamp();
     config.clamp();
+}
+
+/// Border opacity of a surface under a high-contrast theme: a defined edge
+/// instead of a faint hairline.
+const HIGH_CONTRAST_BORDER_ALPHA: u8 = 200;
+
+/// Applies the user's transparency and contrast settings to a theme's material.
+///
+/// Turning Windows "transparency effects" off, or running a high-contrast
+/// theme, asks for a solid surface: every theme becomes opaque, not just the
+/// ones that spelled out an opaque variant. High contrast additionally wants a
+/// defined edge so the surface still separates from what is behind it.
+fn accessible_material(
+    mut tint: [u8; 4],
+    mut border_alpha: u8,
+    transparency: bool,
+    high_contrast: bool,
+) -> ([u8; 4], u8) {
+    if !transparency || high_contrast {
+        tint[3] = 255;
+    }
+    if high_contrast {
+        border_alpha = border_alpha.max(HIGH_CONTRAST_BORDER_ALPHA);
+    }
+    (tint, border_alpha)
 }
 
 /// Vivid accent mix when "Show accent color on Start and taskbar" is enabled (40%).
@@ -401,6 +432,26 @@ mod tests {
         };
         assert_eq!(c.glass.tint, expected);
         assert!(!c.glass.notch_black);
+    }
+
+    #[test]
+    fn solid_and_contrast_settings_override_every_theme_material() {
+        let translucent = [58, 39, 36, 224];
+        assert_eq!(
+            accessible_material(translucent, 34, true, false),
+            (translucent, 34)
+        );
+        // Transparency effects off: solid, hairline border untouched.
+        assert_eq!(
+            accessible_material(translucent, 34, false, false),
+            ([58, 39, 36, 255], 34)
+        );
+        // High contrast: solid with a defined edge, and never a weaker one.
+        assert_eq!(
+            accessible_material(translucent, 34, true, true),
+            ([58, 39, 36, 255], HIGH_CONTRAST_BORDER_ALPHA)
+        );
+        assert_eq!(accessible_material(translucent, 255, true, true).1, 255);
     }
 
     #[test]

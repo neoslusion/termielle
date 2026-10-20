@@ -91,9 +91,6 @@ These were checked and deliberately left alone:
   current position and velocity, which is the interruptibility rule in
   `apple-design` §3 and the reason the project uses a spring rather than a
   fixed-duration curve.
-- **The launcher's enter and exit are asymmetric.** Opening takes 160 ms and
-  closing takes 100 ms, which is the "exit faster than enter" rule in
-  `emil-design-eng`.
 - **The easing is a strong ease-out.** `Transition` uses
   `1 − (1 − t)³`, which is the `ease-out` the skills call for on anything
   entering or responding to a pointer.
@@ -162,11 +159,78 @@ a newer Clippy failed the `-D warnings` gate on eight pre-existing findings
   (`content` and `visible_content`). The bar path — the default surface —
   was converted first; the island path keeps a `content_layer` alive as an
   `Rc` for the crossfade, which makes its reuse a separate change.
-- **The launcher's reveal still fades and rises without scaling.** Apple's
-  "materialize, don't just fade" would have the glass scale in from its
-  trigger, but the launcher paints 1:1 into a DIB, so a scale means either
-  resampling the content or moving the window — a larger change than this
-  pass took on.
+
+## Second pass: what the skills said about frequency
+
+The first pass took the skills' performance and spring rules and confirmed
+what was already right. It did not run the `review-animations` gate
+(`.opencode/skills/review-animations/STANDARDS.md`, *Should it animate?*),
+which is the first question the skills ask and the one that matters most for
+a launcher.
+
+| Surface | Gate result | Change |
+| --- | --- | --- |
+| Alt+Space launcher open/close | Keyboard-initiated, 100+ times a day: **no animation, ever** (the skills cite Raycast). The 160/100 ms reveal was praised in the first pass as asymmetric timing; the right answer was to delete it. | The launcher appears and disappears instantly. The fade, the eight-pixel rise, the exit, and the `reveal`/`origin` state behind them are gone. |
+| Arrow-key selection highlight | List navigation, tens of times a day: near-imperceptible or nothing. | 110 ms → 60 ms. Typing and mouse selection still snap. |
+| Status chips in the bar (clock, Control Center, volume, …) | Had a hover crossfade but no press state; `apple-design` §1 says feedback lands on the press, not the release. | A pressed chip takes its fill on the frame the pointer goes down and eases back over 140 ms on release. Reduced motion releases at once. The notch's existing press swell is unchanged; the bar had no press feedback at all. |
+| A click on a status chip | `apple-design` §10: a tap commits on release and can be cancelled by dragging away. A press that began on a chip used to activate whatever was under the pointer at release, which contradicted the new press fill. | A press that began on a chip only clicks if it is released on that chip. Other controls are unchanged. |
+
+The launcher's display-synced clock from the first pass stays: it now drives
+only the 60 ms highlight glide, which is where a dropped `WM_TIMER` while the
+user is typing would still show.
+
+### Also fixed: the alpha map was borrowed across the present
+
+The first pass moved the hit-test alpha map into `OverlayWindow::draw_at` as a
+`RefCell` borrow held across `UpdateLayeredWindow` and `SetWindowPos`. The
+window procedure reads that map for `WM_NCHITTEST` and `WM_SETCURSOR`, so a
+synchronous dispatch from inside the present would have hit an already-borrowed
+`RefCell` and aborted the process. The map is now built in a scratch buffer on
+the window and swapped into place only after the present succeeds, which keeps
+the allocation reuse, keeps the previous map readable throughout the present,
+and means a failed present no longer leaves the hit test describing a frame that
+never reached the screen.
+
+## Third pass: accessibility, shared motion tokens, and the surfaces not yet audited
+
+### Reduced transparency and high contrast
+
+`apple-design` §14 asks for three independent signals. Reduced motion was
+already honoured. Windows "transparency effects" off was honoured only by the
+themes that spelled out an opaque variant (`light`, `macos-dark`, the default),
+so `catppuccin-macchiato`, `midnight` and `transparent` stayed translucent. High
+contrast was not read at all.
+
+`theme::accessible_material` now applies both settings to every theme: a
+solid tint when transparency effects are off or a high-contrast theme is
+active, and, for high contrast, a defined border (never weaker than the theme
+already had). `system::high_contrast_enabled` reads `SPI_GETHIGHCONTRAST`, and a
+`WM_SETTINGCHANGE` for `SPI_SETHIGHCONTRAST` re-resolves the theme live the same
+way a light/dark flip does. The blur radius is left alone: preferences derives
+its recording-safe toggle from it, and an opaque tint already hides the blur.
+
+### One motion vocabulary
+
+The durations were hand-typed in four files (60, 120, 140 ms) and the one easing
+was a plain cubic ease-out, which the skills call too weak for UI. They now live
+in `animation/motion.rs`: `HOVER_MS`, `PRESS_RELEASE_MS`, `SELECTION_GLIDE_MS`,
+`CONTENT_SWAP_MS`, and `ease_out`, the skills' exact
+`cubic-bezier(0.23, 1, 0.32, 1)`. `Transition` uses it, so hover, press release
+and the launcher highlight share one curve. It reaches 68 % of the distance by
+20 % of the time where the cubic reached 49 %, so those motions start faster.
+The island morph is a spring driven by the user's `animation_ms` and
+`spring_bounce`, and the content crossfade keeps its smoothstep (an
+ease-in-out, which is right for a state change that is not entering).
+
+### Audit: toasts, alerts, tooltips
+
+| Surface | Result |
+| --- | --- |
+| Alert drop-in and collapse | Conforms. Arrival is a 220 ms spring, growth 350 ms, collapse 300 ms critically damped with no overshoot, so the system response snaps and the exit never bounces. The same morph spring is interruptible, and reduced motion snaps it. |
+| Queued alerts | Conforms. A second banner takes the first's place through the existing content crossfade rather than stacking or teleporting. |
+| Alert countdown hairline | Conforms. It is constant motion (linear), ticks only while a banner with a timeout is visible, and stops with it. |
+| Tooltips | Native Windows control with a 600 ms initial delay. It keeps its own shorter reshow delay while moving between tools, which is the "skip the delay after the first" rule. Not ours to restyle. |
+| Notification list scrolling | One row per wheel notch, with no glide. This is the only opportunity found: a 60-100 ms glide would remove a small teleport. It was left alone because the list is short and Windows list controls row-snap the same way. |
 
 ## Re-measuring
 

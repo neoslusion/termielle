@@ -270,6 +270,28 @@ pub fn transparency_enabled() -> bool {
     if status.is_err() { true } else { value == 1 }
 }
 
+/// Whether a Windows high-contrast theme is active. Surfaces must then be
+/// solid and bordered, whatever the Termielle theme says.
+pub fn high_contrast_enabled() -> bool {
+    use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SPI_GETHIGHCONTRAST, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
+    };
+    let mut info = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let queried = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            info.cbSize,
+            Some((&raw mut info).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    };
+    queried.is_ok() && (info.dwFlags & HCF_HIGHCONTRASTON) != Default::default()
+}
+
 /// Whether Windows paints the accent color onto Start and the taskbar
 /// ("Show accent color on Start and taskbar"). When on, the taskbar acrylic
 /// is tinted toward the accent and the island follows it in `auto` mode.

@@ -11,21 +11,25 @@ use termielle_core::VisualState;
 
 const STATUS_ICON_SIZE: i32 = 18;
 
+/// How far a fully pressed chip's fill moves toward the primary ink.
+const PRESS_MIX: f32 = 0.09;
+
 fn paint_status_chip(
     frame: &mut FrameBuffer,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
+    (x, y, width, height): super::hover::Capsule,
     palette: crate::theme::Palette,
     hover: f32,
+    press: f32,
 ) {
-    let mix = |normal: [u8; 4], active: [u8; 4]| {
+    let mix = |normal: [u8; 4], active: [u8; 4], amount: f32| -> [u8; 4] {
         std::array::from_fn(|index| {
-            (normal[index] as f32 + (active[index] as f32 - normal[index] as f32) * hover).round()
+            (normal[index] as f32 + (active[index] as f32 - normal[index] as f32) * amount).round()
                 as u8
         })
     };
+    // A press lifts the hovered fill toward the ink, so the chip answers the
+    // pointer on the frame it goes down rather than on the release.
+    let hovered = mix(palette.surface, palette.raised, hover);
     crate::animation::notch::draw_rounded_rect(
         frame,
         x,
@@ -33,8 +37,8 @@ fn paint_status_chip(
         width,
         height,
         8,
-        mix(palette.surface, palette.raised),
-        mix(palette.border, palette.hover_border),
+        mix(hovered, palette.primary, PRESS_MIX * press),
+        mix(palette.border, palette.hover_border, hover),
     );
 }
 
@@ -270,12 +274,10 @@ impl Controller {
             capsules.push(capsule);
             paint_status_chip(
                 frame,
-                x,
-                y,
-                width,
-                height,
+                capsule,
                 palette,
                 self.bar_hover.amount(capsule, self.clock_ms),
+                self.bar_hover.press_amount(capsule, self.clock_ms),
             );
         };
         let styled = matches!(

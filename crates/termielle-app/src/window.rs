@@ -668,6 +668,11 @@ unsafe extern "system" fn window_proc(
             if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SPI_SETWORKAREA.0 as usize {
                 let _ = unsafe { (*state).events.send(WindowEvent::WorkAreaChanged) };
             }
+            // A high-contrast theme switch changes the material the same way a
+            // light/dark flip does.
+            if wparam.0 == windows::Win32::UI::WindowsAndMessaging::SPI_SETHIGHCONTRAST.0 as usize {
+                let _ = unsafe { (*state).events.send(WindowEvent::SystemThemeChanged) };
+            }
             // lParam points at a NUL-terminated string naming the changed
             // setting; the light/dark toggle broadcasts "ImmersiveColorSet".
             if lparam.0 != 0 {
@@ -1009,6 +1014,11 @@ pub struct OverlayWindow {
     /// The frame's declared hit regions, in device pixels, so the alpha map
     /// can mark them as mouse targets. Empty when there is nothing to mark.
     hit_targets: RefCell<Vec<(i32, i32, u32, u32)>>,
+    /// The alpha map being built for the next present. It is swapped into
+    /// `state.alpha` once the present succeeds, which keeps the previous map
+    /// readable by the hit test for the whole of the present and hands its
+    /// allocation back here for the next frame.
+    alpha_scratch: RefCell<Vec<u8>>,
 }
 
 impl OverlayWindow {
@@ -1125,6 +1135,7 @@ impl OverlayWindow {
                 && !(config.island.is_attached() && config.island.glass.notch_black),
             surface: RefCell::new(None),
             hit_targets: RefCell::new(Vec::new()),
+            alpha_scratch: RefCell::new(Vec::new()),
             last_dest: (0, 0, 1, 1),
         };
         if matches!(config.render, RenderMode::ColorKey) {
@@ -1873,9 +1884,12 @@ impl OverlayWindow {
         // and a fresh `Vec` per frame means an allocation, a free, and a full
         // re-fill on every one of the 60 frames a second a morph runs for.
         // `clear` keeps the capacity, so `resize` reuses the same buffer.
-        let mut alpha_guard = self.state.alpha.borrow_mut();
-        alpha_guard.width = w;
-        let alpha_map = &mut alpha_guard.bytes;
+        // It is built off to the side rather than in `state.alpha`: the window
+        // procedure reads that map for `WM_NCHITTEST` and `WM_SETCURSOR`, and
+        // `UpdateLayeredWindow` below can dispatch those messages while this
+        // function is still running.
+        let mut alpha_scratch = self.alpha_scratch.borrow_mut();
+        let alpha_map = &mut *alpha_scratch;
         alpha_map.clear();
         alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         let dst = surface.pixels();
@@ -1991,6 +2005,9 @@ impl OverlayWindow {
             mark_hit_targets(dst, alpha_map, w, h, &targets);
         }
 
+        let mut published = self.state.alpha.borrow_mut();
+        std::mem::swap(&mut published.bytes, alpha_map);
+        published.width = w;
         Ok(())
     }
 

@@ -17,8 +17,7 @@ impl Transition {
         }
         let progress = (now_ms.saturating_sub(self.started_ms) as f32 / self.duration_ms as f32)
             .clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - progress).powi(3);
-        self.from + (self.target - self.from) * eased
+        self.from + (self.target - self.from) * super::motion::ease_out(progress)
     }
 
     pub(crate) fn active(self, now_ms: u64) -> bool {

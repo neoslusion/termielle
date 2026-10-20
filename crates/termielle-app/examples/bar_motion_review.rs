@@ -144,6 +144,14 @@ fn main() {
     presents.sort_by(f64::total_cmp);
     intervals.sort_by(f64::total_cmp);
     let n = costs.len();
+    // The interval is the gap between two submissions, so it carries the
+    // frame-to-frame variance of render time even when every frame is shown on
+    // its own refresh. A frame is only *missed* when the gap reaches past one
+    // and a half refreshes, or when render + present outran the refresh itself.
+    let refresh = intervals[n / 2];
+    let missed = intervals.iter().filter(|gap| **gap > refresh * 1.5).count();
+    let overran = costs.iter().filter(|cost| **cost > refresh).count();
+    println!("missed refreshes {missed}/{n}; frames over budget {overran}/{n}");
     println!(
         "{n} frames; render+present median {:.2}ms p95 {:.2}ms; presentation interval median {:.2}ms p95 {:.2}ms",
         costs[n / 2],

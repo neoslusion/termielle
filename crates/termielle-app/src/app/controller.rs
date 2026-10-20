@@ -143,6 +143,9 @@ pub struct Controller {
     pub(crate) bar_deadline: Option<u64>,
     pub(crate) volume_feedback_deadline: Option<u64>,
     pub(crate) bar_hover: super::bar::hover::CapsuleHover,
+    /// The status chip the current pointer press began on, so its release can
+    /// be told apart from a drag away.
+    pub(crate) press_origin: Option<super::bar::hover::Capsule>,
     /// Cached bar metrics to prevent heavy COM/Registry/CPU queries on every render.
     /// Most recently rendered transparent content layer for same-geometry
     /// crossfades.
@@ -255,6 +258,7 @@ impl Controller {
             bar_deadline,
             volume_feedback_deadline: None,
             bar_hover: super::bar::hover::CapsuleHover::default(),
+            press_origin: None,
             content_layer: None,
             content_transition: None,
             interaction_deadline: None,
@@ -610,7 +614,7 @@ impl Controller {
             self.content_transition = Some(ContentTransition {
                 previous,
                 started_ms: now_ms,
-                duration_ms: 140,
+                duration_ms: crate::animation::motion::CONTENT_SWAP_MS,
             });
             self.motion_deadline = Some(now_ms.saturating_add(self.motion_interval_ms));
         }

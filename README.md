@@ -186,9 +186,11 @@ watchdog does not relaunch it.
 
 Animation playback is paced by a dedicated clock thread (not `WM_TIMER`, whose
 message-queue latency cannot hold a 16 ms cadence), with the measured present
-cost subtracted from each frame interval. The Alt+Space launcher runs its own
-clock on the same model: Windows drops `WM_TIMER` messages when the window's
-queue is busy, which is exactly while the user is typing in it. Set
+cost subtracted from each frame interval. The Alt+Space launcher appears and
+disappears instantly (a keyboard-summoned window is opened too often to animate)
+and drives its arrow-key highlight from its own clock on the same model:
+Windows drops `WM_TIMER` messages when the window's queue is busy, which is
+exactly while the user is typing in it. Set
 `{"frame_rate": 60}` in the config file to play every animation at that frame
 rate instead of the GIF's own delays — the loop then takes frame count / rate
 seconds (the shipped 60-frame assets loop in one second).

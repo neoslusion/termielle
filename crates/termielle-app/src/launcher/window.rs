@@ -3,6 +3,7 @@ use super::{
     model::{Model, Target},
     paint,
 };
+use crate::animation::motion::SELECTION_GLIDE_MS;
 use crate::animation::transition::Transition;
 use crate::win32_ptr::{
     set_window_long_ptr as SetWindowLongPtrW, window_long_ptr as GetWindowLongPtrW,
@@ -38,9 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     EN_CHANGE, ES_AUTOHSCROLL, GWLP_USERDATA, GetForegroundWindow, GetParent, GetWindowTextLengthW,
     GetWindowTextW, IDC_ARROW, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassW, SW_HIDE,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW, ShowWindow,
-    WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW, ShowWindow, WA_INACTIVE,
+    WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
     WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
     WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSW, WS_CHILD,
     WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
@@ -109,14 +110,11 @@ struct State {
     file_generation: Cell<u64>,
     clock: Instant,
     reduced_motion: Cell<bool>,
-    reveal: Cell<Transition>,
     selection: Cell<Transition>,
-    /// The display-synced clock that drives the reveal and the selection
-    /// highlight. `None` until the window handle exists.
+    /// The display-synced clock that drives the selection highlight. `None`
+    /// until the window handle exists.
     motion_clock: RefCell<Option<crate::window::AnimationClock>>,
     motion_armed: Cell<bool>,
-    restore_after_exit: Cell<bool>,
-    origin: Cell<(i32, i32)>,
 }
 
 impl State {
@@ -133,8 +131,7 @@ impl State {
     /// parked.
     fn sync_motion(&self) {
         let now = self.now_ms();
-        let active = self.reveal.get().active(now)
-            || (self.visible.get() && self.selection.get().active(now));
+        let active = self.visible.get() && self.selection.get().active(now);
         if active {
             self.motion_armed.set(true);
             if let Some(clock) = self.motion_clock.borrow().as_ref() {
@@ -147,36 +144,11 @@ impl State {
         }
     }
 
-    fn apply_reveal(&self, now_ms: u64) {
-        let amount = self.reveal.get().value(now_ms).clamp(0.0, 1.0);
-        let (x, y) = self.origin.get();
-        let offset = ((1.0 - amount) * 8.0 * self.scale.get()).round() as i32;
-        let _ = unsafe {
-            SetLayeredWindowAttributes(
-                self.hwnd.get(),
-                COLORREF(0),
-                (amount * 255.0).round() as u8,
-                LWA_ALPHA,
-            )
-        };
-        let _ = unsafe {
-            SetWindowPos(
-                self.hwnd.get(),
-                None,
-                x,
-                y + offset,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        };
-    }
-
     fn sync_selection(&self, animate: bool, force: bool) {
         let target = self.model.borrow().selected as f32 * paint::ROW_HEIGHT as f32;
         let mut selection = self.selection.get();
         if animate && !self.reduced_motion.get() {
-            selection.retarget(target, self.now_ms(), 110);
+            selection.retarget(target, self.now_ms(), SELECTION_GLIDE_MS);
         } else if force || selection.target != target {
             selection.snap(target);
         }
@@ -185,25 +157,12 @@ impl State {
     }
 
     fn tick(&self, now_ms: u64) {
-        if !self.visible.get()
-            && self.reveal.get().target == 0.0
-            && !self.reveal.get().active(now_ms)
-        {
-            self.finish_hide(self.restore_after_exit.replace(false));
-            return;
-        }
         let repaint_selection = !self.selection.get().is_constant();
-        let mut reveal = self.reveal.get();
-        if !reveal.active(now_ms) {
-            reveal.snap(reveal.target);
-            self.reveal.set(reveal);
-        }
         let mut selection = self.selection.get();
         if !selection.active(now_ms) {
             selection.snap(selection.target);
             self.selection.set(selection);
         }
-        self.apply_reveal(now_ms);
         if repaint_selection {
             let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), None, false) };
         }
@@ -265,32 +224,17 @@ impl State {
     }
 
     fn hide(&self, restore_focus: bool) {
-        if !self.visible.replace(false) && !self.reveal.get().active(self.now_ms()) {
+        if !self.visible.replace(false) {
             return;
         }
         self.pending_icons.lock().unwrap().clear();
         self.file_generation
             .set(self.file_generation.get().wrapping_add(1));
-        if restore_focus && !self.reduced_motion.get() {
-            self.restore_after_exit.set(true);
-            let mut reveal = self.reveal.get();
-            reveal.retarget(0.0, self.now_ms(), 100);
-            self.reveal.set(reveal);
-            self.sync_motion();
-            if !self.motion_armed.get() {
-                self.finish_hide(restore_focus);
-            }
-            return;
-        }
         self.finish_hide(restore_focus);
     }
 
     fn finish_hide(&self, restore_focus: bool) {
         self.visible.set(false);
-        self.restore_after_exit.set(false);
-        let mut reveal = self.reveal.get();
-        reveal.snap(0.0);
-        self.reveal.set(reveal);
         let mut selection = self.selection.get();
         selection.snap(selection.target);
         self.selection.set(selection);
@@ -310,14 +254,6 @@ impl State {
         if foreground != self.hwnd.get() {
             self.previous_window.set(foreground);
         }
-        self.restore_after_exit.set(false);
-        let mut reveal = self.reveal.get();
-        if self.reduced_motion.get() {
-            reveal.snap(1.0);
-        } else {
-            reveal.retarget(1.0, self.now_ms(), 160);
-        }
-        self.reveal.set(reveal);
         self.generation.set(self.generation.get().wrapping_add(1));
         {
             let mut model = self.model.borrow_mut();
@@ -336,10 +272,6 @@ impl State {
             let height =
                 (paint::height(&self.model.borrow()) as f32 * self.scale.get()).round() as i32;
             let work = info.rcWork;
-            self.origin.set((
-                work.left + (work.right - work.left - width) / 2,
-                work.top + (work.bottom - work.top - height).max(0) / 4,
-            ));
             let _ = unsafe {
                 SetWindowPos(
                     self.hwnd.get(),
@@ -353,7 +285,6 @@ impl State {
             };
         }
         self.sync_selection(false, true);
-        self.apply_reveal(self.now_ms());
         self.visible.set(true);
         let _ = unsafe { ShowWindow(self.hwnd.get(), SW_SHOW) };
         let _ = unsafe { SetForegroundWindow(self.hwnd.get()) };
@@ -630,12 +561,9 @@ impl LauncherWindow {
             file_generation: Cell::new(0),
             clock: Instant::now(),
             reduced_motion: Cell::new(false),
-            reveal: Cell::new(Transition::default()),
             selection: Cell::new(Transition::default()),
             motion_clock: RefCell::new(None),
             motion_armed: Cell::new(false),
-            restore_after_exit: Cell::new(false),
-            origin: Cell::new((0, 0)),
         });
         let hwnd = unsafe {
             CreateWindowExW(
@@ -653,10 +581,13 @@ impl LauncherWindow {
                 Some((&*state as *const State).cast()),
             )?
         };
+        // A layered window paints nothing until its attributes are set. The
+        // launcher is always fully opaque: it appears and disappears instantly.
+        unsafe { SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA) }?;
         let mut launcher = Self { state };
         launcher.state.notifier.hwnd = hwnd.0 as isize;
-        // The motion clock drives the reveal and the selection highlight off
-        // the display's vertical blank. The launcher needs its own clock
+        // The motion clock drives the selection highlight off the display's
+        // vertical blank. The launcher needs its own clock
         // because it lives in its own window with its own message queue.
         *launcher.state.motion_clock.borrow_mut() =
             Some(crate::window::AnimationClock::spawn_with(
@@ -773,14 +704,8 @@ impl LauncherWindow {
 
     pub fn configure(&self, island: &IslandConfig, reduced_motion: bool) {
         if self.state.reduced_motion.replace(reduced_motion) != reduced_motion && reduced_motion {
-            let mut reveal = self.state.reveal.get();
-            reveal.snap(reveal.target);
-            self.state.reveal.set(reveal);
             self.state.sync_selection(false, true);
-            if !self.state.visible.get() {
-                self.state.finish_hide(false);
-            } else {
-                self.state.apply_reveal(self.state.now_ms());
+            if self.state.visible.get() {
                 self.state.redraw();
             }
         }
@@ -872,11 +797,6 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
             state.scale.set((wparam.0 & 0xffff) as f32 / 96.0);
             state.restyle();
             let rect = unsafe { &*(lparam.0 as *const RECT) };
-            let offset = ((1.0 - state.reveal.get().value(state.now_ms()))
-                * 8.0
-                * state.scale.get())
-            .round() as i32;
-            state.origin.set((rect.left, rect.top - offset));
             let _ = unsafe {
                 SetWindowPos(
                     hwnd,
@@ -996,9 +916,6 @@ mod tests {
         let launcher = LauncherWindow::create_window(&IslandConfig::default(), false).unwrap();
         let state = &launcher.state;
         state.visible.set(true);
-        let mut reveal = state.reveal.get();
-        reveal.snap(1.0);
-        state.reveal.set(reveal);
         state.model.borrow_mut().set_apps(vec![
             App::application("Alpha".into(), vec![0, 0]),
             App::application("Beta".into(), vec![1, 0, 0]),
@@ -1023,26 +940,38 @@ mod tests {
     }
 
     #[test]
-    fn reveal_settles_and_reduced_motion_parks_the_launcher_motion_clock() {
+    fn the_launcher_appears_and_disappears_instantly_and_parks_its_motion_clock() {
         let island = IslandConfig::default();
         let launcher = LauncherWindow::create_window(&island, false).unwrap();
         let state = &launcher.state;
-        state.visible.set(true);
-        let started = state.now_ms();
-        let mut reveal = state.reveal.get();
-        reveal.retarget(1.0, started, 160);
-        state.reveal.set(reveal);
-        state.sync_motion();
+        state.model.borrow_mut().set_apps(vec![
+            App::application("Alpha".into(), vec![0, 0]),
+            App::application("Beta".into(), vec![1, 0, 0]),
+        ]);
+        state.show();
+        assert!(state.visible.get());
+        assert!(!state.motion_armed.get());
+        unsafe {
+            SendMessageW(
+                state.edit.get(),
+                WM_KEYDOWN,
+                Some(WPARAM(VK_DOWN.0 as usize)),
+                Some(LPARAM(0)),
+            )
+        };
         assert!(state.motion_armed.get());
-        state.tick(started + 200);
-        assert_eq!(state.reveal.get().value(started + 200), 1.0);
+        let settled = state.now_ms() + SELECTION_GLIDE_MS + 1;
+        state.tick(settled);
+        assert_eq!(
+            state.selection.get().value(settled),
+            paint::ROW_HEIGHT as f32
+        );
         assert!(!state.motion_armed.get());
         state.hide(true);
         assert!(!state.visible.get());
-        assert!(state.motion_armed.get());
+        assert!(!state.motion_armed.get());
         launcher.configure(&island, true);
         assert!(!state.motion_armed.get());
-        assert_eq!(state.reveal.get().value(state.now_ms()), 0.0);
     }
 
     #[test]

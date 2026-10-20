@@ -8,6 +8,7 @@
 mod fallback;
 mod gif;
 pub(crate) mod icons;
+pub(crate) mod motion;
 pub mod notch;
 mod text_cache;
 pub(crate) mod text_layout;

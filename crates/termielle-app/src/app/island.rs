@@ -686,6 +686,13 @@ impl Controller {
 
     pub fn handle_click(&mut self, x: i32, y: i32, now_ms: u64) -> ClickOutcome {
         let (x, y) = (self.to_logical(x), self.to_logical(y));
+        // A press that began on a status chip is cancelled by releasing
+        // anywhere else: dragging away is how a pointer takes a click back.
+        if let Some(origin) = self.press_origin.take() {
+            if !self.capsule_contains(origin, (x, y)) {
+                return ClickOutcome::None;
+            }
+        }
         let hit_id = self
             .icon_hits
             .iter()
@@ -812,6 +819,34 @@ impl Controller {
         ClickOutcome::None
     }
 
+    /// Whether `point` (logical frame pixels) is inside a status chip. Chips
+    /// are stored relative to the bar row, so the row's offset is applied here.
+    fn capsule_contains(
+        &self,
+        (x, y, width, height): super::bar::hover::Capsule,
+        (px, py): (i32, i32),
+    ) -> bool {
+        let (_, frame_height) = self.current_logical_size();
+        let bar_y = if self.island.bar.position == termielle_core::BarPosition::Bottom {
+            frame_height.saturating_sub(self.island.bar.height) as i32
+        } else {
+            0
+        };
+        px >= x && px < x + width as i32 && py - bar_y >= y && py - bar_y < y + height as i32
+    }
+
+    /// The right-zone status chip under `point` (logical frame pixels), if any.
+    fn bar_capsule_at(&self, point: Option<(i32, i32)>) -> Option<super::bar::hover::Capsule> {
+        let point = point?;
+        self.bar_right_cache.as_ref().and_then(|cache| {
+            cache
+                .capsules
+                .iter()
+                .copied()
+                .find(|capsule| self.capsule_contains(*capsule, point))
+        })
+    }
+
     /// Stores the cursor position for icon hover highlighting. The poll
     /// reports physical client pixels; they are mapped to frame space before
     /// comparing against `icon_hits`. Triggers a repaint only when the
@@ -833,26 +868,7 @@ impl Controller {
         };
         let mut changed = on_icon(&self.hover_point) != on_icon(&point);
         if self.island.is_bar() {
-            let (_, height) = self.current_logical_size();
-            let bar_y = if self.island.bar.position == termielle_core::BarPosition::Bottom {
-                height.saturating_sub(self.island.bar.height) as i32
-            } else {
-                0
-            };
-            let capsule = point.and_then(|(px, py)| {
-                self.bar_right_cache.as_ref().and_then(|cache| {
-                    cache
-                        .capsules
-                        .iter()
-                        .copied()
-                        .find(|(x, y, width, height)| {
-                            px >= *x
-                                && px < *x + *width as i32
-                                && py - bar_y >= *y
-                                && py - bar_y < *y + *height as i32
-                        })
-                })
-            });
+            let capsule = self.bar_capsule_at(point);
             if self
                 .bar_hover
                 .set_target(capsule, now_ms, self.reduced_motion)
@@ -1087,11 +1103,44 @@ impl Controller {
     /// The island swells ~3% under the pointer, like the Dynamic Island
     /// under the fingertip, and settles back on release.
     pub fn set_pressed(&mut self, pressed: bool, now_ms: u64) -> bool {
-        if !self.island.is_enabled() || self.island.is_bar() || self.pressed == pressed {
+        if self.island.is_bar() {
+            return self.set_bar_press(pressed, now_ms);
+        }
+        if !self.island.is_enabled() || self.pressed == pressed {
             return false;
         }
         self.pressed = pressed;
         self.morph_to_target(now_ms)
+    }
+
+    /// The bar half of [`Self::set_pressed`]: the status chip under the pointer
+    /// takes its press fill. The bar has no swell, so the chip is the only
+    /// thing that can answer the press.
+    fn set_bar_press(&mut self, pressed: bool, now_ms: u64) -> bool {
+        if !self.island.is_enabled() {
+            return false;
+        }
+        self.clock_ms = now_ms;
+        let capsule = if pressed {
+            self.bar_capsule_at(self.hover_point)
+        } else {
+            None
+        };
+        if pressed {
+            // The release that follows this press belongs to it: it only
+            // counts as a click if it lands on the chip that was pressed.
+            self.press_origin = capsule;
+        }
+        if !self
+            .bar_hover
+            .set_pressed(capsule, now_ms, self.reduced_motion)
+        {
+            return false;
+        }
+        self.bar_right_cache = None;
+        let (width, height) = self.current_logical_size();
+        self.rerender_island(width, height, now_ms);
+        true
     }
 
     /// Spring for one morph: growing surfaces open with the configured
