@@ -1,6 +1,6 @@
 //! One-shot deadlines paced by the overlay monitor's vertical blank.
 
-use super::{WakeHandle, now_ms};
+use super::{ANIMATION_MSG, WakeHandle, now_ms};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
@@ -44,7 +44,22 @@ fn find_output(factory: &IDXGIFactory1, monitor: usize) -> Option<IDXGIOutput> {
 }
 
 impl AnimationClock {
+    /// The overlay's clock: wakes the overlay with its own animation message.
     pub fn spawn(wake: WakeHandle) -> Self {
+        Self::spawn_with(wake, ANIMATION_MSG)
+    }
+
+    /// A clock for another window: it wakes `wake` with `message` once per
+    /// display refresh.
+    ///
+    /// A `WM_TIMER` cannot do this. Windows delivers timer messages through
+    /// the window's own message queue and drops them when that queue is
+    /// busy, so a timer-driven animation stutters exactly when the window
+    /// has work to do — while the user is typing in the launcher, for
+    /// instance. This thread waits for the display's vertical blank and
+    /// posts a message, so the frame lands on the refresh no matter what
+    /// else the queue is carrying.
+    pub fn spawn_with(wake: WakeHandle, message: u32) -> Self {
         let (sender, receiver) = mpsc::channel::<Command>();
         let hwnd = wake.hwnd.0 as usize;
         std::thread::spawn(move || {
@@ -118,7 +133,7 @@ impl AnimationClock {
                 }
                 // Disarm before posting: each arm produces at most one wake.
                 deadline = None;
-                if wake.post_animation().is_err() {
+                if wake.post_message(message).is_err() {
                     break;
                 }
             }
@@ -130,6 +145,15 @@ impl AnimationClock {
     /// A new command interrupts an older wait, including an idle wait.
     pub fn arm(&self, deadline: Option<u64>) {
         let _ = self.sender.send(Command::Arm(deadline));
+    }
+
+    /// Arms the clock for the next display refresh.
+    ///
+    /// `delay_ms` is measured from now, in milliseconds; the wake still
+    /// lands on a vertical blank, so the delay only says how long the clock
+    /// may wait before it starts looking for one.
+    pub fn arm_after(&self, delay_ms: u64) {
+        self.arm(Some(now_ms().saturating_add(delay_ms)));
     }
 
     /// Re-resolve the output after display topology/resume, even when Windows

@@ -78,6 +78,27 @@ pub struct FrameBuffer {
 }
 
 impl FrameBuffer {
+    /// Resizes the canvas to `width` x `height` device pixels at `scale` and
+    /// clears it to fully transparent.
+    ///
+    /// The pixel buffer's allocation survives a resize to the same size, so a
+    /// canvas that is repainted every frame stops paying for an allocation
+    /// (and the page faults that come with a fresh multi-megabyte mapping)
+    /// on every one of those frames.
+    pub fn resize_cleared(&mut self, width: u32, height: u32, scale: f32) {
+        let bytes = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|count| count.checked_mul(4))
+            .unwrap_or_default();
+        self.width = width;
+        self.height = height;
+        self.scale = scale;
+        self.delay_ms = 0;
+        self.loop_index = 0;
+        self.pixels_pbgra.clear();
+        self.pixels_pbgra.resize(bytes, 0);
+    }
+
     /// The alpha byte of one pixel; out-of-bounds pixels are transparent.
     pub fn alpha_at(&self, x: u32, y: u32) -> u8 {
         if x >= self.width || y >= self.height {
@@ -91,6 +112,19 @@ impl FrameBuffer {
         self.pixels_pbgra
             .chunks_exact(4)
             .any(|chunk| chunk == pixel)
+    }
+}
+
+impl Default for FrameBuffer {
+    fn default() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            pixels_pbgra: Vec::new(),
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        }
     }
 }
 

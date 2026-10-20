@@ -170,17 +170,11 @@ impl Controller {
         // unchanged by a face frame, so taking the cached-zone path here is
         // what keeps a resting bar animating without a full strip rebuild
         // every tick.
-        self.current = if self.island.is_bar() {
-            self.render_bar_with_damage(
-                self.state,
-                w,
-                h,
-                now_ms,
-                crate::app::bar::modules::BarDamage::CENTER,
-            )
+        if self.island.is_bar() {
+            self.rerender_bar(w, h, now_ms, crate::app::bar::modules::BarDamage::CENTER);
         } else {
-            self.render_island(self.state, w, h, now_ms)
-        };
+            self.rerender_island(w, h, now_ms);
+        }
     }
 }
 /// Box-downscales a premultiplied BGRA frame to `size x size`.

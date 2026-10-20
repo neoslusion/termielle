@@ -93,7 +93,6 @@ fn main() -> std::io::Result<()> {
                         pixels_pbgra: pixels,
                     }
                 }),
-                ..Default::default()
             }),
             ..Default::default()
         });
@@ -196,7 +195,6 @@ fn main() -> std::io::Result<()> {
             },
             cpu_pct: 24,
             memory_pct: 58,
-            ..Default::default()
         };
         controller.set_bar_metrics(metrics.clone(), 10000);
         if std::env::args().any(|arg| arg == "--volume-feedback") {

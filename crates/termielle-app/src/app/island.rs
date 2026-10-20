@@ -28,10 +28,12 @@ impl Controller {
         width: u32,
         height: u32,
         now_ms: u64,
-    ) -> FrameBuffer {
+        frame: &mut FrameBuffer,
+    ) {
         self.activity.deadline = None;
         if self.island.is_bar() {
-            return self.render_bar(state, width, height, now_ms);
+            self.render_bar(state, width, height, now_ms, frame);
+            return;
         }
         // Every fresh frame re-derives banner visibility: the countdown tick
         // must stop the moment a collapse or cutover leaves no banner on
@@ -43,7 +45,10 @@ impl Controller {
         let presentation = self.presentation();
         if presentation == Presentation::Hidden || height <= 4 {
             self.icon_hits.clear();
-            return self.blank_frame(width, height);
+            let scale = self.render_scale();
+            let (device_w, device_h) = scaled_size((width.max(1), height.max(1)), scale);
+            frame.resize_cleared(device_w, device_h, scale);
+            return;
         }
         if self.spring.is_none() {
             self.radius = self.target_radius();
@@ -53,7 +58,7 @@ impl Controller {
         let radius = (self.radius.round() as u32).min(height / 2);
         let blobs = self.blob_rects(width, height, radius, attached);
         let black = island.glass.notch_black && attached;
-        let mut frame = self.glass_layer_blobs(width, height, radius, attached, &blobs, black);
+        self.glass_layer_blobs_into(frame, width, height, radius, attached, &blobs, black);
 
         // Content rides the morph: it is drawn on its own canvas and
         // composited with an enter alpha (plus a slight rise for the
@@ -122,7 +127,7 @@ impl Controller {
         let bridge_k = crate::animation::notch::BRIDGE_K_MAX
             * (1.0 - self.separation_now().clamp(0.0, BLOB_GAP_PX) / BLOB_GAP_PX);
         crate::animation::notch::clip_content(&mut visible_content, &blobs, bridge_k);
-        crate::animation::notch::blend_frame_over(&mut frame, &visible_content, 0, 0, 255);
+        crate::animation::notch::blend_frame_over(frame, &visible_content, 0, 0, 255);
         // An interruption starts from the composite the user actually saw,
         // including a partially completed content swap.
         self.content_layer = Some(std::rc::Rc::new(visible_content));
@@ -135,7 +140,7 @@ impl Controller {
         } else if self.media_playing() && island.has_widget("music") {
             crate::system::accent_color_bgra()
         } else {
-            return frame;
+            return;
         };
         // Awaiting input breathes: the strip pulses slowly so "waiting"
         // never reads as dead.
@@ -148,8 +153,7 @@ impl Controller {
         } else {
             strip
         };
-        crate::animation::notch::draw_accent_strip(&mut frame, attached, radius, strip);
-        frame
+        crate::animation::notch::draw_accent_strip(frame, attached, radius, strip);
     }
 
     /// The iOS/macOS presentation the pill should rest in right now:
@@ -497,8 +501,7 @@ impl Controller {
             if self.island.is_bar() {
                 let (_, current_h) = self.current_logical_size();
                 let (_, target_h) = self.target_size(self.state);
-                self.current =
-                    self.render_island(self.state, width_logical, current_h, self.clock_ms);
+                self.rerender_island(width_logical, current_h, self.clock_ms);
                 if current_h != target_h {
                     self.morph_to_target(self.clock_ms);
                 }
@@ -575,7 +578,7 @@ impl Controller {
         self.content_transition = None;
         self.content_layer = None;
         if self.island.is_enabled() {
-            self.current = self.render_island(self.state, logical_w, logical_h, now_ms);
+            self.rerender_island(logical_w, logical_h, now_ms);
         } else {
             let _ = self.load_animation_classic(self.state, now_ms);
             return true;
@@ -677,7 +680,7 @@ impl Controller {
             self.bar_right_cache = None;
         }
         let (width, height) = self.current_logical_size();
-        self.current = self.render_bar_with_damage(self.state, width, height, now_ms, damage);
+        self.rerender_bar(width, height, now_ms, damage);
         true
     }
 
@@ -861,7 +864,7 @@ impl Controller {
         self.hover_point = point;
         if changed && self.island.is_enabled() {
             let (width, height) = self.current_logical_size();
-            self.current = self.render_island(self.state, width, height, self.clock_ms);
+            self.rerender_island(width, height, self.clock_ms);
         }
         changed
     }
@@ -1141,7 +1144,7 @@ impl Controller {
                     && s.target_radius() == target_r
             })
         {
-            self.current = self.render_island(self.state, from_w, from_h, now_ms);
+            self.rerender_island(from_w, from_h, now_ms);
             return true;
         }
 
@@ -1155,7 +1158,7 @@ impl Controller {
                 self.panel_morphing = false;
             }
             self.radius = target_r;
-            self.current = self.render_island(self.state, target_w, target_h, now_ms);
+            self.rerender_island(target_w, target_h, now_ms);
             self.frame_deadline = None;
             return true;
         }
@@ -1185,7 +1188,7 @@ impl Controller {
                 self.alert_pill_morphing = false;
             }
             self.radius = target_r;
-            self.current = self.render_island(self.state, target_w, target_h, now_ms);
+            self.rerender_island(target_w, target_h, now_ms);
             self.frame_deadline = None;
             return true;
         }
@@ -1215,8 +1218,7 @@ impl Controller {
         // State ownership and pixels change together. Otherwise the event
         // path acknowledges the new state while presenting the previous glyph
         // until the first display-clock wake.
-        self.current = self.render_island(
-            self.state,
+        self.rerender_island(
             from_w.round().max(1.0) as u32,
             from_h.round().max(1.0) as u32,
             now_ms,

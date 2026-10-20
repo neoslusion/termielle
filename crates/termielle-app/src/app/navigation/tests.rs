@@ -367,7 +367,7 @@ fn visible_rows_work_mid_resize_and_hidden_footer_never_has_hit_targets() {
         let mut c = controller(position, 1280, 1.0);
         update(&mut c, (1..=6).map(|i| win(i, "Editor")).collect());
         click(&mut c, Action::Group(app("Editor").key()), false);
-        c.current = c.render_bar(
+        c.current = c.render_bar_frame(
             c.state,
             1280,
             c.island.bar.height + super::super::bar::types::BAR_POPUP_GAP + 120,

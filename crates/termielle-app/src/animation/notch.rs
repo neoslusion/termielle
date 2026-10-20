@@ -312,7 +312,9 @@ pub fn glass_layer(
     glass: &GlassConfig,
     scale: f32,
 ) -> FrameBuffer {
-    glass_layer_blobs(
+    let mut frame = FrameBuffer::default();
+    glass_layer_blobs_into(
+        &mut frame,
         width,
         height,
         &[BlobRect {
@@ -327,7 +329,8 @@ pub fn glass_layer(
         false,
         BRIDGE_K_MAX,
         scale,
-    )
+    );
+    frame
 }
 
 /// Renders the frosted-glass material (shadow, body, border, highlight) in
@@ -337,7 +340,13 @@ pub fn glass_layer(
 /// geometry. `bridge_k` is the liquid-bridge fillet between blobs in
 /// pixels. With `black` set the body is opaque true black — the material
 /// of the real notch, which must read as display hardware, not glass.
-pub fn glass_layer_blobs(
+///
+/// The material is written into `out` rather than into a fresh buffer, so a
+/// surface that is redrawn every frame reuses one allocation instead of
+/// taking a new multi-megabyte mapping on every one of those frames.
+#[allow(clippy::too_many_arguments)] // material renderer: every input is a distinct material or geometry term.
+pub fn glass_layer_blobs_into(
+    out: &mut FrameBuffer,
     width: u32,
     height: u32,
     blobs: &[BlobRect],
@@ -345,30 +354,24 @@ pub fn glass_layer_blobs(
     black: bool,
     bridge_k: f32,
     scale: f32,
-) -> FrameBuffer {
+) {
     let (width, height) = scaled_size((width.max(1), height.max(1)), scale);
-    let mut frame = FrameBuffer {
-        width,
-        height,
-        pixels_pbgra: vec![0u8; (width * height * 4) as usize],
-        delay_ms: 0,
-        loop_index: 0,
-        scale,
-    };
+    out.resize_cleared(width, height, scale);
     if blobs.is_empty() {
-        return frame;
+        return;
     }
+    let frame = out;
     // Author the material at device resolution: blob geometry, the bridge
     // fillet, and every material constant below are logical units scaled
     // here, so the layers keep their designed proportions at any DPI.
     let blobs: Vec<BlobRect> = blobs
         .iter()
         .map(|b| BlobRect {
-            x: sx(&frame, b.x),
-            y: sx(&frame, b.y),
-            w: su(&frame, b.w),
-            h: su(&frame, b.h),
-            r: su(&frame, b.r),
+            x: sx(frame, b.x),
+            y: sx(frame, b.y),
+            w: su(frame, b.w),
+            h: su(frame, b.h),
+            r: su(frame, b.r),
             attached: b.attached,
         })
         .collect();
@@ -394,7 +397,7 @@ pub fn glass_layer_blobs(
         let bx_end = (blobs[0].x + blobs[0].w as i32).max(0) as usize;
         let bx_end = bx_end.min(width as usize);
         if bx_start >= bx_end {
-            return frame;
+            return;
         }
         for y in by_start..by_end {
             let row = y * width as usize * 4;
@@ -404,7 +407,7 @@ pub fn glass_layer_blobs(
                 chunk.copy_from_slice(&body);
             }
         }
-        return frame;
+        return;
     }
 
     for y in 0..height {
@@ -526,7 +529,6 @@ pub fn glass_layer_blobs(
             frame.pixels_pbgra[idx..idx + 4].copy_from_slice(&acc);
         }
     }
-    frame
 }
 
 /// Bilinear sample of a premultiplied BGRA frame at fractional source

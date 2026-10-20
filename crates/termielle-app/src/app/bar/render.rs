@@ -112,12 +112,18 @@ impl Controller {
         width: u32,
         height: u32,
         now_ms: u64,
-    ) -> FrameBuffer {
-        self.render_bar_with_damage(state, width, height, now_ms, BarDamage::FULL)
+        frame: &mut FrameBuffer,
+    ) {
+        self.render_bar_with_damage(state, width, height, now_ms, BarDamage::FULL, frame)
     }
 
     /// Renders only the bar zones invalidated by a metrics update. The
     /// center surface and the other zone are retained from the previous frame.
+    ///
+    /// The result is written into `frame` rather than into a buffer of its
+    /// own. The bar surface is several megabytes wide, and a morph redraws it
+    /// sixty times a second: allocating a fresh canvas per frame meant an
+    /// allocation, a free, and a page-fault storm on every one of them.
     pub(crate) fn render_bar_with_damage(
         &mut self,
         state: VisualState,
@@ -125,7 +131,8 @@ impl Controller {
         height: u32,
         now_ms: u64,
         damage: BarDamage,
-    ) -> FrameBuffer {
+        frame: &mut FrameBuffer,
+    ) {
         let damage = if self.is_navigation_open() {
             BarDamage::FULL
         } else {
@@ -208,8 +215,8 @@ impl Controller {
             && !damage.contains(BarDamage::CENTER)
             && left_valid
             && right_valid
-            && self.current.width == device_w
-            && self.current.height == device_h;
+            && frame.width == device_w
+            && frame.height == device_h;
 
         if !can_partial {
             self.icon_hits.clear();
@@ -254,20 +261,23 @@ impl Controller {
             .collect();
 
         if can_partial {
-            let mut frame = self.current.clone();
+            // `frame` still holds the previous frame, so only the damaged
+            // zones are cleared and repainted. The old path cloned the whole
+            // surface first to get that behaviour, which copied every pixel
+            // of the bar on every metrics tick.
             if damage.contains(BarDamage::LEFT) {
-                clear_region(&mut frame, bar_y, 0, left_end, bar_h);
+                clear_region(frame, bar_y, 0, left_end, bar_h);
                 if let Some(row) = row.as_ref() {
-                    composite_region(&mut frame, row, bar_y, 0, left_end);
+                    composite_region(frame, row, bar_y, 0, left_end);
                 }
-                composite_region(&mut frame, &left_frame, bar_y, 0, left_end);
+                composite_region(frame, &left_frame, bar_y, 0, left_end);
             }
             if damage.contains(BarDamage::RIGHT) {
-                clear_region(&mut frame, bar_y, right_start, width, bar_h);
+                clear_region(frame, bar_y, right_start, width, bar_h);
                 if let Some(row) = row.as_ref() {
-                    composite_region(&mut frame, row, bar_y, right_start, width);
+                    composite_region(frame, row, bar_y, right_start, width);
                 }
-                composite_region(&mut frame, &right_frame, bar_y, right_start, width);
+                composite_region(frame, &right_frame, bar_y, right_start, width);
             }
             let mut hits = left_hits;
             hits.extend(right_hits);
@@ -279,19 +289,19 @@ impl Controller {
                 .collect();
             hits.extend(old_center);
             self.icon_hits = hits;
-            return frame;
+            return;
         }
 
-        let mut frame = self.blank_frame(width, height);
+        frame.resize_cleared(device_w, device_h, self.render_scale());
         if let Some(row) = row.as_ref() {
-            composite_region(&mut frame, row, bar_y, 0, width);
+            composite_region(frame, row, bar_y, 0, width);
         }
-        composite_region(&mut frame, &left_frame, bar_y, 0, left_end);
-        composite_region(&mut frame, &right_frame, bar_y, right_start, width);
+        composite_region(frame, &left_frame, bar_y, 0, left_end);
+        composite_region(frame, &right_frame, bar_y, right_start, width);
         if island_expanded && self.bar_module("center", "termielle") {
             let tint = self.island.glass.tint;
             crate::animation::notch::draw_rounded_rect(
-                &mut frame,
+                frame,
                 island_x,
                 island_y,
                 island_w,
@@ -319,14 +329,13 @@ impl Controller {
         };
         let mut bar_hits = left_hits;
         bar_hits.extend(right_hits);
-        self.paint_bar_center(&mut frame, state, now_ms, width, card, bar_hits);
+        self.paint_bar_center(frame, state, now_ms, width, card, bar_hits);
         if (self.panel_open || self.panel_morphing) && expanded {
-            self.paint_bar_panel(&mut frame, width, exp_h, bar_y, content_w, now_ms);
+            self.paint_bar_panel(frame, width, exp_h, bar_y, content_w, now_ms);
         }
         if self.is_navigation_open() && expanded {
-            self.paint_navigation_popup(&mut frame, width, exp_h, bar_y);
+            self.paint_navigation_popup(frame, width, exp_h, bar_y);
         }
-        frame
     }
 
     fn paint_bar_panel(
@@ -498,7 +507,7 @@ mod tests {
                         + BAR_POPUP_GAP
                         + crate::app::cards::panel::panel_height();
                     controller.current =
-                        controller.render_bar(VisualState::Idle, 1920, height, 1000);
+                        controller.render_bar_frame(VisualState::Idle, 1920, height, 1000);
                     let capsule = controller.bar_right_cache.as_ref().unwrap().capsules[0];
                     let left = controller.bar_left_cache.as_ref().unwrap().frame.clone();
                     let before = controller.bar_right_cache.as_ref().unwrap().frame.clone();
@@ -587,7 +596,7 @@ mod tests {
             let visible_height = panel_height - 12;
             let height = controller.island.bar.height + BAR_POPUP_GAP + visible_height;
             controller.current =
-                controller.render_bar(VisualState::Idle, controller.bar_width, height, 1_100);
+                controller.render_bar_frame(VisualState::Idle, controller.bar_width, height, 1_100);
             let (_, x, y, width, button_height) = controller
                 .click_regions()
                 .iter()
@@ -646,7 +655,7 @@ mod tests {
                 + crate::app::cards::media::MEDIA_HEIGHT
                 - 12;
             controller.current =
-                controller.render_bar(VisualState::Idle, controller.bar_width, height, 1_100);
+                controller.render_bar_frame(VisualState::Idle, controller.bar_width, height, 1_100);
             let (_, x, y, width, button_height) = controller
                 .click_regions()
                 .iter()
@@ -782,9 +791,9 @@ mod tests {
         let height = 40u32;
 
         let mut top = bar_controller(termielle_core::BarPosition::Top);
-        let top_frame = top.render_bar(VisualState::Idle, width, height, 60_000);
+        let top_frame = top.render_bar_frame(VisualState::Idle, width, height, 60_000);
         let mut bottom = bar_controller(termielle_core::BarPosition::Bottom);
-        let bottom_frame = bottom.render_bar(VisualState::Idle, width, height, 60_000);
+        let bottom_frame = bottom.render_bar_frame(VisualState::Idle, width, height, 60_000);
 
         let bar_y = (height - bar_h) as usize;
         let differing = (0..bar_h as usize)
@@ -857,7 +866,7 @@ mod tests {
         let width = 1536u32;
 
         let mut edge = bar_controller(0, 0);
-        let frame = edge.render_bar(VisualState::Idle, width, 36, 60_000);
+        let frame = edge.render_bar_frame(VisualState::Idle, width, 36, 60_000);
         let alpha = |f: &crate::animation::FrameBuffer, x: u32, y: u32| -> u8 {
             let idx = ((y as usize * f.width as usize) + x as usize) * 4;
             f.pixels_pbgra[idx + 3]
@@ -885,7 +894,7 @@ mod tests {
 
         for (margin, corner_radius) in [(12u32, 0u32), (0, 10)] {
             let mut floating = bar_controller(margin, corner_radius);
-            let frame = floating.render_bar(VisualState::Idle, width, 36, 60_000);
+            let frame = floating.render_bar_frame(VisualState::Idle, width, 36, 60_000);
             let y = (floating.bar_row().1 + 4) as u32;
             for x in [margin + 4, width / 2, width - margin - 5] {
                 assert!(
@@ -906,7 +915,7 @@ mod tests {
             island.bar.modules_right =
                 vec!["clock".into(), "volume".into(), "control_center".into()];
             controller.set_island_config(island.clone(), 60_000);
-            controller.render_bar(VisualState::Idle, 1536, 36, 60_000);
+            controller.render_bar_frame(VisualState::Idle, 1536, 36, 60_000);
             let hits = controller.click_regions();
             let workspace = hits
                 .iter()
@@ -928,7 +937,7 @@ mod tests {
             island.bar.modules_left.swap(0, 1);
             island.bar.modules_right.reverse();
             controller.set_island_config(island, 60_100);
-            controller.render_bar(VisualState::Idle, 1536, 36, 60_100);
+            controller.render_bar_frame(VisualState::Idle, 1536, 36, 60_100);
             let hits = controller.click_regions();
             let workspace = hits
                 .iter()
@@ -957,25 +966,31 @@ mod tests {
         let mut island = controller.island.clone();
         crate::theme::select_theme(&mut island, "macos-dark");
         controller.set_island_config(island, 60_000);
-        controller.current = controller.render_bar(VisualState::Idle, width, 36, 60_000);
+        controller.current = controller.render_bar_frame(VisualState::Idle, width, 36, 60_000);
         let (_, _, _, pill_y, pill_h, _) = controller.bar_row();
         let offset = (((pill_y as u32 + pill_h / 2) * width + 4) * 4 + 3) as usize;
         assert!(controller.current.pixels_pbgra[offset] > 0);
         let hits = controller.click_regions().to_vec();
         let before = controller.current.clone();
-        let partial = controller.render_bar_with_damage(
-            VisualState::Idle,
-            width,
-            36,
-            60_000,
-            BarDamage::RIGHT,
-        );
-        assert_eq!(partial.pixels_pbgra, before.pixels_pbgra);
+        // The damaged update runs against the frame that is already on
+        // screen, which is what makes it a partial update: only the right
+        // zone is repainted and the rest of the bar is carried over.
+        controller.render_into_current(|controller, frame| {
+            controller.render_bar_with_damage(
+                VisualState::Idle,
+                width,
+                36,
+                60_000,
+                BarDamage::RIGHT,
+                frame,
+            );
+        });
+        assert_eq!(controller.current.pixels_pbgra, before.pixels_pbgra);
         assert_eq!(controller.click_regions(), hits);
         let mut island = controller.island.clone();
         crate::theme::select_theme(&mut island, "transparent");
         controller.set_island_config(island, 60_100);
-        let frame = controller.render_bar(VisualState::Idle, width, 36, 60_100);
+        let frame = controller.render_bar_frame(VisualState::Idle, width, 36, 60_100);
         assert_eq!(frame.pixels_pbgra[offset], 0);
         assert!(
             controller
@@ -995,7 +1010,7 @@ mod tests {
         island.theme = "catppuccin-macchiato".into();
         crate::theme::apply_theme(&mut island, "catppuccin-macchiato");
         controller.set_island_config(island, 60_000);
-        let frame = controller.render_bar(VisualState::Idle, width, 36, 60_000);
+        let frame = controller.render_bar_frame(VisualState::Idle, width, 36, 60_000);
         let (_, _, _, pill_y, pill_h, _) = controller.bar_row();
         let alpha = |x: u32| -> u8 {
             let index = (((pill_y as u32 + pill_h / 2) * frame.width + x) * 4) as usize;
@@ -1047,7 +1062,7 @@ mod tests {
             },
             60_000,
         );
-        let frame = controller.render_bar(VisualState::Idle, 1536, 36, 60_000);
+        let frame = controller.render_bar_frame(VisualState::Idle, 1536, 36, 60_000);
         let workspaces: Vec<_> = controller
             .icon_hits
             .iter()
@@ -1064,7 +1079,7 @@ mod tests {
         assert!(frame.pixels_pbgra[icon_index + 2] > frame.pixels_pbgra[icon_index]);
 
         controller.set_bar_width(480);
-        controller.render_bar(VisualState::Idle, 480, 36, 60_000);
+        controller.render_bar_frame(VisualState::Idle, 480, 36, 60_000);
         let left_limit = controller.bar_pill_rect(480).0 - BAR_ZONE_GAP as i32;
         assert!(
             controller

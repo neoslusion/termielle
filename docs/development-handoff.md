@@ -22,6 +22,9 @@ as a GitHub release.
 - [Whole-application power](application-power.md): persistent tray/preferences Off and external On; executable controls deployed on 2026-10-06, with no installer/shortcut changes.
 - [Preferences/navigation polish](preferences-navigation-polish.md): deployed in the 2026-10-06 standalone binary; manual UI acceptance and system popovers/replacement readiness remain pending.
 - [Event protocol](protocol.md): the content-free agent lifecycle contract.
+- [Motion and performance](motion-and-performance.md): the macOS-grade motion
+  and frame-cost pass — the launcher's display-synced clock, the reused
+  surface canvas, the row-wise present, and the before/after measurements.
 - This document: agreed direction, delivered work, source map, validation, and handoff.
 
 ## Follow-up publication scope

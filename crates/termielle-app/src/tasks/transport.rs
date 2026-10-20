@@ -73,7 +73,7 @@ fn find_session(app: &str) -> Result<Session, Error> {
         |op| op.GetResults(),
     )?;
     if let Ok(current) = manager.GetCurrentSession() {
-        if current.SourceAppUserModelId()?.to_string() == app {
+        if current.SourceAppUserModelId()? == app {
             return Ok(current);
         }
     }
@@ -81,7 +81,7 @@ fn find_session(app: &str) -> Result<Session, Error> {
     let mut matching = None;
     for index in 0..sessions.Size()? {
         let session = sessions.GetAt(index)?;
-        if session.SourceAppUserModelId()?.to_string() == app {
+        if session.SourceAppUserModelId()? == app {
             if matching.is_some() {
                 return Err(Error::MissingSession);
             }

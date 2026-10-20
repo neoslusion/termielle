@@ -667,10 +667,10 @@ mod tests {
             let card_height = c.activity_height();
             let base = c.island.bar.height + crate::app::bar::types::BAR_POPUP_GAP;
             let hidden_height = base + card_height * 65 / 100;
-            c.current = c.render_bar(c.state, 800, hidden_height, 100_000);
+            c.current = c.render_bar_frame(c.state, 800, hidden_height, 100_000);
             assert!(!c.icon_hits.iter().any(|hit| SessionActivity::is_hit(hit.0)));
             let visible_height = base + card_height * 90 / 100;
-            c.current = c.render_bar(c.state, 800, visible_height, 100_000);
+            c.current = c.render_bar_frame(c.state, 800, visible_height, 100_000);
             assert!(c.icon_hits.iter().any(|hit| SessionActivity::is_hit(hit.0)));
             assert!(
                 c.icon_hits

@@ -107,7 +107,7 @@ mod tests {
         let mut c = controller();
         let before = c.bar_pill_rect(800);
         assert!(before.2 < 180);
-        c.render_bar(VisualState::Idle, 800, 36, 1000);
+        c.render_bar_frame(VisualState::Idle, 800, 36, 1000);
         let hit = c
             .icon_hits
             .iter()
@@ -122,7 +122,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(c.bar_pill_rect(800).2, 180);
-        c.render_bar(VisualState::Idle, 800, 36, 1000);
+        c.render_bar_frame(VisualState::Idle, 800, 36, 1000);
         let hit = c
             .icon_hits
             .iter()

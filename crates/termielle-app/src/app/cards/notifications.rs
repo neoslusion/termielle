@@ -71,7 +71,7 @@ impl Controller {
         };
         let changed = previous != self.notification_scroll;
         if changed {
-            self.current = self.render_island(self.state, width, height, now_ms);
+            self.rerender_island(width, height, now_ms);
         }
         Some(changed)
     }

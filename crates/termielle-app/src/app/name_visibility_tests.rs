@@ -69,7 +69,7 @@ fn hiding_the_brand_does_not_hide_media_content() {
         });
         let paint = |ctrl: &mut Controller| {
             if layout == IslandLayout::Bar {
-                ctrl.render_bar(VisualState::Idle, 960, 36, 1_000)
+                ctrl.render_bar_frame(VisualState::Idle, 960, 36, 1_000)
             } else {
                 let island = ctrl.island_config().clone();
                 let mut frame = ctrl.blank_frame(180, 36);
@@ -130,19 +130,19 @@ fn bar_brand_toggle_keeps_the_pill_clickable_and_active_labels_unchanged() {
     ] {
         let mut ctrl = controller(IslandLayout::Bar, true);
         ctrl.island.bar.position = position;
-        let named = ctrl.render_bar(VisualState::Idle, 960, 36, 1_000);
+        let named = ctrl.render_bar_frame(VisualState::Idle, 960, 36, 1_000);
         let hits = ctrl.click_regions().to_vec();
         ctrl.island.show_name = false;
-        let unnamed = ctrl.render_bar(VisualState::Idle, 960, 36, 1_000);
+        let unnamed = ctrl.render_bar_frame(VisualState::Idle, 960, 36, 1_000);
         assert_ne!(named.pixels_pbgra, unnamed.pixels_pbgra);
         assert_eq!(ctrl.click_regions(), hits.as_slice());
         assert!(
             hits.iter()
                 .any(|(id, ..)| *id == crate::bar::HIT_BAR_TERMIELLE_MODULE)
         );
-        let working = ctrl.render_bar(VisualState::Working, 960, 36, 1_000);
+        let working = ctrl.render_bar_frame(VisualState::Working, 960, 36, 1_000);
         ctrl.island.show_name = true;
-        let named_working = ctrl.render_bar(VisualState::Working, 960, 36, 1_000);
+        let named_working = ctrl.render_bar_frame(VisualState::Working, 960, 36, 1_000);
         assert_eq!(working.pixels_pbgra, named_working.pixels_pbgra);
     }
 }

@@ -266,7 +266,9 @@ impl Controller {
         if controller.island.is_enabled() {
             controller.refresh_face(state);
             let (w, h) = controller.target_size(state);
-            controller.current = controller.render_island(state, w, h, 0);
+            let mut frame = std::mem::take(&mut controller.current);
+            controller.render_island(state, w, h, 0, &mut frame);
+            controller.current = frame;
             controller.arm_face_deadline(0);
         } else {
             let _ = controller.load_animation_classic(VisualState::Idle, 0);
@@ -363,7 +365,7 @@ impl Controller {
             } else {
                 BarDamage::LEFT
             };
-            self.current = self.render_bar_with_damage(self.state, from.0, from.1, now_ms, damage);
+            self.rerender_bar(from.0, from.1, now_ms, damage);
             return true;
         }
         if !self.dashboard_expanded() && !self.media_available() {
@@ -373,7 +375,7 @@ impl Controller {
         if !self.island.is_bar() && (media_changed || tasks_changed) {
             self.begin_content_transition(now_ms);
         }
-        self.current = self.render_island(self.state, from.0, from.1, now_ms);
+        self.rerender_island(from.0, from.1, now_ms);
         true
     }
 
@@ -446,7 +448,7 @@ impl Controller {
             alert.expires_at_ms = is_front.then(|| now_ms.saturating_add(duration_ms));
             if is_front {
                 let (width, height) = self.current_logical_size();
-                self.current = self.render_island(self.state, width, height, now_ms);
+                self.rerender_island(width, height, now_ms);
             } else if self.is_notification_center_open() {
                 return self.morph_to_target(now_ms);
             }
@@ -581,7 +583,7 @@ impl Controller {
             self.spring = None;
             if is_enabled {
                 let (width, height) = self.target_size(self.state);
-                self.current = self.render_island(self.state, width, height, now_ms);
+                self.rerender_island(width, height, now_ms);
                 self.frame_deadline = None;
                 self.arm_face_deadline(now_ms);
             } else {
@@ -691,7 +693,7 @@ impl Controller {
             self.activity.deadline = None;
             if self.activity_visible() {
                 let (w, h) = self.current_logical_size();
-                self.current = self.render_island(self.state, w, h, now_ms);
+                self.rerender_island(w, h, now_ms);
                 actions.present_frame = true;
             }
         }
@@ -699,13 +701,7 @@ impl Controller {
             self.volume_feedback_deadline = None;
             if self.island.is_bar() {
                 let (width, height) = self.current_logical_size();
-                self.current = self.render_bar_with_damage(
-                    self.state,
-                    width,
-                    height,
-                    now_ms,
-                    BarDamage::CENTER,
-                );
+                self.rerender_bar(width, height, now_ms, BarDamage::CENTER);
                 actions.present_frame = true;
             }
         }
@@ -798,12 +794,12 @@ impl Controller {
                     if !self.panel_open {
                         self.panel_morphing = false;
                     }
-                    self.current = self.render_island(self.state, target_w, target_h, now_ms);
+                    self.rerender_island(target_w, target_h, now_ms);
                     self.frame_deadline = None;
                     self.arm_face_deadline(now_ms);
                 } else {
                     let (w, h) = current_size;
-                    self.current = self.render_island(self.state, w, h, now_ms);
+                    self.rerender_island(w, h, now_ms);
                     let interval = self.motion_interval_ms;
                     let next = now_ms
                         .saturating_add(interval)
@@ -828,7 +824,7 @@ impl Controller {
                 }
                 if !settled || self.split_active() {
                     let (w, h) = self.target_size(self.state);
-                    self.current = self.render_island(self.state, w, h, now_ms);
+                    self.rerender_island(w, h, now_ms);
                     actions.present_frame = true;
                 }
                 if !settled {
@@ -864,7 +860,7 @@ impl Controller {
         {
             self.motion_deadline = None;
             let (w, h) = self.current_logical_size();
-            self.current = self.render_island(self.state, w, h, now_ms);
+            self.rerender_island(w, h, now_ms);
             actions.present_frame = true;
         }
         if self.motion_active(now_ms) {
@@ -881,8 +877,7 @@ impl Controller {
             self.bar_hover.schedule(now_ms, self.motion_interval_ms);
             self.bar_right_cache = None;
             let (width, height) = self.current_logical_size();
-            self.current =
-                self.render_bar_with_damage(self.state, width, height, now_ms, BarDamage::RIGHT);
+            self.rerender_bar(width, height, now_ms, BarDamage::RIGHT);
             actions.present_frame = true;
         }
 
@@ -892,7 +887,7 @@ impl Controller {
                 self.bar_deadline = Some(now_ms.saturating_add(BAR_REFRESH_MS));
                 if self.bar_metrics_cache.is_none() {
                     let (w, h) = self.current_logical_size();
-                    self.current = self.render_island(self.state, w, h, now_ms);
+                    self.rerender_island(w, h, now_ms);
                     actions.present_frame = true;
                 }
             } else if self.bar_deadline.is_none() {
@@ -925,11 +920,11 @@ impl Controller {
     /// countdown costs a card redraw rather than a full bar rebuild.
     fn repaint_alert_countdown(&mut self, now_ms: u64) {
         let (width, height) = self.current_logical_size();
-        self.current = if self.island.is_bar() {
-            self.render_bar_with_damage(self.state, width, height, now_ms, BarDamage::CENTER)
+        if self.island.is_bar() {
+            self.rerender_bar(width, height, now_ms, BarDamage::CENTER);
         } else {
-            self.render_island(self.state, width, height, now_ms)
-        };
+            self.rerender_island(width, height, now_ms);
+        }
     }
 
     /// Whether any procedural motion is live: thinking bounce, worker orbit,
@@ -1014,6 +1009,66 @@ impl Controller {
         &self.current
     }
 
+    /// Re-renders the island into the canvas that is already on screen.
+    ///
+    /// The surface is several megabytes wide and a morph redraws it sixty
+    /// times a second. Allocating a fresh canvas per frame meant an
+    /// allocation, a free, and a page-fault storm on every one of those
+    /// frames; rendering into the canvas that is already there keeps the
+    /// allocation — and the pages behind it — alive across the morph.
+    pub(crate) fn rerender_island(&mut self, width: u32, height: u32, now_ms: u64) {
+        let state = self.state;
+        self.render_into_current(|controller, frame| {
+            controller.render_island(state, width, height, now_ms, frame)
+        });
+    }
+
+    /// Re-renders the bar into the canvas that is already on screen. See
+    /// [`Self::rerender_island`] for why the canvas is reused.
+    pub(crate) fn rerender_bar(
+        &mut self,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+        damage: super::bar::modules::BarDamage,
+    ) {
+        let state = self.state;
+        self.render_into_current(|controller, frame| {
+            controller.render_bar_with_damage(state, width, height, now_ms, damage, frame)
+        });
+    }
+
+    /// Renders a bar into a buffer of its own.
+    ///
+    /// The animated paths render into the canvas that is already on screen
+    /// (see [`Self::rerender_bar`]); this one is for callers that need the
+    /// frame to outlive the call.
+    #[cfg(test)]
+    pub(crate) fn render_bar_frame(
+        &mut self,
+        state: VisualState,
+        width: u32,
+        height: u32,
+        now_ms: u64,
+    ) -> FrameBuffer {
+        let mut frame = FrameBuffer::default();
+        self.render_bar(state, width, height, now_ms, &mut frame);
+        frame
+    }
+
+    /// Renders into the canvas that is already on screen.
+    ///
+    /// See [`Self::rerender_island`] for why the canvas is reused rather than
+    /// replaced.
+    pub(crate) fn render_into_current(
+        &mut self,
+        render: impl FnOnce(&mut Controller, &mut FrameBuffer),
+    ) {
+        let mut frame = std::mem::take(&mut self.current);
+        render(self, &mut frame);
+        self.current = frame;
+    }
+
     /// The click regions the current frame installed, as
     /// `(id, x, y, w, h)` in frame coordinates. Read-only: it lets callers
     /// that cannot see `icon_hits` - tests, the review renderer - address a
@@ -1037,7 +1092,7 @@ impl Controller {
         if self.island.is_enabled() {
             let (w, h) = self.target_size(self.state);
             self.spring = None;
-            self.current = self.render_island(self.state, w, h, self.clock_ms);
+            self.rerender_island(w, h, self.clock_ms);
             self.separation = None;
             self.frame_deadline = None;
             self.arm_face_deadline(0);

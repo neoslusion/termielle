@@ -1030,7 +1030,7 @@ fn notch_material_is_true_black_island_is_glass() {
     // Attached notch: opaque true black, fused with the bezel.
     let mut notch = visible_idle_island();
     notch.layout = IslandLayout::Notch;
-    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, notch);
+    let c = Controller::new_with_island(5000, 60000, catalog(), false, None, notch);
     let frame = c.current_frame();
     let idx = ((18 * frame.width + 20) * 4) as usize;
     assert_eq!(frame.pixels_pbgra[idx..idx + 4], [0, 0, 0, 255]);
@@ -1038,7 +1038,7 @@ fn notch_material_is_true_black_island_is_glass() {
     // Floating island: glass, not black.
     let mut island = visible_idle_island();
     island.layout = IslandLayout::Island;
-    let mut c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
+    let c = Controller::new_with_island(5000, 60000, catalog(), false, None, island);
     let frame = c.current_frame();
     let idx = ((18 * frame.width + 20) * 4) as usize;
     let pixel = &frame.pixels_pbgra[idx..idx + 4];

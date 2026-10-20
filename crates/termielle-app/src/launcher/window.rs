@@ -37,21 +37,24 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_DROPSHADOW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     EN_CHANGE, ES_AUTOHSCROLL, GWLP_USERDATA, GetForegroundWindow, GetParent, GetWindowTextLengthW,
-    GetWindowTextW, IDC_ARROW, KillTimer, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassW,
-    SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetLayeredWindowAttributes, SetTimer, SetWindowPos, SetWindowTextW,
-    ShowWindow, WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    GetWindowTextW, IDC_ARROW, LWA_ALPHA, LoadCursorW, PostMessageW, RegisterClassW, SW_HIDE,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetLayeredWindowAttributes, SetWindowPos, SetWindowTextW, ShowWindow,
+    WA_INACTIVE, WINDOW_STYLE, WM_ACTIVATE, WM_APP, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SETFONT, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
 const UPDATE_MSG: u32 = WM_APP + 101;
 const OPEN_MSG: u32 = WM_APP + 102;
 const HOTKEY_ID: i32 = 101;
-const MOTION_TIMER: usize = 103;
+/// The launcher's motion wake. A dedicated clock thread posts this on the
+/// display's vertical blank; a `WM_TIMER` would be delivered through the
+/// message queue and dropped while the queue is busy — which is exactly
+/// when the launcher is working hardest, with the user typing into it.
+const MOTION_MSG: u32 = WM_APP + 103;
 static CLASS: OnceLock<Result<u16, u32>> = OnceLock::new();
 
 enum Update {
@@ -108,7 +111,10 @@ struct State {
     reduced_motion: Cell<bool>,
     reveal: Cell<Transition>,
     selection: Cell<Transition>,
-    motion_timer: Cell<bool>,
+    /// The display-synced clock that drives the reveal and the selection
+    /// highlight. `None` until the window handle exists.
+    motion_clock: RefCell<Option<crate::window::AnimationClock>>,
+    motion_armed: Cell<bool>,
     restore_after_exit: Cell<bool>,
     origin: Cell<(i32, i32)>,
 }
@@ -118,23 +124,26 @@ impl State {
         self.clock.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 
-    fn sync_timer(&self) {
+    /// Arms or parks the motion clock.
+    ///
+    /// The clock waits for the display's vertical blank and then posts
+    /// [`MOTION_MSG`], so a frame lands on the refresh instead of whenever
+    /// the message queue happens to drain. While the motion runs, each tick
+    /// re-arms the clock for the next refresh; when it ends, the clock is
+    /// parked.
+    fn sync_motion(&self) {
         let now = self.now_ms();
         let active = self.reveal.get().active(now)
             || (self.visible.get() && self.selection.get().active(now));
-        if active && !self.motion_timer.get() {
-            let timer = unsafe { SetTimer(Some(self.hwnd.get()), MOTION_TIMER, 16, None) };
-            self.motion_timer.set(timer != 0);
-            if timer == 0 {
-                let mut reveal = self.reveal.get();
-                reveal.snap(reveal.target);
-                self.reveal.set(reveal);
-                let mut selection = self.selection.get();
-                selection.snap(selection.target);
-                self.selection.set(selection);
+        if active {
+            self.motion_armed.set(true);
+            if let Some(clock) = self.motion_clock.borrow().as_ref() {
+                clock.arm_after(0);
             }
-        } else if !active && self.motion_timer.replace(false) {
-            let _ = unsafe { KillTimer(Some(self.hwnd.get()), MOTION_TIMER) };
+        } else if self.motion_armed.replace(false) {
+            if let Some(clock) = self.motion_clock.borrow().as_ref() {
+                clock.arm(None);
+            }
         }
     }
 
@@ -172,7 +181,7 @@ impl State {
             selection.snap(target);
         }
         self.selection.set(selection);
-        self.sync_timer();
+        self.sync_motion();
     }
 
     fn tick(&self, now_ms: u64) {
@@ -198,7 +207,7 @@ impl State {
         if repaint_selection {
             let _ = unsafe { InvalidateRect(Some(self.hwnd.get()), None, false) };
         }
-        self.sync_timer();
+        self.sync_motion();
     }
     fn request_icons(&self) {
         if !self.visible.get() {
@@ -267,8 +276,8 @@ impl State {
             let mut reveal = self.reveal.get();
             reveal.retarget(0.0, self.now_ms(), 100);
             self.reveal.set(reveal);
-            self.sync_timer();
-            if !self.motion_timer.get() {
+            self.sync_motion();
+            if !self.motion_armed.get() {
                 self.finish_hide(restore_focus);
             }
             return;
@@ -285,7 +294,7 @@ impl State {
         let mut selection = self.selection.get();
         selection.snap(selection.target);
         self.selection.set(selection);
-        self.sync_timer();
+        self.sync_motion();
         let foreground = unsafe { GetForegroundWindow() } == self.hwnd.get();
         let _ = unsafe { ShowWindow(self.hwnd.get(), SW_HIDE) };
         if restore_focus && foreground {
@@ -356,7 +365,7 @@ impl State {
         self.request_icons();
         self.request_documents();
         self.redraw();
-        self.sync_timer();
+        self.sync_motion();
     }
 
     fn open_selected(&self) {
@@ -513,7 +522,7 @@ impl State {
             self.selection.get().value(self.now_ms()),
             self.palette.get(),
         );
-        let mut info = BITMAPINFO {
+        let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
                 biWidth: frame.width as i32,
@@ -540,7 +549,7 @@ impl State {
                     0,
                     frame.height,
                     frame.pixels_pbgra.as_ptr().cast(),
-                    &mut info,
+                    &info,
                     DIB_RGB_COLORS,
                 )
             };
@@ -551,7 +560,6 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        let _ = unsafe { KillTimer(Some(self.hwnd.get()), MOTION_TIMER) };
         if !self.font.get().is_invalid() {
             let _ = unsafe { DeleteObject(self.font.get().into()) };
         }
@@ -624,7 +632,8 @@ impl LauncherWindow {
             reduced_motion: Cell::new(false),
             reveal: Cell::new(Transition::default()),
             selection: Cell::new(Transition::default()),
-            motion_timer: Cell::new(false),
+            motion_clock: RefCell::new(None),
+            motion_armed: Cell::new(false),
             restore_after_exit: Cell::new(false),
             origin: Cell::new((0, 0)),
         });
@@ -646,6 +655,14 @@ impl LauncherWindow {
         };
         let mut launcher = Self { state };
         launcher.state.notifier.hwnd = hwnd.0 as isize;
+        // The motion clock drives the reveal and the selection highlight off
+        // the display's vertical blank. The launcher needs its own clock
+        // because it lives in its own window with its own message queue.
+        *launcher.state.motion_clock.borrow_mut() =
+            Some(crate::window::AnimationClock::spawn_with(
+                crate::window::WakeHandle::for_window(hwnd),
+                MOTION_MSG,
+            ));
         let edit = unsafe {
             CreateWindowExW(
                 Default::default(),
@@ -827,7 +844,7 @@ unsafe fn dispatch(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> 
         WM_CLOSE => state.hide(true),
         WM_ERASEBKGND => return LRESULT(1),
         WM_PAINT => state.paint(),
-        WM_TIMER if wparam.0 == MOTION_TIMER => state.tick(state.now_ms()),
+        MOTION_MSG => state.tick(state.now_ms()),
         WM_COMMAND if (wparam.0 >> 16) as u32 == EN_CHANGE => {
             let mut text =
                 vec![0; unsafe { GetWindowTextLengthW(state.edit.get()) }.max(0) as usize + 1];
@@ -997,16 +1014,16 @@ mod tests {
         assert_eq!(state.model.borrow().selected_app().unwrap().name, "Beta");
         assert_eq!(state.selection.get().target, paint::ROW_HEIGHT as f32);
         assert!(state.selection.get().active(state.now_ms()));
-        assert!(state.motion_timer.get());
+        assert!(state.motion_armed.get());
         unsafe { SetWindowTextW(state.edit.get(), w!("be")) }.unwrap();
         assert_eq!(state.model.borrow().selected_app().unwrap().name, "Beta");
         assert_eq!(state.selection.get().value(state.now_ms()), 0.0);
-        assert!(!state.motion_timer.get());
+        assert!(!state.motion_armed.get());
         state.hide(false);
     }
 
     #[test]
-    fn reveal_settles_and_reduced_motion_cancels_all_launcher_timers() {
+    fn reveal_settles_and_reduced_motion_parks_the_launcher_motion_clock() {
         let island = IslandConfig::default();
         let launcher = LauncherWindow::create_window(&island, false).unwrap();
         let state = &launcher.state;
@@ -1015,16 +1032,16 @@ mod tests {
         let mut reveal = state.reveal.get();
         reveal.retarget(1.0, started, 160);
         state.reveal.set(reveal);
-        state.sync_timer();
-        assert!(state.motion_timer.get());
+        state.sync_motion();
+        assert!(state.motion_armed.get());
         state.tick(started + 200);
         assert_eq!(state.reveal.get().value(started + 200), 1.0);
-        assert!(!state.motion_timer.get());
+        assert!(!state.motion_armed.get());
         state.hide(true);
         assert!(!state.visible.get());
-        assert!(state.motion_timer.get());
+        assert!(state.motion_armed.get());
         launcher.configure(&island, true);
-        assert!(!state.motion_timer.get());
+        assert!(!state.motion_armed.get());
         assert_eq!(state.reveal.get().value(state.now_ms()), 0.0);
     }
 

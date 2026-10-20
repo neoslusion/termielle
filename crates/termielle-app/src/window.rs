@@ -1869,7 +1869,15 @@ impl OverlayWindow {
             .filter(|_| self.frosted_enabled && self.glass.blur_radius > 0);
 
         let is_hidden_sensor = h <= 4;
-        let mut alpha_map = Vec::with_capacity(w as usize * h as usize);
+        // The alpha map is reused across presents: at bar width it is ~140 KB,
+        // and a fresh `Vec` per frame means an allocation, a free, and a full
+        // re-fill on every one of the 60 frames a second a morph runs for.
+        // `clear` keeps the capacity, so `resize` reuses the same buffer.
+        let mut alpha_guard = self.state.alpha.borrow_mut();
+        alpha_guard.width = w;
+        let alpha_map = &mut alpha_guard.bytes;
+        alpha_map.clear();
+        alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         let dst = surface.pixels();
         if is_hidden_sensor {
             // Assign alpha = 1 for the hidden sensor: 1/255 opacity is completely invisible
@@ -1881,16 +1889,16 @@ impl OverlayWindow {
                 px[2] = 0;
                 px[3] = 1;
             }
-            alpha_map.resize(w as usize * h as usize, ALPHA_HIT_THRESHOLD);
         } else {
             // 1:1 blit: the frame already matches the window surface.
+            let width = w as usize;
             match backdrop {
                 Some(bg) => {
-                    for yy in 0..h {
-                        for xx in 0..w {
-                            let source = &frame.pixels_pbgra
-                                [(yy as usize * w as usize + xx as usize) * 4..][..4];
-                            let target = yy as usize * stride + xx as usize * 4;
+                    for yy in 0..h as usize {
+                        let alpha_row = &mut alpha_map[yy * width..][..width];
+                        let source_row = &frame.pixels_pbgra[yy * width * 4..][..width * 4];
+                        for (xx, source) in source_row.chunks_exact(4).enumerate() {
+                            let target = yy * stride + xx * 4;
                             let pixel = material::composite(
                                 source,
                                 bg.sample(x.saturating_add(xx as i32), y.saturating_add(yy as i32)),
@@ -1899,18 +1907,23 @@ impl OverlayWindow {
                             dst[target..target + 4].copy_from_slice(&pixel);
                             // Hit-testing still follows the frame's own alpha, so the
                             // rounded corners stay click-through.
-                            alpha_map.push(source[3]);
+                            alpha_row[xx] = source[3];
                         }
                     }
                 }
                 None => {
-                    for yy in 0..h {
-                        for xx in 0..w {
-                            let source = &frame.pixels_pbgra
-                                [(yy as usize * w as usize + xx as usize) * 4..][..4];
-                            let target = yy as usize * stride + xx as usize * 4;
-                            dst[target..target + 4].copy_from_slice(source);
-                            alpha_map.push(source[3]);
+                    // Row-wise copy. The frame's rows are contiguous and the
+                    // surface's stride is a multiple of four, so one memcpy per
+                    // row replaces a bounds-checked four-byte copy for every
+                    // pixel of the window — the dominant cost of a present.
+                    let row_bytes = width * 4;
+                    for yy in 0..h as usize {
+                        let source = &frame.pixels_pbgra[yy * row_bytes..][..row_bytes];
+                        let target = yy * stride;
+                        dst[target..target + row_bytes].copy_from_slice(source);
+                        let alpha_row = &mut alpha_map[yy * width..][..width];
+                        for (index, pixel) in source.chunks_exact(4).enumerate() {
+                            alpha_row[index] = pixel[3];
                         }
                     }
                 }
@@ -1975,13 +1988,9 @@ impl OverlayWindow {
         // makes DWM route the pointer here at all.
         if !self.hit_targets.borrow().is_empty() {
             let targets = self.hit_targets.borrow();
-            mark_hit_targets(dst, &mut alpha_map, w, h, &targets);
+            mark_hit_targets(dst, alpha_map, w, h, &targets);
         }
 
-        *self.state.alpha.borrow_mut() = AlphaMap {
-            bytes: alpha_map,
-            width: w,
-        };
         Ok(())
     }
 
@@ -2122,10 +2131,23 @@ fn now_ms() -> u64 {
 }
 
 impl WakeHandle {
+    /// A handle for another window that the animation clock can wake.
+    ///
+    /// The overlay's clock posts the overlay's own animation message; a
+    /// second window posts a message of its own instead.
+    pub fn for_window(hwnd: HWND) -> Self {
+        Self { hwnd }
+    }
+
+    /// Posts `message` to the window this handle names.
+    pub fn post_message(&self, message: u32) -> Result<(), WindowError> {
+        unsafe { PostMessageW(Some(self.hwnd), message, WPARAM(0), LPARAM(0)) }?;
+        Ok(())
+    }
+
     /// Requests normal whole-app teardown without WM_CLOSE's chooser dismissal.
     pub fn post_power_off(&self) -> Result<(), WindowError> {
-        unsafe { PostMessageW(Some(self.hwnd), POWER_OFF_MSG, WPARAM(0), LPARAM(0)) }?;
-        Ok(())
+        self.post_message(POWER_OFF_MSG)
     }
 
     pub fn post_app_launch_result(&self, code: i32) {
@@ -2137,11 +2159,6 @@ impl WakeHandle {
                 LPARAM(code as isize),
             )
         };
-    }
-
-    fn post_animation(&self) -> Result<(), WindowError> {
-        unsafe { PostMessageW(Some(self.hwnd), ANIMATION_MSG, WPARAM(0), LPARAM(0)) }?;
-        Ok(())
     }
 
     /// Posts an empty message to the overlay's message queue.

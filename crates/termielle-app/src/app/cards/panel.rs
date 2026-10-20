@@ -27,6 +27,7 @@ pub(crate) fn volume_track(width: u32) -> (i32, i32, u32, u32) {
     )
 }
 
+#[allow(clippy::too_many_arguments)] // paint helper: each argument is a distinct tile term.
 fn paint_tile(
     frame: &mut FrameBuffer,
     x: i32,
@@ -376,11 +377,11 @@ mod tests {
 
     #[test]
     fn sections_fit_without_overlap() {
-        assert!(100 + (TILE_H as i32) < SOUND_Y);
-        assert!(SOUND_Y + 74 < MEDIA_Y);
-        assert!(MEDIA_Y + 64 < STATS_Y);
-        assert!(STATS_Y + 18 < FOOTER_Y);
-        assert!(FOOTER_Y + 22 <= panel_height() as i32);
+        const { assert!(100 + (TILE_H as i32) < SOUND_Y) };
+        const { assert!(SOUND_Y + 74 < MEDIA_Y) };
+        const { assert!(MEDIA_Y + 64 < STATS_Y) };
+        const { assert!(STATS_Y + 18 < FOOTER_Y) };
+        const { assert!(FOOTER_Y + 22 <= panel_height() as i32) };
     }
 
     #[test]

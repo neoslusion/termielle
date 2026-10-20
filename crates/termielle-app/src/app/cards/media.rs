@@ -129,109 +129,6 @@ fn source_label(app: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tasks::ThumbBitmap;
-    use termielle_core::AssetCatalog;
-
-    #[test]
-    fn media_labels_are_readable_and_artwork_tint_has_a_safe_default() {
-        assert_eq!(time_label(83_000), "1:23");
-        assert_eq!(time_label(3_661_000), "1:01:01");
-        assert_eq!(source_label("Vendor.Player_123!Music"), "Music");
-        assert_eq!(source_label("Spotify.exe"), "Spotify");
-        assert_eq!(source_label(""), "Media session");
-        let fallback = [255, 132, 10, 255];
-        assert_eq!(artwork_accent(None, fallback), fallback);
-        let mut media = MediaInfo {
-            thumbnail: Some(ThumbBitmap {
-                width: 1,
-                height: 1,
-                pixels_pbgra: vec![50, 50, 50, 255],
-            }),
-            ..Default::default()
-        };
-        assert_eq!(artwork_accent(Some(&media), fallback), fallback);
-        media.thumbnail.as_mut().unwrap().pixels_pbgra = vec![180, 60, 80, 255];
-        assert_eq!(artwork_accent(Some(&media), fallback), [217, 96, 45, 255]);
-    }
-
-    #[test]
-    fn media_controls_fit_the_card_at_multiple_widths_and_scales() {
-        for width in [180, 320, 420] {
-            for scale in [1.0, 1.25, 2.0] {
-                let island = IslandConfig::default();
-                let mut controller = Controller::new_with_island(
-                    5_000,
-                    60_000,
-                    AssetCatalog::new(Vec::new()),
-                    true,
-                    None,
-                    island.clone(),
-                );
-                controller.dpi_scale = scale;
-                controller.media = Some(MediaInfo {
-                    title:
-                        "A long title 日本語 that should wrap instead of overlapping the controls"
-                            .into(),
-                    playing: true,
-                    ..Default::default()
-                });
-                let mut frame = controller.blank_frame(width, MEDIA_HEIGHT);
-                controller.icon_hits.clear();
-                controller.paint_media_card(
-                    &mut frame,
-                    &island,
-                    &CardPaintCtx {
-                        width,
-                        height: MEDIA_HEIGHT,
-                        cy: MEDIA_HEIGHT as i32 / 2,
-                        accent: [255; 4],
-                        now: 1_000,
-                        eq_now: 1_000,
-                        pad: 18,
-                    },
-                );
-                for (_, x, y, w, h) in &controller.icon_hits {
-                    assert!(
-                        *x >= 0
-                            && *y >= 0
-                            && *x + *w as i32 <= width as i32
-                            && *y + *h as i32 <= MEDIA_HEIGHT as i32
-                    );
-                }
-                assert!(
-                    controller
-                        .icon_hits
-                        .iter()
-                        .any(|hit| hit.0 == HIT_MEDIA_PLAY_PAUSE && hit.3 == 48 && hit.4 == 48)
-                );
-                assert_eq!(controller.icon_hits.len(), if width < 220 { 2 } else { 4 });
-                assert_eq!(frame.scale, scale);
-            }
-        }
-    }
-
-    #[test]
-    fn paused_wave_is_static() {
-        let mut first = FrameBuffer {
-            width: 30,
-            height: 20,
-            pixels_pbgra: vec![0; 30 * 20 * 4],
-            delay_ms: 0,
-            loop_index: 0,
-            scale: 1.0,
-        };
-        let mut second = first.clone();
-        paint_wave(&mut first, 4, 10, 0, false, [255; 4]);
-        paint_wave(&mut second, 4, 10, 443, false, [255; 4]);
-        assert_eq!(first.pixels_pbgra, second.pixels_pbgra);
-        paint_wave(&mut second, 4, 10, 443, true, [255; 4]);
-        assert_ne!(first.pixels_pbgra, second.pixels_pbgra);
-    }
-}
-
 impl Controller {
     pub(crate) fn paint_bar_media(
         &self,
@@ -468,5 +365,108 @@ impl Controller {
             );
         }
         self.paint_notch_close(frame, ctx.width);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::ThumbBitmap;
+    use termielle_core::AssetCatalog;
+
+    #[test]
+    fn media_labels_are_readable_and_artwork_tint_has_a_safe_default() {
+        assert_eq!(time_label(83_000), "1:23");
+        assert_eq!(time_label(3_661_000), "1:01:01");
+        assert_eq!(source_label("Vendor.Player_123!Music"), "Music");
+        assert_eq!(source_label("Spotify.exe"), "Spotify");
+        assert_eq!(source_label(""), "Media session");
+        let fallback = [255, 132, 10, 255];
+        assert_eq!(artwork_accent(None, fallback), fallback);
+        let mut media = MediaInfo {
+            thumbnail: Some(ThumbBitmap {
+                width: 1,
+                height: 1,
+                pixels_pbgra: vec![50, 50, 50, 255],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(artwork_accent(Some(&media), fallback), fallback);
+        media.thumbnail.as_mut().unwrap().pixels_pbgra = vec![180, 60, 80, 255];
+        assert_eq!(artwork_accent(Some(&media), fallback), [217, 96, 45, 255]);
+    }
+
+    #[test]
+    fn media_controls_fit_the_card_at_multiple_widths_and_scales() {
+        for width in [180, 320, 420] {
+            for scale in [1.0, 1.25, 2.0] {
+                let island = IslandConfig::default();
+                let mut controller = Controller::new_with_island(
+                    5_000,
+                    60_000,
+                    AssetCatalog::new(Vec::new()),
+                    true,
+                    None,
+                    island.clone(),
+                );
+                controller.dpi_scale = scale;
+                controller.media = Some(MediaInfo {
+                    title:
+                        "A long title 日本語 that should wrap instead of overlapping the controls"
+                            .into(),
+                    playing: true,
+                    ..Default::default()
+                });
+                let mut frame = controller.blank_frame(width, MEDIA_HEIGHT);
+                controller.icon_hits.clear();
+                controller.paint_media_card(
+                    &mut frame,
+                    &island,
+                    &CardPaintCtx {
+                        width,
+                        height: MEDIA_HEIGHT,
+                        cy: MEDIA_HEIGHT as i32 / 2,
+                        accent: [255; 4],
+                        now: 1_000,
+                        eq_now: 1_000,
+                        pad: 18,
+                    },
+                );
+                for (_, x, y, w, h) in &controller.icon_hits {
+                    assert!(
+                        *x >= 0
+                            && *y >= 0
+                            && *x + *w as i32 <= width as i32
+                            && *y + *h as i32 <= MEDIA_HEIGHT as i32
+                    );
+                }
+                assert!(
+                    controller
+                        .icon_hits
+                        .iter()
+                        .any(|hit| hit.0 == HIT_MEDIA_PLAY_PAUSE && hit.3 == 48 && hit.4 == 48)
+                );
+                assert_eq!(controller.icon_hits.len(), if width < 220 { 2 } else { 4 });
+                assert_eq!(frame.scale, scale);
+            }
+        }
+    }
+
+    #[test]
+    fn paused_wave_is_static() {
+        let mut first = FrameBuffer {
+            width: 30,
+            height: 20,
+            pixels_pbgra: vec![0; 30 * 20 * 4],
+            delay_ms: 0,
+            loop_index: 0,
+            scale: 1.0,
+        };
+        let mut second = first.clone();
+        paint_wave(&mut first, 4, 10, 0, false, [255; 4]);
+        paint_wave(&mut second, 4, 10, 443, false, [255; 4]);
+        assert_eq!(first.pixels_pbgra, second.pixels_pbgra);
+        paint_wave(&mut second, 4, 10, 443, true, [255; 4]);
+        assert_ne!(first.pixels_pbgra, second.pixels_pbgra);
     }
 }

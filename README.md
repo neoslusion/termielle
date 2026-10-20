@@ -32,6 +32,13 @@ search. See the [document search guide](docs/document-search.md) and the
 decisions, validation, and local redeployment; the
 [island and bar guide](docs/island.md) covers detailed configuration and usage.
 
+Motion and frame cost are held to the display's refresh budget: both the
+overlay and the launcher pace their animation from a dedicated clock thread
+that waits for the vertical blank, and every animated frame reuses one
+surface canvas instead of allocating a new one. See the
+[motion and performance pass](docs/motion-and-performance.md) for the
+measurements and the reasoning behind it.
+
 Any other agent CLI works too: the emitter's `--source` accepts any short
 lowercase identifier and its session extraction recognizes every common
 identifier key, so wiring up a new agent is pure configuration, following the
@@ -179,10 +186,12 @@ watchdog does not relaunch it.
 
 Animation playback is paced by a dedicated clock thread (not `WM_TIMER`, whose
 message-queue latency cannot hold a 16 ms cadence), with the measured present
-cost subtracted from each frame interval. Set `{"frame_rate": 60}` in the
-config file to play every animation at that frame rate instead of the GIF's
-own delays — the loop then takes frame count / rate seconds (the shipped
-60-frame assets loop in one second).
+cost subtracted from each frame interval. The Alt+Space launcher runs its own
+clock on the same model: Windows drops `WM_TIMER` messages when the window's
+queue is busy, which is exactly while the user is typing in it. Set
+`{"frame_rate": 60}` in the config file to play every animation at that frame
+rate instead of the GIF's own delays — the loop then takes frame count / rate
+seconds (the shipped 60-frame assets loop in one second).
 
 ## Multi-session activity
 
