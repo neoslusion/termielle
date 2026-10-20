@@ -137,11 +137,34 @@ impl Controller {
     /// Advances the face animation one step and re-renders the current pill:
     /// decodes one more loop frame while filling, then cycles the cache.
     pub(crate) fn advance_face(&mut self, now_ms: u64) {
+        if !self.step_face(now_ms) {
+            return;
+        }
+        let (w, h) = self.current_logical_size();
+        // A bar face tick redraws only the center surface. The side zones are
+        // unchanged by a face frame, so taking the cached-zone path here is
+        // what keeps a resting bar animating without a full strip rebuild
+        // every tick.
+        if self.island.is_bar() {
+            self.rerender_bar(w, h, now_ms, crate::app::bar::modules::BarDamage::CENTER);
+        } else {
+            self.rerender_island(w, h, now_ms);
+        }
+    }
+
+    /// The state half of [`Self::advance_face`]: decodes one more loop frame
+    /// while filling, then cycles the cache, and re-arms the face deadline.
+    /// Returns whether there is a new frame to draw.
+    ///
+    /// A morph repaints the pill on every tick and reads the face frame as it
+    /// does, so the morph steps the face with this and lets its own render draw
+    /// it, instead of painting the whole surface a second time in one tick.
+    pub(crate) fn step_face(&mut self, now_ms: u64) -> bool {
         if self.presentation() == crate::animation::notch::Presentation::Hidden {
             // Invisible top-edge sensor: keep the tick cadence (and the
             // background loop fill above), skip the pixels nobody sees.
             self.arm_face_deadline(now_ms);
-            return;
+            return false;
         }
         if let Some(gif) = self.face_decoder.as_mut() {
             let done = match gif.next_frame() {
@@ -159,22 +182,13 @@ impl Controller {
         if !self.settle_idle_bar_face() {
             if self.face_frames.len() < 2 {
                 self.arm_face_deadline(now_ms);
-                return;
+                return false;
             }
             self.face_idx = (self.face_idx + 1) % self.face_frames.len();
             self.face_frame = self.face_frames[self.face_idx].clone();
         }
         self.arm_face_deadline(now_ms);
-        let (w, h) = self.current_logical_size();
-        // A bar face tick redraws only the center surface. The side zones are
-        // unchanged by a face frame, so taking the cached-zone path here is
-        // what keeps a resting bar animating without a full strip rebuild
-        // every tick.
-        if self.island.is_bar() {
-            self.rerender_bar(w, h, now_ms, crate::app::bar::modules::BarDamage::CENTER);
-        } else {
-            self.rerender_island(w, h, now_ms);
-        }
+        true
     }
 }
 /// Box-downscales a premultiplied BGRA frame to `size x size`.

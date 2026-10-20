@@ -176,7 +176,16 @@ impl Controller {
                         text_width,
                         ROW_HEIGHT - 4,
                         8,
-                        [255, 255, 255, 18],
+                        [
+                            255,
+                            255,
+                            255,
+                            if self.rect_pressed((ctx.pad, y, text_width, ROW_HEIGHT - 4)) {
+                                34
+                            } else {
+                                18
+                            },
+                        ],
                         [0; 4],
                     );
                 }
@@ -317,7 +326,18 @@ impl Controller {
             w,
             h,
             8,
-            [255, 255, 255, if hovered { 32 } else { 15 }],
+            [
+                255,
+                255,
+                255,
+                if hovered && self.rect_pressed(rect) {
+                    48
+                } else if hovered {
+                    32
+                } else {
+                    15
+                },
+            ],
             [255, 255, 255, 25],
         );
         crate::animation::notch::draw_text_in_rect(

@@ -11,6 +11,17 @@ use termielle_core::PinnedApp;
 impl Controller {
     pub fn navigation_pointer_down(&mut self, x: i32, y: i32, now: u64) {
         let point = (self.to_logical(x), self.to_logical(y));
+        self.press_point = Some(point);
+        self.press_hit = self
+            .icon_hits
+            .iter()
+            .find(|&&(_, hx, hy, hw, hh)| {
+                point.0 >= hx
+                    && point.0 < hx + hw as i32
+                    && point.1 >= hy
+                    && point.1 < hy + hh as i32
+            })
+            .map(|&(id, ..)| id);
         self.navigation.drag = None;
         self.navigation.cancelled_click = false;
         self.navigation.rail_pressed = self

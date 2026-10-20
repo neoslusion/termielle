@@ -13,7 +13,25 @@ pub(crate) struct Palette {
     pub selection_secondary: [u8; 4],
 }
 
+/// How far a fully pressed control's fill moves toward the primary ink.
+pub(crate) const PRESS_MIX: f32 = 0.09;
+
 impl Palette {
+    /// `fill` as it looks while held down: lifted toward the primary ink, so a
+    /// control answers the pointer on the frame it goes down.
+    pub(crate) fn pressed(&self, fill: [u8; 4]) -> [u8; 4] {
+        self.press_lift(fill, 1.0)
+    }
+
+    /// `fill` lifted by `amount` (0..=1) of a full press.
+    pub(crate) fn press_lift(&self, fill: [u8; 4], amount: f32) -> [u8; 4] {
+        std::array::from_fn(|index| {
+            (f32::from(fill[index])
+                + (f32::from(self.primary[index]) - f32::from(fill[index])) * PRESS_MIX * amount)
+                .round() as u8
+        })
+    }
+
     pub fn ink_pair(island: &IslandConfig) -> ([u8; 4], [u8; 4]) {
         if island.theme == "macos-dark" {
             ([247, 245, 245, 255], [198, 193, 193, 245])

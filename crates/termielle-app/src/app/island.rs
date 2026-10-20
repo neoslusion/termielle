@@ -686,13 +686,6 @@ impl Controller {
 
     pub fn handle_click(&mut self, x: i32, y: i32, now_ms: u64) -> ClickOutcome {
         let (x, y) = (self.to_logical(x), self.to_logical(y));
-        // A press that began on a status chip is cancelled by releasing
-        // anywhere else: dragging away is how a pointer takes a click back.
-        if let Some(origin) = self.press_origin.take() {
-            if !self.capsule_contains(origin, (x, y)) {
-                return ClickOutcome::None;
-            }
-        }
         let hit_id = self
             .icon_hits
             .iter()
@@ -700,6 +693,14 @@ impl Controller {
                 x >= hx && x < hx + hw as i32 && y >= hy && y < hy + hh as i32
             })
             .map(|&(id, ..)| id);
+
+        // A press that began on a control is cancelled by releasing anywhere
+        // else: dragging away is how a pointer takes a click back.
+        if let Some(pressed) = self.press_hit.take() {
+            if hit_id != Some(pressed) {
+                return ClickOutcome::None;
+            }
+        }
 
         if let Some(id) = hit_id {
             if super::navigation::Navigation::is_rail_hit(id)
@@ -817,6 +818,30 @@ impl Controller {
             return ClickOutcome::Expanded;
         }
         ClickOutcome::None
+    }
+
+    /// Whether the pointer is holding down on `rect`: it went down inside and
+    /// is still inside, so dragging off lets the control go, the way releasing
+    /// there would cancel the click.
+    pub(crate) fn rect_pressed(&self, (x, y, width, height): (i32, i32, u32, u32)) -> bool {
+        let inside = |(px, py): (i32, i32)| {
+            px >= x && px < x + width as i32 && py >= y && py < y + height as i32
+        };
+        self.press_point.is_some_and(inside) && self.hover_point.is_some_and(inside)
+    }
+
+    /// Moves the pointer into a child canvas's coordinates for the duration of
+    /// one paint. Pair with [`Self::restore_pointer`].
+    pub(crate) fn shift_pointer(&mut self, dx: i32, dy: i32) -> super::controller::PointerSnapshot {
+        let saved = (self.hover_point, self.press_point);
+        let shift = |(x, y): (i32, i32)| (x - dx, y - dy);
+        self.hover_point = saved.0.map(shift);
+        self.press_point = saved.1.map(shift);
+        saved
+    }
+
+    pub(crate) fn restore_pointer(&mut self, saved: super::controller::PointerSnapshot) {
+        (self.hover_point, self.press_point) = saved;
     }
 
     /// Whether `point` (logical frame pixels) is inside a status chip. Chips
@@ -1126,15 +1151,17 @@ impl Controller {
         } else {
             None
         };
-        if pressed {
-            // The release that follows this press belongs to it: it only
-            // counts as a click if it lands on the chip that was pressed.
-            self.press_origin = capsule;
-        }
-        if !self
+        // A press that began on a control, and its release, change how that
+        // control is drawn even when no status chip is involved.
+        let control_changed = if pressed {
+            self.press_point.is_some()
+        } else {
+            self.press_point.take().is_some()
+        };
+        let chip_changed = self
             .bar_hover
-            .set_pressed(capsule, now_ms, self.reduced_motion)
-        {
+            .set_pressed(capsule, now_ms, self.reduced_motion);
+        if !chip_changed && !control_changed {
             return false;
         }
         self.bar_right_cache = None;

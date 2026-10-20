@@ -8,6 +8,7 @@ impl Controller {
             .hover_point
             .is_some_and(|(x, y)| x >= rect.0 && x < rect.0 + 28 && y >= rect.1 && y < rect.1 + 28);
         let palette = crate::theme::Palette::for_island(&self.island);
+        let pressed = self.rect_pressed((rect.0, rect.1, 28, 28));
         notch::draw_rounded_rect(
             frame,
             rect.0,
@@ -15,7 +16,9 @@ impl Controller {
             28,
             28,
             14,
-            if hovered {
+            if pressed {
+                palette.pressed(palette.raised)
+            } else if hovered {
                 palette.raised
             } else {
                 palette.surface

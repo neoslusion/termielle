@@ -383,9 +383,7 @@ impl Controller {
             pad: 18,
         };
         let island = self.island.clone();
-        let saved_hover = self.hover_point;
-        self.hover_point =
-            saved_hover.map(|(hover_x, hover_y)| (hover_x - panel_x, hover_y - panel_y));
+        let saved_pointer = self.shift_pointer(panel_x, panel_y);
         match self.panel_kind {
             crate::app::types::RightPanel::Controls => {
                 self.paint_control_panel(&mut content, &island, &context)
@@ -394,7 +392,7 @@ impl Controller {
                 self.paint_notification_panel(&mut content, &context)
             }
         }
-        self.hover_point = saved_hover;
+        self.restore_pointer(saved_pointer);
         let progress = (visible_h as f32 / panel_h as f32).clamp(0.0, 1.0);
         let alpha =
             (255.0 * crate::animation::notch::smoothstep(0.65, 0.98, progress)).round() as u8;
@@ -646,8 +644,9 @@ mod tests {
         let away = (on_chip.0 - 400, on_chip.1);
 
         controller.set_hover_point_at(Some(on_chip), 1100);
+        controller.navigation_pointer_down(on_chip.0, on_chip.1, 1100);
+        assert_eq!(controller.press_hit, Some(HIT_CARD_PANEL));
         assert!(controller.set_pressed(true, 1100));
-        assert!(controller.press_origin.is_some());
         assert!(controller.set_pressed(false, 1200));
         assert_eq!(
             controller.handle_click(away.0, away.1, 1200),
@@ -656,13 +655,76 @@ mod tests {
         assert!(!controller.panel_open);
 
         controller.set_hover_point_at(Some(on_chip), 1300);
+        controller.navigation_pointer_down(on_chip.0, on_chip.1, 1300);
         assert!(controller.set_pressed(true, 1300));
         assert!(controller.set_pressed(false, 1400));
         assert_eq!(
             controller.handle_click(on_chip.0, on_chip.1, 1400),
             ClickOutcome::PanelToggled
         );
-        assert!(controller.press_origin.is_none());
+        assert!(controller.press_hit.is_none());
+    }
+
+    #[test]
+    fn a_held_control_center_tile_is_drawn_pressed_lets_go_when_dragged_off_and_cancels_on_a_stray_release()
+     {
+        use crate::app::types::ClickOutcome;
+        use crate::bar::shell::ShellAction;
+        let mut island = IslandConfig {
+            layout: IslandLayout::Bar,
+            face_animated: false,
+            ..IslandConfig::default()
+        };
+        island.theme = "catppuccin-macchiato".into();
+        crate::theme::apply_theme(&mut island, "catppuccin-macchiato");
+        let mut controller = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            island,
+        );
+        controller.set_bar_width(1920);
+        controller.set_bar_metrics(Snapshot::empty(), 1000);
+        controller.panel_open = true;
+        let height =
+            controller.island.bar.height + BAR_POPUP_GAP + crate::app::cards::panel::panel_height();
+        controller.current = controller.render_bar_frame(VisualState::Idle, 1920, height, 1000);
+        let (_, x, y, width, tile_height) = controller
+            .click_regions()
+            .iter()
+            .find(|hit| hit.0 == ShellAction::Network.hit_id())
+            .copied()
+            .expect("Network tile");
+        let on_tile = (x + width as i32 / 2, y + tile_height as i32 / 2);
+        let beside = (on_tile.0, on_tile.1 + tile_height as i32 * 3);
+        let at_rest = controller.current_frame().pixels_pbgra.clone();
+
+        controller.set_hover_point_at(Some(on_tile), 1100);
+        controller.navigation_pointer_down(on_tile.0, on_tile.1, 1100);
+        assert!(controller.set_pressed(true, 1100));
+        assert_ne!(at_rest, controller.current_frame().pixels_pbgra);
+        let held = controller.current_frame().pixels_pbgra.clone();
+
+        // Dragging off the tile lets it go; coming back picks it up again.
+        controller.set_hover_point_at(Some(beside), 1150);
+        assert_eq!(at_rest, controller.current_frame().pixels_pbgra);
+        controller.set_hover_point_at(Some(on_tile), 1200);
+        assert_eq!(held, controller.current_frame().pixels_pbgra);
+
+        // Released on the tile: the press is over and the tile is drawn at rest.
+        controller.set_pressed(false, 1250);
+        assert_eq!(at_rest, controller.current_frame().pixels_pbgra);
+
+        // Pressed on the tile but released elsewhere: no click.
+        controller.navigation_pointer_down(on_tile.0, on_tile.1, 1300);
+        controller.set_pressed(true, 1300);
+        controller.set_pressed(false, 1350);
+        assert_eq!(
+            controller.handle_click(beside.0, beside.1, 1350),
+            ClickOutcome::None
+        );
     }
 
     #[test]

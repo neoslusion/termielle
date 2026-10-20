@@ -40,6 +40,7 @@ fn paint_tile(
     secondary: [u8; 4],
     palette: crate::theme::Palette,
     active: bool,
+    pressed: bool,
 ) {
     notch::draw_rounded_rect(
         frame,
@@ -48,7 +49,11 @@ fn paint_tile(
         width,
         TILE_H,
         12,
-        palette.surface,
+        if pressed {
+            palette.pressed(palette.surface)
+        } else {
+            palette.surface
+        },
         palette.border,
     );
     notch::draw_rounded_rect(
@@ -154,8 +159,10 @@ impl Controller {
                     }
                     _ => false,
                 };
+            let pressed = self.rect_pressed((x, y, tile_width, TILE_H));
             paint_tile(
-                frame, x, y, tile_width, label, subtitle, icon, primary, secondary, palette, active,
+                frame, x, y, tile_width, label, subtitle, icon, primary, secondary, palette,
+                active, pressed,
             );
             self.icon_hits
                 .push((action.hit_id(), x, y, tile_width, TILE_H));

@@ -23,6 +23,10 @@ use std::rc::Rc;
 /// Destination-independent content swap used when geometry does not change.
 /// The previous content is shared rather than copied, so state/activity swaps
 /// do not duplicate a full-resolution frame.
+/// The hover and press points as a paint saw them, so a child canvas can shift
+/// them into its own coordinates and put them back.
+pub(crate) type PointerSnapshot = (Option<(i32, i32)>, Option<(i32, i32)>);
+
 pub(crate) struct ContentTransition {
     pub(crate) previous: Rc<crate::animation::FrameBuffer>,
     pub(crate) started_ms: u64,
@@ -143,9 +147,13 @@ pub struct Controller {
     pub(crate) bar_deadline: Option<u64>,
     pub(crate) volume_feedback_deadline: Option<u64>,
     pub(crate) bar_hover: super::bar::hover::CapsuleHover,
-    /// The status chip the current pointer press began on, so its release can
-    /// be told apart from a drag away.
-    pub(crate) press_origin: Option<super::bar::hover::Capsule>,
+    /// Where the pointer went down, in frame pixels, while it is still held.
+    /// A control is drawn pressed while the pointer is down on it and still
+    /// over it.
+    pub(crate) press_point: Option<(i32, i32)>,
+    /// The hit region the pointer went down on. It outlives the release, so
+    /// the click that follows can be cancelled by a release somewhere else.
+    pub(crate) press_hit: Option<isize>,
     /// Cached bar metrics to prevent heavy COM/Registry/CPU queries on every render.
     /// Most recently rendered transparent content layer for same-geometry
     /// crossfades.
@@ -258,7 +266,8 @@ impl Controller {
             bar_deadline,
             volume_feedback_deadline: None,
             bar_hover: super::bar::hover::CapsuleHover::default(),
-            press_origin: None,
+            press_point: None,
+            press_hit: None,
             content_layer: None,
             content_transition: None,
             interaction_deadline: None,
@@ -572,6 +581,8 @@ impl Controller {
         if mode_changed {
             self.volume_feedback_deadline = None;
             self.pressed = false;
+            self.press_point = None;
+            self.press_hit = None;
             self.manually_expanded = false;
             self.panel_open = false;
             self.panel_morphing = false;
@@ -844,7 +855,13 @@ impl Controller {
         if self.island.is_enabled() {
             if let Some(face_at) = self.face_deadline {
                 if now_ms >= face_at {
-                    self.advance_face(now_ms);
+                    if self.spring.is_some() || self.separation.is_some() {
+                        // The morph above is repainting the pill every tick
+                        // and draws this frame with it.
+                        self.step_face(now_ms);
+                    } else {
+                        self.advance_face(now_ms);
+                    }
                     actions.present_frame = true;
                 }
             }
@@ -1716,6 +1733,57 @@ mod tests {
         c.advance_face(1_080);
         assert_eq!(c.face_idx, 3);
         assert_eq!(c.face_frame.pixels_pbgra[0], 240);
+    }
+
+    /// A morph repaints the pill on every tick, so the face is stepped for it
+    /// (`step_face`) rather than drawn a second time in the same tick
+    /// (`advance_face`). Both must move the face; only one may paint.
+    #[test]
+    fn stepping_the_face_advances_it_without_painting_and_advancing_paints() {
+        let mut c = Controller::new_with_island(
+            5_000,
+            60_000,
+            AssetCatalog::new(Vec::new()),
+            false,
+            None,
+            IslandConfig {
+                layout: IslandLayout::Bar,
+                face_animated: true,
+                ..IslandConfig::default()
+            },
+        );
+        c.set_bar_width(1536);
+        c.set_bar_metrics(crate::bar::metrics::Snapshot::empty(), 900);
+        let mut frames = Vec::new();
+        for shade in [10u8, 90, 170, 240] {
+            let mut frame = c.face_frame.clone();
+            frame.pixels_pbgra.fill(shade);
+            frames.push(frame);
+        }
+        c.face_frames = frames;
+        c.face_delays = vec![40; 4];
+        c.face_frame = c.face_frames[0].clone();
+        c.state = VisualState::Working;
+        c.rerender_island(1536, c.island.bar.height, 900);
+        let painted = c.current_frame().pixels_pbgra.clone();
+
+        assert!(c.step_face(1_000), "a live face has a new frame to draw");
+        assert_eq!(c.face_idx, 1);
+        assert_eq!(c.face_frame.pixels_pbgra[0], 90);
+        assert_eq!(
+            painted,
+            c.current_frame().pixels_pbgra,
+            "stepping the face must not repaint the surface"
+        );
+        assert!(c.face_deadline.is_some(), "the next face frame is armed");
+
+        c.advance_face(1_040);
+        assert_eq!(c.face_idx, 2);
+        assert_ne!(
+            painted,
+            c.current_frame().pixels_pbgra,
+            "advancing the face paints it"
+        );
     }
 
     /// A bar with the hover setting in the given state. Reduced motion so the

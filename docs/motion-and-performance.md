@@ -173,7 +173,8 @@ a launcher.
 | Alt+Space launcher open/close | Keyboard-initiated, 100+ times a day: **no animation, ever** (the skills cite Raycast). The 160/100 ms reveal was praised in the first pass as asymmetric timing; the right answer was to delete it. | The launcher appears and disappears instantly. The fade, the eight-pixel rise, the exit, and the `reveal`/`origin` state behind them are gone. |
 | Arrow-key selection highlight | List navigation, tens of times a day: near-imperceptible or nothing. | 110 ms → 60 ms. Typing and mouse selection still snap. |
 | Status chips in the bar (clock, Control Center, volume, …) | Had a hover crossfade but no press state; `apple-design` §1 says feedback lands on the press, not the release. | A pressed chip takes its fill on the frame the pointer goes down and eases back over 140 ms on release. Reduced motion releases at once. The notch's existing press swell is unchanged; the bar had no press feedback at all. |
-| A click on a status chip | `apple-design` §10: a tap commits on release and can be cancelled by dragging away. A press that began on a chip used to activate whatever was under the pointer at release, which contradicted the new press fill. | A press that began on a chip only clicks if it is released on that chip. Other controls are unchanged. |
+| A click on any control | `apple-design` §10: a tap commits on release and can be cancelled by dragging away. A press that began on a control used to activate whatever was under the pointer at release, which contradicted the press fill the chips now show. | A press records the hit region it went down on, and the click only commits if the release is on that same region. Dragging off a held control lets it go, and coming back picks it up again. Navigation drags are unaffected: they finish before the click is considered. |
+| Press feedback on the other controls | The media buttons, the Control Center tiles, the notch close button, the notification Clear button and the session-activity rows and buttons had hover but no press state. | Each lifts its fill toward the ink while held (`Palette::pressed`), on the frame the pointer goes down. The solid play/pause button dims instead, since it is already at the ink. The Control Center tiles had no hover at all and now have a pressed state. |
 
 The launcher's display-synced clock from the first pass stays: it now drives
 only the 60 ms highlight glide, which is where a dropped `WM_TIMER` while the
@@ -232,6 +233,35 @@ ease-in-out, which is right for a state change that is not entering).
 | Tooltips | Native Windows control with a 600 ms initial delay. It keeps its own shorter reshow delay while moving between tools, which is the "skip the delay after the first" rule. Not ours to restyle. |
 | Notification list scrolling | One row per wheel notch, with no glide. This is the only opportunity found: a 60-100 ms glide would remove a small teleport. It was left alone because the list is short and Windows list controls row-snap the same way. |
 
+## Fourth pass: the face was painting the bar a second time
+
+With the frame-pacing misread corrected, the remaining question was why paint p95
+sat at about 8.5 ms against a 1.7 ms median. A per-tick trace of which call
+sites re-rendered the bar showed it: during a morph, every tick rendered the
+whole surface twice. `on_timer` stepped the spring and repainted the bar, and
+then the face-animation tick (`advance_face`) repainted the bar again, panel
+and all (about 3.4 ms for the Control Center panel), because it ran after the
+morph's render. The procedural-motion tick right below it already had the
+rule ("skipped while a morph tick already repainted this call"); the face tick
+did not.
+
+`advance_face` is now `step_face` (advance the frame, re-arm the deadline,
+report whether there is something to draw) plus the repaint. While a spring or
+blob separation is running, `on_timer` only steps the face and lets the morph's
+own render draw it, so the face lands at most one tick later (16 ms, against a
+frame delay of 20 ms or more) and the surface is painted once per tick.
+
+Five runs of the same probe, before and after, on the same host:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Paint, p95 | 8.5-9.5 ms | 5.3-5.7 ms |
+| Render + present, p95 | 11.8-13.0 ms | 9.1-9.3 ms |
+| Render + present, median | 3.2-3.5 ms | 3.2-3.3 ms |
+
+The median is unchanged because most ticks never had the second paint; it was
+the morph ticks the face tick coincided with that carried the tail.
+
 ## Re-measuring
 
 ```powershell
@@ -239,7 +269,14 @@ cargo build -p termielle-app --release --example bar_motion_review
 .\target\release\examples\bar_motion_review.exe --primary --macchiato --controls
 ```
 
-The probe prints render + present, paint, present, and the presentation
-interval, each as a median and a p95 over 240 frames. Run it with no other
+The probe prints missed refreshes and frames over budget, then render + present,
+paint, present, and the presentation interval, each as a median and a p95 over
+240 frames. The presentation interval is the gap between two submissions, so it
+carries render-time variance even when every frame is displayed on its own
+refresh; read the missed-refresh count for dropped frames. Add
+`--max-missed N` and `--max-over-budget N` to make the probe exit non-zero when
+a change costs more than that: one or two missed refreshes per run is the
+normal floor on an idle machine, so a limit of 6 and 4 catches a real
+regression without tripping on noise. Run it with no other
 Termielle instance running: a second instance competes for the CPU and
 inflates every number.

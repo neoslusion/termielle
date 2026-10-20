@@ -11,6 +11,18 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The value after `flag` on the command line, if the flag was given.
+fn limit(flag: &str) -> Option<usize> {
+    let mut arguments = std::env::args();
+    arguments.find(|argument| argument == flag)?;
+    Some(
+        arguments
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{flag} takes a frame count")),
+    )
+}
+
 fn main() {
     let mut config = AppConfig::default();
     config.island.layout = IslandLayout::Bar;
@@ -152,6 +164,21 @@ fn main() {
     let missed = intervals.iter().filter(|gap| **gap > refresh * 1.5).count();
     let overran = costs.iter().filter(|cost| **cost > refresh).count();
     println!("missed refreshes {missed}/{n}; frames over budget {overran}/{n}");
+    // A regression guard for the smoothness of the morph: with a limit given, the
+    // probe fails when a change costs more refreshes than the limit allows.
+    let mut over_limit = false;
+    if let Some(max) = limit("--max-missed") {
+        if missed > max {
+            eprintln!("FAIL: {missed} missed refreshes, limit {max}");
+            over_limit = true;
+        }
+    }
+    if let Some(max) = limit("--max-over-budget") {
+        if overran > max {
+            eprintln!("FAIL: {overran} frames over budget, limit {max}");
+            over_limit = true;
+        }
+    }
     println!(
         "{n} frames; render+present median {:.2}ms p95 {:.2}ms; presentation interval median {:.2}ms p95 {:.2}ms",
         costs[n / 2],
@@ -166,4 +193,7 @@ fn main() {
         presents[n / 2],
         presents[n * 95 / 100]
     );
+    if over_limit {
+        std::process::exit(1);
+    }
 }

@@ -282,6 +282,7 @@ impl Controller {
                 x >= rect.0 && x < rect.0 + size as i32 && y >= rect.1 && y < rect.1 + size as i32
             });
             let primary_control = hit == HIT_MEDIA_PLAY_PAUSE;
+            let pressed = self.rect_pressed((rect.0, rect.1, size, size));
             notch::draw_rounded_rect(
                 frame,
                 rect.0,
@@ -290,9 +291,19 @@ impl Controller {
                 size,
                 size / 2,
                 if primary_control {
-                    palette.primary
+                    // The solid control is already at the ink, so a press
+                    // dims it instead of lifting it.
+                    if pressed {
+                        palette.secondary
+                    } else {
+                        palette.primary
+                    }
                 } else if hovered {
-                    palette.raised
+                    if pressed {
+                        palette.pressed(palette.raised)
+                    } else {
+                        palette.raised
+                    }
                 } else {
                     palette.surface
                 },

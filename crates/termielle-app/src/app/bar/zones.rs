@@ -11,9 +11,6 @@ use termielle_core::VisualState;
 
 const STATUS_ICON_SIZE: i32 = 18;
 
-/// How far a fully pressed chip's fill moves toward the primary ink.
-const PRESS_MIX: f32 = 0.09;
-
 fn paint_status_chip(
     frame: &mut FrameBuffer,
     (x, y, width, height): super::hover::Capsule,
@@ -27,8 +24,6 @@ fn paint_status_chip(
                 as u8
         })
     };
-    // A press lifts the hovered fill toward the ink, so the chip answers the
-    // pointer on the frame it goes down rather than on the release.
     let hovered = mix(palette.surface, palette.raised, hover);
     crate::animation::notch::draw_rounded_rect(
         frame,
@@ -37,7 +32,7 @@ fn paint_status_chip(
         width,
         height,
         8,
-        mix(hovered, palette.primary, PRESS_MIX * press),
+        palette.press_lift(hovered, press),
         mix(palette.border, palette.hover_border, hover),
     );
 }
@@ -688,9 +683,8 @@ impl Controller {
                 }];
 
                 let island_cfg = self.island.clone();
-                let saved_hover = self.hover_point;
                 let content_x = card.content_x;
-                self.hover_point = saved_hover.map(|(x, y)| (x - content_x, y - card.island_y));
+                let saved_pointer = self.shift_pointer(content_x, card.island_y);
                 if !self.alert_pill_morphing || !self.alerts.is_empty() || self.island_card_open() {
                     self.render_content(
                         &mut content,
@@ -703,7 +697,7 @@ impl Controller {
                         now_ms,
                     );
                 }
-                self.hover_point = saved_hover;
+                self.restore_pointer(saved_pointer);
             }
 
             let (fade_start, fade_end) = if self.alerts.is_empty() {

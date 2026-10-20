@@ -227,7 +227,9 @@ impl Controller {
             inner_width,
             FOOTER_H,
             10,
-            if hovered {
+            if self.rect_pressed((PAD, clear_y, inner_width, FOOTER_H)) {
+                palette.pressed(palette.selection)
+            } else if hovered {
                 palette.selection
             } else {
                 palette.raised
