@@ -6,12 +6,17 @@ the native Windows renderer or adding continuous decorative effects.
 
 ## Delivered motion
 
-- **Launcher entrance:** none. The launcher was first delivered with a 160 ms
-  fade-and-rise and a 100 ms exit; the
+- **Launcher entrance:** the launcher grows out of the bar's pill over 160 ms
+  and collapses back into it over 120 ms. It was first delivered as a 160 ms fade-and-rise with a
+  100 ms exit, which the
   [motion pass](motion-and-performance.md#second-pass-what-the-skills-said-about-frequency)
-  removed both, because a window summoned from the keyboard is opened hundreds
-  of times a day and an animation there is latency, not polish. It appears and
-  disappears instantly.
+  removed (a window summoned from the keyboard is opened hundreds of times a
+  day, and a fade there is latency, not polish). It came back as a connection to
+  the pill, not a fade: see
+  [the launcher grows out of the pill](motion-and-performance.md#the-launcher-grows-out-of-the-pill).
+  With no bar to grow from, or under reduced motion, it appears and
+  disappears instantly. Every way of closing it, including losing focus and
+  launching something, collapses it; focus is not held for the collapse.
 - **Selection highlight:** Up/Down moves the highlight over 60 ms. Selection
   itself changes immediately: Enter acts on the selected item, not wherever
   the animated background happens to be. Text, icons, and row hit regions do
@@ -28,7 +33,8 @@ the native Windows renderer or adding continuous decorative effects.
 The launcher runs a display-synced clock (the same `AnimationClock` the overlay
 uses, not a `WM_TIMER`), armed only while the selection transition is active
 and parked at rest, on dismissal, or on reduced motion. Native EDIT input/IME
-is available the instant the window appears.
+is available the instant the window appears, including while it is still
+growing.
 
 Capsule transitions use the controller's existing display-paced deadline path,
 invalidate only the right zone cache, and keep the left zone cached. They stop

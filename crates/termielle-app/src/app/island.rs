@@ -1023,6 +1023,10 @@ impl Controller {
     /// leaving waits [`HOVER_GRACE_MS`] so the pointer can travel down into
     /// the card it just opened instead of dismissing it on the way.
     pub fn set_hover(&mut self, inside: bool, now_ms: u64) -> bool {
+        if inside && self.launcher_open {
+            // The launcher is under the pill; a card must not open into it.
+            return false;
+        }
         if !self.island.is_enabled() {
             return false;
         }

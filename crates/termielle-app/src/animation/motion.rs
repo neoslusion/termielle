@@ -20,6 +20,23 @@ pub(crate) const PRESS_RELEASE_MS: u64 = 140;
 /// design: fast enough to read as continuity rather than as a delay.
 pub(crate) const SELECTION_GLIDE_MS: u64 = 60;
 
+/// The launcher growing out of the bar's pill. Alt+Space is a keyboard action
+/// and the skills' frequency gate says such actions should not animate at all,
+/// so this is the shortest a spatial connection to the pill can be drawn in: a
+/// strong ease-out that does most of its work in the first third, interruptible
+/// by typing (the window is live from the first frame). With no bar to grow
+/// from, or reduced motion, there is no reveal.
+pub(crate) const LAUNCHER_REVEAL_MS: u64 = 160;
+
+/// The launcher collapsing back into the pill. The reverse of the opening, and
+/// shorter: a deliberate action takes the longer beat, and putting the window
+/// away is the system's answer to it.
+pub(crate) const LAUNCHER_COLLAPSE_MS: u64 = 120;
+
+/// The dot on the pill that stands for notifications waiting behind the
+/// launcher fading in and out. Skills: small UI, 100-160 ms.
+pub(crate) const NOTIFICATION_DOT_FADE_MS: u64 = 120;
+
 /// Same-geometry island content swapping for new content (state, media, or
 /// alert). Skills: small UI, under 300 ms.
 pub(crate) const CONTENT_SWAP_MS: u64 = 140;

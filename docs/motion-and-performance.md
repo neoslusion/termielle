@@ -262,6 +262,121 @@ Five runs of the same probe, before and after, on the same host:
 The median is unchanged because most ticks never had the second paint; it was
 the morph ticks the face tick coincided with that carried the tail.
 
+## The launcher grows out of the pill
+
+The second pass made the launcher instant, which is what the skills' frequency
+gate says about a keyboard-summoned window. The pill is what makes a case for
+bringing a reveal back: `apple-design` §7 says something should emerge from where
+it came from, and the launcher previously appeared in the upper quarter of
+whichever monitor held the foreground window, with no relation to anything. So
+Alt+Space (and the bar's Search chip) now opens the launcher against the pill and
+grows it out of it, in 160 ms (`LAUNCHER_REVEAL_MS`, the shortest a spatial
+connection can be drawn in), and putting it away on purpose (Escape, Alt+Space)
+collapses it back into the pill in 120 ms (`LAUNCHER_COLLAPSE_MS`): the reverse
+of the opening, shorter because the system's answer to a deliberate action takes
+the shorter beat. Every way of putting it away collapses it, including losing
+focus and launching something.
+
+**How it works.** The launcher stays its own window, because the native text box
+gives it IME input for free, and a layered window cannot host one over a
+per-pixel-alpha surface. So the growth is a clip: a rounded region reveals the
+window, starting as a pill-wide, 12 px strip against the pill and ending as the
+whole window, at which point the region is removed so Windows rounds and shadows
+it as it always did. While it grows the window also slides from against the pill
+to where it rests, so it flows down and out of the pill rather than sitting
+under it. The region is applied before the window is shown, so the first frame
+is the strip and never a flash of the full launcher, and the reveal's clock
+starts once the window is up and focused, so the 160 ms the user sees is not
+spent on the window manager. The window is live from the first frame: typing
+works while it grows.
+
+**Resting place.** It settles where the launcher always used to open, a quarter
+of the way down the work area (an upper-quarter placement that is "a little
+further to the middle of the screen" than a launcher stuck under the bar), but
+never nearer the bar than the pill itself. Under a bottom bar the same rule is
+mirrored: it settles a quarter of the way up and slides up from the pill. The
+resting edge is fixed when it opens, so typing, which changes its height, does
+not move it.
+
+**Closing is the reverse.** Escape or Alt+Space starts the collapse from wherever
+the opening had got to, so interrupting an opening reverses it smoothly instead
+of snapping. Reopening during a collapse grows it back from where it is. The
+collapse is only a picture and nothing waits on it: focus has already moved on
+when the cause is losing focus or launching, and when the cause is Escape focus
+returns to the previous window as the collapse ends. (The first version hid it at
+once on focus loss "so another application is never held up", which confused the
+two: the wait only ever applied to returning focus.) A second request while it
+collapses finishes it. Notifications stay held until it has finished collapsing,
+not until it starts.
+
+The waiting-alert dot on the pill fades in and out over 120 ms
+(`NOTIFICATION_DOT_FADE_MS`) with the alerts it stands for, rather than popping,
+and keeps its colour while it fades out. Under reduced motion it snaps.
+
+- **Placement** (`launcher/anchor.rs`, pure geometry with tests): centred on the
+  pill, starting below it for a top bar and above it (growing upward) for a bottom bar,
+  kept inside the work area of the pill's monitor, with the strip following the
+  pill when the window had to be pushed off-centre. The runtime reports the
+  pill's screen rectangle every loop (`Controller::launcher_anchor`), and the
+  launcher docks to it when it opens, so a pill that changes width while the
+  launcher is open does not move the window.
+- **No bar, bar hidden by a fullscreen app, or reduced motion:** no anchor or no
+  reveal. The launcher opens centred and instantly, as it did before.
+- **Notifications.** Banners open in the same space under the pill, so while the
+  launcher is open they wait. A banner that was showing is set aside with its
+  timer paused, a new notification is queued, and the pill carries a dot in the
+  waiting alert's accent colour so it is not missed. When the launcher closes the
+  banners come back, with their lifetime starting then. Nothing is dropped:
+  notifications are still recorded in the Notification Center as they arrive.
+  Opening the launcher also closes any open popup, and hover cannot open a card
+  into it.
+
+**The tension, stated plainly.** This puts an animation back on a keyboard action.
+It is justified by the spatial connection and kept short, interruptible by typing,
+and absent under reduced motion, but it is a design call, and the skills' rule
+says no. The window stays immediate; if the reveal ever feels like latency,
+`LAUNCHER_REVEAL_MS` and `LAUNCHER_COLLAPSE_MS` are the two numbers to set to
+zero.
+
+**What is not done.** The clip is a GDI region, which is not antialiased, so the
+rounded corners are slightly rough for the 160 ms they exist. The corners and
+shadow become Windows' own at the end of the reveal, and the window loses them
+again during the collapse.
+
+## Fifth pass: the notification banner
+
+The banner a notification opens in the bar read as plain, and rendering it
+(`render_review <out.bmp> notification --bar --macos --scale=2`, plus
+`--long-alert` for the worst case) showed why. The icon tile was the sender's
+colour at 16 % opacity, which on dark glass is a muddy blue-grey square; the
+headline and detail were pinned to fixed rows, leaving a dead gap whenever the
+headline took one line; the "View history" button ended three pixels above the
+countdown line; and neither it nor the dismiss circle had a hover or press
+state, which the rest of the bar now has.
+
+Applied from `apple-design` §12 (materials and depth), §16 (craft, hierarchy) and
+§1/§10 (feedback on the press):
+
+- **Icon tile.** A squircle in the full accent with a vertical gradient (lighter
+  at the top, deeper at the bottom) and a hairline ring, so it reads as an app
+  icon instead of a tint. The initial is dark on a light accent and white on
+  anything else. The agent's face sits on the same tile.
+- **Hierarchy and rhythm.** The detail now follows the headline directly, however
+  many lines the headline took, and gives up its second line when the headline
+  needed two, so the footer is never crowded. Because the card is a fixed 148 px,
+  the icon and text move together to sit in the free space (at most 14 px down)
+  instead of hanging from the top edge with a gap below.
+- **Footer and countdown.** The button is a 22 px pill with a clear gap above the
+  countdown, which is now a rounded 2 px track along the foot of the card that the
+  accent drains from the right.
+- **Hover and press** on the dismiss circle and the "View history" button, the
+  same lift the other controls use.
+
+No motion was added. A banner arrives tens of times a day, which is the tier where
+the skills say to remove or drastically reduce motion, so it keeps the existing
+morph and content crossfade and nothing staggers. The card's height, hit regions
+and copy are unchanged.
+
 ## Re-measuring
 
 ```powershell

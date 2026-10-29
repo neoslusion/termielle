@@ -336,6 +336,22 @@ impl Controller {
         if self.is_navigation_open() && expanded {
             self.paint_navigation_popup(frame, width, exp_h, bar_y);
         }
+        let dot = self.dot_fade.value(now_ms);
+        if dot > 0.0 {
+            // A notification arrived while the launcher owns the space under
+            // the pill: it waits, and the pill carries a dot so it is not
+            // missed. The dot fades with the waiting alerts.
+            let (pill_x, pill_off, pill_w, pill_h) = self.bar_pill_rect(width);
+            let mut color = self.dot_accent;
+            color[3] = (f32::from(color[3]) * dot).round() as u8;
+            crate::animation::notch::draw_disc(
+                frame,
+                pill_x + pill_w as i32 - 9,
+                bar_y + pill_off + pill_h as i32 / 2,
+                3,
+                color,
+            );
+        }
     }
 
     fn paint_bar_panel(

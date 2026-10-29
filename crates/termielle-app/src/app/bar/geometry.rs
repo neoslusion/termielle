@@ -99,6 +99,31 @@ impl Controller {
         let pill_cx = ((width.saturating_sub(pill_w)) / 2) as i32;
         (pill_cx, pill_off, pill_w, pill_h)
     }
+    /// The collapsed pill in screen pixels, for the launcher to grow out of.
+    /// `dest` is where the bar window was last drawn (`x, y, w, h`, physical
+    /// pixels). `None` when this is not a bar, or the bar has not been drawn.
+    pub fn launcher_anchor(&self, dest: (i32, i32, u32, u32)) -> Option<crate::launcher::Anchor> {
+        if !self.island.is_bar() || dest.2 <= 1 || dest.3 <= 1 {
+            return None;
+        }
+        let scale = self.render_scale();
+        let (pill_x, pill_off, pill_w, pill_h) = self.bar_pill_rect(self.bar_width);
+        let (_, frame_height) = self.current_logical_size();
+        let bottom = self.island.bar.position == termielle_core::BarPosition::Bottom;
+        let bar_y = if bottom {
+            frame_height.saturating_sub(self.island.bar.height) as i32
+        } else {
+            0
+        };
+        let px = |logical: i32| (logical as f32 * scale).round() as i32;
+        let left = dest.0 + px(pill_x);
+        let top = dest.1 + px(bar_y + pill_off);
+        Some(crate::launcher::Anchor {
+            pill: (left, top, left + px(pill_w as i32), top + px(pill_h as i32)),
+            below: !bottom,
+        })
+    }
+
     /// Coarse bar-frame containment, including the whole frame while a popup is open.
     ///
     /// A bar window is mostly transparent and its hit map covers every opaque

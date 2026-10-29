@@ -1752,6 +1752,9 @@ fn run_gui(
         }
     };
     let mut preferences_preview = false;
+    if let Some(launcher) = &launcher {
+        launcher.set_wake(window.wake_handle());
+    }
     controller.enable_display_pacing();
     // Windows toast forwarding: own STA thread plus channel. Gated on
     // config only — smoke runs never reach run_gui, so diagnostics stays
@@ -1839,6 +1842,24 @@ fn run_gui(
         bar_service.configure(controller.island_config());
         if let Some(launcher) = &launcher {
             launcher.configure(controller.island_config(), controller.reduced_motion);
+            // The launcher grows out of the bar's pill, so it needs to know
+            // where the pill is on screen (and that there is one to grow from).
+            launcher.set_anchor(if window.is_fullscreen_suppressed() {
+                None
+            } else {
+                controller.launcher_anchor(window.last_dest())
+            });
+            // The bar steps aside for the launcher and takes its banners back
+            // when it closes.
+            if controller.set_launcher_open(launcher.is_visible(), now_ms()) {
+                present_current(
+                    window,
+                    controller,
+                    log,
+                    ack.as_mut(),
+                    Some(backdrop_request),
+                );
+            }
         }
         if now_ms() >= next_taskbar_reassert {
             next_taskbar_reassert = now_ms().saturating_add(TASKBAR_REASSERT_MS);

@@ -54,10 +54,19 @@ fn main() -> std::io::Result<()> {
         controller.set_dpi_scale(scale.parse().expect("scale must be a number"));
     }
     if state == "notification" {
+        let long = std::env::args().any(|arg| arg == "--long-alert");
         controller.trigger_alert(
             termielle_app::app::AlertKind::System,
-            "Dinner tonight?",
-            "Messages: Are we still on for 7?",
+            if long {
+                "Quarterly planning moved to Thursday afternoon, please confirm"
+            } else {
+                "Dinner tonight?"
+            },
+            if long {
+                "Calendar: The review now runs two hours and the room has changed to the fourth floor"
+            } else {
+                "Messages: Are we still on for 7?"
+            },
             [240, 154, 92, 255],
             6_000,
             10_000,

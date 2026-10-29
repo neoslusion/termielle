@@ -129,6 +129,16 @@ pub struct Controller {
     pub(crate) navigation: super::navigation::Navigation,
     /// Queued notification alert banners; the front one shows.
     pub(crate) alerts: VecDeque<AlertBanner>,
+    /// Whether the launcher is open. It grows out of the pill and owns the
+    /// space under it, so banners wait instead of opening there.
+    pub(crate) launcher_open: bool,
+    /// Alerts that arrived (or were showing) while the launcher was open. The
+    /// pill carries a dot for them, and they are replayed when it closes.
+    pub(crate) held_alerts: VecDeque<AlertBanner>,
+    /// The waiting-alert dot on the pill, 0 (gone) to 1 (shown), fading with
+    /// `held_alerts`, and the colour it keeps while it fades out.
+    pub(crate) dot_fade: crate::animation::transition::Transition,
+    pub(crate) dot_accent: [u8; 4],
     pub(crate) recent_notifications: VecDeque<RecentNotification>,
     pub(crate) unread_notifications: usize,
     pub(crate) notification_scroll: usize,
@@ -257,6 +267,10 @@ impl Controller {
             clock_ms: 0,
             state_since_ms: 0,
             alerts: VecDeque::new(),
+            launcher_open: false,
+            held_alerts: VecDeque::new(),
+            dot_fade: crate::animation::transition::Transition::default(),
+            dot_accent: [255; 4],
             recent_notifications: VecDeque::new(),
             unread_notifications: 0,
             notification_scroll: 0,
@@ -478,6 +492,20 @@ impl Controller {
             expires_at_ms: None,
             duration_ms,
         };
+        if self.launcher_open {
+            // The launcher owns the space under the pill, so the alert waits
+            // there and the pill shows a dot. The newest copy of a repeated
+            // event replaces the older one, as it would in the live queue.
+            self.held_alerts
+                .retain(|held| held.dedupe_key != alert.dedupe_key);
+            self.dot_accent = alert.accent;
+            self.held_alerts.push_back(alert);
+            while self.held_alerts.len() > MAX_QUEUED_ALERTS + 1 {
+                self.held_alerts.pop_front();
+            }
+            self.sync_dot(now_ms);
+            return self.repaint_bar_at_rest(now_ms);
+        }
         let was_empty = self.alerts.is_empty();
         let preempts_system = kind == super::types::AlertKind::Agent
             && self
@@ -515,6 +543,76 @@ impl Controller {
             self.begin_content_transition(now_ms);
         }
         self.morph_to_target(now_ms)
+    }
+
+    /// Tells the controller whether the launcher is open.
+    ///
+    /// The launcher grows out of the pill and sits in the space a banner or a
+    /// popup would use. Opening it closes whatever is under the pill and sets
+    /// any showing banner aside; closing it brings the banners back, so a
+    /// notification is delayed by the search, never lost to it. Returns whether
+    /// the surface changed and needs presenting.
+    pub fn set_launcher_open(&mut self, open: bool, now_ms: u64) -> bool {
+        if self.launcher_open == open || !self.island.is_enabled() {
+            return false;
+        }
+        self.launcher_open = open;
+        if open {
+            self.hover_deadline = None;
+            self.hover_expanded = false;
+            self.collapse_if_expanded(now_ms);
+            let mut showing: VecDeque<AlertBanner> = self.alerts.drain(..).collect();
+            for alert in &mut showing {
+                alert.expires_at_ms = None;
+            }
+            showing.append(&mut self.held_alerts);
+            if let Some(newest) = showing.back() {
+                self.dot_accent = newest.accent;
+            }
+            self.held_alerts = showing;
+            self.alert_pill_morphing = false;
+            self.sync_dot(now_ms);
+            self.morph_to_target(now_ms);
+            self.repaint_bar_at_rest(now_ms);
+        } else {
+            let waiting = std::mem::take(&mut self.held_alerts);
+            if !waiting.is_empty() {
+                self.alerts.extend(waiting);
+                self.arm_front_alert(now_ms);
+                self.alert_pill_morphing = true;
+            }
+            self.sync_dot(now_ms);
+            self.morph_to_target(now_ms);
+            self.repaint_bar_at_rest(now_ms);
+        }
+        true
+    }
+
+    /// Fades the waiting-alert dot toward whether anything is waiting. Under
+    /// reduced motion it snaps.
+    fn sync_dot(&mut self, now_ms: u64) {
+        let target = if self.held_alerts.is_empty() {
+            0.0
+        } else {
+            1.0
+        };
+        if self.reduced_motion {
+            self.dot_fade.snap(target);
+        } else if self.dot_fade.retarget(
+            target,
+            now_ms,
+            crate::animation::motion::NOTIFICATION_DOT_FADE_MS,
+        ) {
+            // Nothing else may be ticking, so start the frames that carry it.
+            self.motion_deadline = Some(now_ms.saturating_add(self.motion_interval_ms));
+        }
+    }
+
+    /// Repaints the surface at its current size (the held-alert dot changed).
+    fn repaint_bar_at_rest(&mut self, now_ms: u64) -> bool {
+        let (width, height) = self.current_logical_size();
+        self.rerender_island(width, height, now_ms);
+        true
     }
 
     fn remember_notification(
@@ -957,7 +1055,7 @@ impl Controller {
         if !self.island.is_enabled() || self.reduced_motion {
             return false;
         }
-        if self.content_transition.is_some() {
+        if self.content_transition.is_some() || self.dot_fade.active(now_ms) {
             return true;
         }
         if self.media_playing() {
@@ -1940,6 +2038,122 @@ mod tests {
         assert_eq!(before.height, controller.current_frame().height);
         assert_ne!(before.pixels_pbgra, controller.current_frame().pixels_pbgra);
         assert!(controller.content_transition.is_none());
+    }
+
+    #[test]
+    fn an_alert_that_arrives_while_the_launcher_is_open_waits_under_a_dot_and_replays_on_close() {
+        use super::super::types::AlertKind;
+        let mut controller = bar_with_hover(false);
+        // The helper is reduced-motion so morphs land in one tick; the dot's
+        // fade is what this test is about.
+        controller.reduced_motion = false;
+        controller.set_task_update_at(WorkerUpdate::default(), 900);
+        let (width, height) = controller.current_logical_size();
+        controller.rerender_island(width, height, 950);
+
+        assert!(controller.set_launcher_open(true, 1_000));
+        assert!(
+            !controller.set_launcher_open(true, 1_001),
+            "no change, no repaint"
+        );
+        controller.trigger_alert(
+            AlertKind::System,
+            "Message",
+            "Messages: Hello",
+            [255, 80, 80, 255],
+            6_000,
+            1_100,
+            "held:one",
+        );
+        assert!(
+            controller.alerts.is_empty(),
+            "no banner opens under the launcher"
+        );
+        assert_eq!(controller.held_alerts.len(), 1);
+        assert_eq!(
+            controller.presentation(),
+            crate::animation::notch::Presentation::Minimal
+        );
+        // The dot fades in rather than appearing: it is invisible on the frame
+        // the alert arrives, and there once the fade has run.
+        let dot = |controller: &Controller| {
+            let (width, _) = controller.current_logical_size();
+            let (pill_x, pill_off, pill_w, pill_h) = controller.bar_pill_rect(width);
+            let scale = controller.render_scale();
+            let x = ((pill_x + pill_w as i32 - 9) as f32 * scale) as usize;
+            let y = ((pill_off + pill_h as i32 / 2) as f32 * scale) as usize;
+            let frame = controller.current_frame();
+            let at = (y * frame.width as usize + x) * 4;
+            frame.pixels_pbgra[at..at + 4].to_vec()
+        };
+        let arriving = dot(&controller);
+        controller.on_timer(1_100 + crate::animation::motion::NOTIFICATION_DOT_FADE_MS + 20);
+        let shown = dot(&controller);
+        assert_ne!(
+            arriving, shown,
+            "the pill carries a dot for the waiting alert"
+        );
+        assert!(controller.dot_fade.target == 1.0);
+        // It is still recorded as a notification, and a repeat replaces it.
+        assert_eq!(controller.recent_notifications.len(), 1);
+        controller.trigger_alert(
+            AlertKind::System,
+            "Message",
+            "Messages: Hello again",
+            [255, 80, 80, 255],
+            6_000,
+            1_200,
+            "held:one",
+        );
+        assert_eq!(controller.held_alerts.len(), 1);
+
+        assert!(controller.set_launcher_open(false, 2_000));
+        assert!(controller.dot_fade.target == 0.0, "the dot fades out");
+        assert!(controller.held_alerts.is_empty());
+        assert_eq!(controller.alerts.len(), 1, "the banner is back");
+        assert_eq!(
+            controller.alerts[0].expires_at_ms,
+            Some(2_000 + 6_000),
+            "its lifetime starts when it is shown, not when it arrived"
+        );
+        assert_eq!(
+            controller.presentation(),
+            crate::animation::notch::Presentation::Expanded
+        );
+    }
+
+    #[test]
+    fn opening_the_launcher_sets_a_showing_banner_aside_and_keeps_hover_from_opening_a_card() {
+        use super::super::types::AlertKind;
+        let mut controller = bar_with_hover(false);
+        controller.set_task_update_at(WorkerUpdate::default(), 900);
+        controller.trigger_alert(
+            AlertKind::System,
+            "Message",
+            "Messages: Hello",
+            [255; 4],
+            6_000,
+            1_000,
+            "showing:one",
+        );
+        assert_eq!(controller.alerts.len(), 1);
+
+        controller.set_launcher_open(true, 1_500);
+        assert!(controller.alerts.is_empty());
+        assert_eq!(controller.held_alerts.len(), 1);
+        assert_eq!(
+            controller.held_alerts[0].expires_at_ms, None,
+            "its timer is paused"
+        );
+        assert!(!controller.set_hover(true, 1_600));
+        assert!(
+            controller.hover_deadline.is_none(),
+            "hover must not arm a card"
+        );
+
+        controller.set_launcher_open(false, 3_000);
+        assert_eq!(controller.alerts.len(), 1);
+        assert_eq!(controller.alerts[0].expires_at_ms, Some(3_000 + 6_000));
     }
 
     #[test]
